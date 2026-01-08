@@ -1,0 +1,11 @@
+flask
+pandas
+numpy
+joblib
+matplotlib
+scikit-learn
+openpyxl
+reportlab
+xgboost
+python-dotenv
+supabase

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Register</title>
+
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(to right, #1f4037, #99f2c8);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            background: white;
+            width: 400px;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0px 8px 25px rgba(0,0,0,0.25);
+            text-align: center;
+        }
+
+        h2 {
+            color: #1f4037;
+            margin-bottom: 20px;
+        }
+
+        input {
+            width: 100%;
+            padding: 12px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #1f4037;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #163128;
+        }
+
+        .success {
+            color: green;
+            margin-top: 15px;
+            font-weight: bold;
+        }
+
+        .error {
+            color: red;
+            margin-top: 15px;
+            font-weight: bold;
+        }
+
+        a {
+            display: block;
+            margin-top: 15px;
+            text-decoration: none;
+            color: #1f4037;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+    <h2>Register</h2>
+
+    <form method="POST">
+        <input type="text" name="username" placeholder="Email" required>
+        <input type="text" name="profile_username" placeholder="Username (optional)">
+        <input type="password" name="password" placeholder="Password" required>
+        <input type="password" name="confirm" placeholder="Confirm Password" required>
+        <button type="submit">Register</button>
+    </form>
+
+    {% if success %}
+        <p class="success">{{ success }}</p>
+    {% endif %}
+
+    {% if error %}
+        <p class="error">{{ error }}</p>
+    {% endif %}
+
+    <a href="/">Back to Login</a>
+</div>
+
+</body>
+</html>

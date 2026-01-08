@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Retail Demand Forecasting</title>
+
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(to right, #1f4037, #99f2c8);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            background: white;
+            width: 600px;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0px 8px 25px rgba(0,0,0,0.25);
+            text-align: center;
+        }
+
+        h1 {
+            color: #1f4037;
+            margin-bottom: 10px;
+        }
+
+        p {
+            color: #555;
+            font-size: 15px;
+            margin-bottom: 30px;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 12px;
+            margin: 12px 0;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+            font-size: 14px;
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            margin-top: 20px;
+            background: #1f4037;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #163128;
+        }
+
+        .error {
+            color: red;
+            font-size: 14px;
+            margin-top: 10px;
+            display: none;
+        }
+
+        .logout {
+            margin-top: 18px;
+        }
+
+        .logout a {
+            color: #1f4037;
+            font-weight: bold;
+            text-decoration: none;
+        }
+
+        .logout a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+    <h1>Retail Demand Forecasting</h1>
+    <p>
+        Upload your sales dataset to predict future demand using
+        Machine Learning models.
+    </p>
+
+    <form action="/upload" method="POST" enctype="multipart/form-data" onsubmit="return validateForm()">
+
+        <input type="file" id="file" name="file" accept=".xlsx,.csv">
+
+        <select name="months" id="months">
+            <option value="">Select Forecast Duration</option>
+            {% for i in range(1, 13) %}
+                <option value="{{ i }}">{{ i }} Month{{ 's' if i > 1 else '' }}</option>
+            {% endfor %}
+        </select>
+
+        <div class="error" id="errorMsg"></div>
+
+        <button type="submit">Generate Forecast</button>
+    </form>
+
+    <div style="margin-top:20px;">
+        New user?
+        <a href="/register" style="font-weight:bold; color:#1f4037;">
+            Register here
+        </a>
+    </div>
+
+    <div class="logout">
+        <a href="/logout">Logout</a>
+    </div>
+</div>
+
+<script>
+    function validateForm() {
+        const fileInput = document.getElementById("file");
+        const months = document.getElementById("months").value;
+        const errorMsg = document.getElementById("errorMsg");
+
+        errorMsg.style.display = "none";
+        errorMsg.innerHTML = "";
+
+        if (!fileInput.value) {
+            errorMsg.innerHTML = "⚠ Please upload a sales dataset file.";
+            errorMsg.style.display = "block";
+            return false;
+        }
+
+        const fileName = fileInput.value.toLowerCase();
+        if (!fileName.endsWith(".csv") && !fileName.endsWith(".xlsx")) {
+            errorMsg.innerHTML = "⚠ Only CSV or Excel (.xlsx) files are allowed.";
+            errorMsg.style.display = "block";
+            return false;
+        }
+
+        if (months === "") {
+            errorMsg.innerHTML = "⚠ Please select forecast duration (months).";
+            errorMsg.style.display = "block";
+            return false;
+        }
+
+        return true;
+    }
+</script>
+
+</body>
+</html>
