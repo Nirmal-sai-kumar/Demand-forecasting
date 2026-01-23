@@ -120,13 +120,17 @@
 
     <!-- GRAPH 1 -->
     <div class="card">
-        <h2>Actual vs Predicted Sales</h2>
+        <h2>Actual vs Predicted Sales — Trend: {{ past_actual_trend }}</h2>
         <img src="{{ url_for('static', filename=past_image) }}">
+        <p class="no-data" style="margin-top: 12px;">
+            Actual trend: <strong>{{ past_actual_trend }}</strong> &nbsp;|&nbsp;
+            Predicted trend: <strong>{{ past_pred_trend }}</strong>
+        </p>
     </div>
 
     <!-- GRAPH 2 -->
     <div class="card">
-        <h2>Future Sales Forecast ({{ months }} Month{{ 's' if months > 1 else '' }})</h2>
+        <h2>Future Sales Forecast ({{ months }} Month{{ 's' if months > 1 else '' }}) — Trend Graph: {{ future_trend }}</h2>
         <img src="{{ url_for('static', filename=future_image) }}">
     </div>
 
