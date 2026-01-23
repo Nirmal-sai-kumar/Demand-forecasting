@@ -32,6 +32,22 @@ APP_BASE_URL = os.getenv("APP_BASE_URL", "http://127.0.0.1:5000").rstrip("/")
 # ---------- LOAD MODEL ----------
 model = joblib.load("model/xgb_model.joblib")
 
+
+def _trend_label(series: pd.Series | np.ndarray | list[float], eps: float = 1e-9) -> str:
+    """Return a human-friendly trend label based on the fitted slope."""
+    values = np.asarray(series, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return "Flat"
+
+    x = np.arange(values.size, dtype=float)
+    slope = np.polyfit(x, values, 1)[0]
+    if slope > eps:
+        return "Upward"
+    if slope < -eps:
+        return "Downward"
+    return "Flat"
+
 # ---------- LOGIN ----------
 @app.route('/', methods=['GET', 'POST'])
 def login():
@@ -205,12 +221,15 @@ def upload():
         'predicted': preds
     }).set_index('date').resample('W').mean()
 
+    past_actual_trend = _trend_label(graph_df['actual'])
+    past_pred_trend = _trend_label(graph_df['predicted'])
+
     plt.figure(figsize=(11, 5))
     plt.plot(graph_df.index, graph_df['actual'], label="Actual", linewidth=2)
     plt.plot(graph_df.index, graph_df['predicted'], label="Predicted", linewidth=2)
     plt.legend()
     plt.grid(True)
-    plt.title("Weekly Actual vs Predicted Sales")
+    plt.title("Actual vs Predicted Sales (Weekly)")
     plt.savefig("graphs/past_graph.png")
     plt.close()
 
@@ -244,8 +263,11 @@ def upload():
         )
     })
 
+    future_trend = _trend_label(future_df['Predicted_Sales'])
+
     plt.figure(figsize=(10, 5))
     plt.plot(future_df['Month'], future_df['Predicted_Sales'], marker='o')
+    plt.title(f"Future Sales Forecast ({months} Month{'s' if months > 1 else ''})")
     plt.grid(True)
     plt.savefig("graphs/future_graph.png")
     plt.close()
@@ -284,6 +306,11 @@ def upload():
     # ---------- STORE FOR DOWNLOAD ----------
     session['metrics'] = {'MAE': mae, 'RMSE': rmse, 'R2': r2}
     session['insights'] = {'Average Demand': avg_demand, 'Recommendation': recommendation}
+    session['trends'] = {
+        'Past Actual Trend': past_actual_trend,
+        'Past Predicted Trend': past_pred_trend,
+        'Future Forecast Trend': future_trend,
+    }
     session['category_cost_table'] = category_cost_table
 
     return render_template(
@@ -296,6 +323,9 @@ def upload():
         r2=r2,
         avg_demand=avg_demand,
         recommendation=recommendation,
+        past_actual_trend=past_actual_trend,
+        past_pred_trend=past_pred_trend,
+        future_trend=future_trend,
         category_cost_table=category_cost_table
     )
 
@@ -334,6 +364,18 @@ def download_pdf():
     for k, v in session['insights'].items():
         c.drawString(50, y, f"{k}: {v}")
         y -= 20
+
+    # Add trend summary if present
+    trends = session.get('trends') or {}
+    if trends:
+        y -= 10
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y, "Trend Summary")
+        y -= 20
+        c.setFont("Helvetica", 11)
+        for k, v in trends.items():
+            c.drawString(50, y, f"{k}: {v}")
+            y -= 18
 
     c.drawImage("graphs/past_graph.png", 50, 250, 500, 200)
     c.drawImage("graphs/future_graph.png", 50, 20, 500, 200)
