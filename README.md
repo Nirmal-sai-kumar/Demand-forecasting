@@ -1,7 +1,5 @@
 ```powershell
 # 1) Go to project folder
-cd "E:\EDUCATIONAL DATA\SEM-8\new Retail_Demand_Forecasting"
-
 # 2) Create + activate virtual environment
 python -m venv .venv
 .\.venv\Scripts\Activate
