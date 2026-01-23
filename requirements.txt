@@ -9,3 +9,4 @@ reportlab
 xgboost
 python-dotenv
 supabase
+gunicorn
