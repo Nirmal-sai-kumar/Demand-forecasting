@@ -230,6 +230,8 @@ def upload():
     if request.method == 'GET':
         return redirect(url_for('home'))
 
+    app.logger.info("/upload POST received")
+
     try:
         file = request.files.get('file')
         if not file or not file.filename:
