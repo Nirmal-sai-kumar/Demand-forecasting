@@ -61,6 +61,24 @@ if not os.path.exists(MODEL_PATH):
 model = joblib.load(MODEL_PATH)
 
 
+# XGBoost can raise "data did not contain feature names" on some deployments
+# depending on version + pandas integration. Use a safe wrapper that disables
+# feature validation when supported.
+FEATURE_COLS = ["lag_1", "lag_7", "roll_mean_7", "roll_mean_30"]
+
+
+def _safe_predict(m, X):
+    """Predict with XGBoost models across versions.
+
+    Some XGBoost versions enforce feature-name validation even when given a
+    pandas DataFrame. Disabling validate_features avoids Runtime 500s on Render.
+    """
+    try:
+        return m.predict(X, validate_features=False)
+    except TypeError:
+        return m.predict(X)
+
+
 def _load_report_from_session() -> dict:
     report_id = session.get("report_id")
     if not report_id:
@@ -285,10 +303,10 @@ def upload():
                 ),
             ), 400
 
-        feature_cols = ['lag_1', 'lag_7', 'roll_mean_7', 'roll_mean_30']
-        X = df[feature_cols].astype(float)
+        X = df[FEATURE_COLS].astype(float)
+        X.columns = [str(c) for c in X.columns]
         y = df['units_sold']
-        preds = model.predict(X)
+        preds = _safe_predict(model, X)
 
         # ---------- METRICS ----------
         mae = int(mean_absolute_error(y, preds))
@@ -339,9 +357,9 @@ def upload():
             # Use a DataFrame with the same column names to avoid ValueError on Render.
             features_df = pd.DataFrame(
                 [[lag_1, lag_7, roll_mean_7, roll_mean_30]],
-                columns=feature_cols,
+                columns=FEATURE_COLS,
             )
-            val = float(model.predict(features_df)[0])
+            val = float(_safe_predict(model, features_df)[0])
             future.append(val)
             history.append(val)
 

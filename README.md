@@ -2,7 +2,12 @@
 # 1) Go to project folder
 # 2) Create + activate virtual environment
 python -m venv .venv
-.\.venv\Scripts\Activate
+
+# PowerShell:
+.\.venv\Scripts\Activate.ps1
+
+# CMD:
+# .\.venv\Scripts\activate.bat
 
 # 3) Install all dependencies (CORRECT)
 python -m pip install --upgrade pip
