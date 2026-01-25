@@ -1,13 +1,21 @@
-from flask import Flask, request, render_template, redirect, url_for, session, send_file
+from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request
 import json
 import logging
 import os
 import tempfile
+import time
+from typing import List, Union
 from uuid import uuid4
 
 import pandas as pd
 import numpy as np
 import joblib
+
+# ---------- RUNTIME DIR (set early for Matplotlib) ----------
+RUNTIME_DIR = os.getenv("RUNTIME_DIR", tempfile.gettempdir())
+MPLCONFIG_DIR = os.path.join(RUNTIME_DIR, "matplotlib")
+os.makedirs(MPLCONFIG_DIR, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", MPLCONFIG_DIR)
 
 # Ensure matplotlib uses a non-GUI backend in production (Render/Linux)
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -31,18 +39,18 @@ logging.basicConfig(level=logging.INFO)
 
 # ---------- RUNTIME FOLDERS (writable on Render) ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RUNTIME_DIR = os.getenv("RUNTIME_DIR", tempfile.gettempdir())
-
 UPLOAD_DIR = os.path.join(RUNTIME_DIR, "retail_forecast_uploads")
 GRAPH_DIR = os.path.join(RUNTIME_DIR, "retail_forecast_graphs")
 DOWNLOAD_DIR = os.path.join(RUNTIME_DIR, "retail_forecast_downloads")
-MPLCONFIG_DIR = os.path.join(RUNTIME_DIR, "matplotlib")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(GRAPH_DIR, exist_ok=True)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(MPLCONFIG_DIR, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", MPLCONFIG_DIR)
+
+ALLOWED_UPLOAD_EXTS = {".csv", ".xlsx", ".xls"}
+TREND_EPS_DEFAULT = float(os.getenv("TREND_EPS", "0.01"))
+CLEANUP_MAX_AGE_HOURS = float(os.getenv("CLEANUP_MAX_AGE_HOURS", "24"))
+MAX_FORECAST_MONTHS = 12
 
 app = Flask(__name__)
 app.static_folder = GRAPH_DIR
@@ -89,15 +97,40 @@ def _load_report_from_session() -> dict:
         return json.load(f)
 
 
-def _trend_label(series: pd.Series | np.ndarray | list[float], eps: float = 1e-9) -> str:
+def _cleanup_runtime_dirs(max_age_hours: float = CLEANUP_MAX_AGE_HOURS) -> None:
+    """Best-effort cleanup of temp files to prevent disk growth on Render."""
+    try:
+        max_age_seconds = float(max_age_hours) * 3600.0
+    except Exception:
+        max_age_seconds = 24.0 * 3600.0
+
+    now = time.time()
+    for directory in (UPLOAD_DIR, GRAPH_DIR, DOWNLOAD_DIR):
+        try:
+            for name in os.listdir(directory):
+                path = os.path.join(directory, name)
+                try:
+                    if not os.path.isfile(path):
+                        continue
+                    age = now - os.path.getmtime(path)
+                    if age > max_age_seconds:
+                        os.remove(path)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+
+
+def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float = TREND_EPS_DEFAULT) -> str:
     """Return a human-friendly trend label based on the fitted slope."""
     values = np.asarray(series, dtype=float)
     values = values[np.isfinite(values)]
     if values.size < 2:
-        return "Flat"
+        return "Insufficient Data"
 
     x = np.arange(values.size, dtype=float)
     slope = np.polyfit(x, values, 1)[0]
+    eps = float(eps)
     if slope > eps:
         return "Upward"
     if slope < -eps:
@@ -251,6 +284,8 @@ def upload():
     app.logger.info("/upload POST received")
 
     try:
+        _cleanup_runtime_dirs()
+
         file = request.files.get('file')
         if not file or not file.filename:
             return render_template("index.html", error="Please choose a dataset file to upload."), 400
@@ -259,11 +294,22 @@ def upload():
         if not months_raw.isdigit():
             return render_template("index.html", error="Please enter a valid number of months."), 400
         months = int(months_raw)
-        if months < 1 or months > 24:
-            return render_template("index.html", error="Months must be between 1 and 24."), 400
+        if months < 1 or months > MAX_FORECAST_MONTHS:
+            return render_template(
+                "index.html",
+                error=f"Months must be between 1 and {MAX_FORECAST_MONTHS}.",
+            ), 400
 
         filename = secure_filename(file.filename)
         ext = os.path.splitext(filename)[1].lower()
+        if ext not in ALLOWED_UPLOAD_EXTS:
+            return render_template(
+                "index.html",
+                error=(
+                    f"Unsupported file type: {ext or '(no extension)'}. "
+                    f"Allowed: {', '.join(sorted(ALLOWED_UPLOAD_EXTS))}."
+                ),
+            ), 400
         report_id = str(uuid4())
 
         dataset_path = os.path.join(UPLOAD_DIR, f"{report_id}{ext or '.xlsx'}")
@@ -285,16 +331,25 @@ def upload():
             ), 400
 
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df['units_sold'] = pd.to_numeric(df['units_sold'], errors='coerce')
         df = df.sort_values('date').dropna(subset=['date', 'units_sold'])
 
-        # ---------- FEATURE ENGINEERING ----------
-        df['lag_1'] = df['units_sold'].shift(1)
-        df['lag_7'] = df['units_sold'].shift(7)
-        df['roll_mean_7'] = df['units_sold'].shift(1).rolling(7).mean()
-        df['roll_mean_30'] = df['units_sold'].shift(1).rolling(30).mean()
-        df.dropna(inplace=True)
+        raw_history = df['units_sold'].astype(float).tolist()
+        if len(raw_history) < 30:
+            return render_template(
+                "index.html",
+                error="Not enough history for forecasting. Please upload at least 30 days of data.",
+            ), 400
 
-        if df.empty:
+        # ---------- FEATURE ENGINEERING ----------
+        df_feat = df.copy()
+        df_feat['lag_1'] = df_feat['units_sold'].shift(1)
+        df_feat['lag_7'] = df_feat['units_sold'].shift(7)
+        df_feat['roll_mean_7'] = df_feat['units_sold'].shift(1).rolling(7).mean()
+        df_feat['roll_mean_30'] = df_feat['units_sold'].shift(1).rolling(30).mean()
+        df_feat.dropna(inplace=True)
+
+        if df_feat.empty:
             return render_template(
                 "index.html",
                 error=(
@@ -303,9 +358,8 @@ def upload():
                 ),
             ), 400
 
-        X = df[FEATURE_COLS].astype(float)
-        X.columns = [str(c) for c in X.columns]
-        y = df['units_sold']
+        X = df_feat[FEATURE_COLS].astype(float)
+        y = df_feat['units_sold'].astype(float)
         preds = _safe_predict(model, X)
 
         # ---------- METRICS ----------
@@ -315,7 +369,7 @@ def upload():
 
         # ---------- PAST GRAPH ----------
         graph_df = pd.DataFrame({
-            'date': df['date'],
+            'date': df_feat['date'],
             'actual': y,
             'predicted': preds
         }).set_index('date').resample('W').mean()
@@ -334,17 +388,14 @@ def upload():
         plt.legend()
         plt.grid(True)
         plt.title("Actual vs Predicted Sales (Weekly)")
+        plt.xlabel("Date")
+        plt.ylabel("Units Sold")
         plt.savefig(past_path)
         plt.close()
 
         # ---------- FUTURE FORECAST ----------
-        future: list[float] = []
-        history = df['units_sold'].astype(float).tolist()
-        if len(history) < 30:
-            return render_template(
-                "index.html",
-                error="Not enough history for forecasting. Please upload more data.",
-            ), 400
+        future: List[float] = []
+        history = list(raw_history)
 
         steps = months * 4
         for _ in range(steps):
@@ -363,22 +414,27 @@ def upload():
             future.append(val)
             history.append(val)
 
+        monthly_pred = (
+            pd.Series(future)
+            .groupby(np.arange(len(future)) // 4)
+            .mean()
+        )
+
         future_df = pd.DataFrame({
             "Month": range(1, months + 1),
-            "Predicted_Sales": (
-                pd.Series(future)
-                .groupby(np.arange(len(future)) // 4)
-                .mean()
-                .astype(int)
-                .values
-            )
+            "Predicted_Sales": monthly_pred.round().astype(int).values,
         })
 
-        future_trend = _trend_label(future_df['Predicted_Sales'])
+        future_forecast_table = future_df.to_dict(orient='records')
+
+        future_trend = _trend_label(monthly_pred.values)
 
         plt.figure(figsize=(10, 5))
         plt.plot(future_df['Month'], future_df['Predicted_Sales'], marker='o')
         plt.title(f"Future Sales Forecast ({months} Month{'s' if months > 1 else ''})")
+        plt.xlabel("Month")
+        plt.ylabel("Predicted Sales (Units)")
+        plt.xticks(future_df['Month'].astype(int).tolist())
         plt.grid(True)
         plt.savefig(future_path)
         plt.close()
@@ -396,11 +452,14 @@ def upload():
         # ---------- OPTIONAL CATEGORY COST TABLE ----------
         category_cost_table = []
         if 'price' in df.columns and 'product_category' in df.columns:
-            df['month'] = df['date'].dt.month
-            df['total_cost'] = df['price'] * df['units_sold']
+            df_cat = df.copy()
+            df_cat['price'] = pd.to_numeric(df_cat['price'], errors='coerce')
+            df_cat['year_month'] = df_cat['date'].dt.to_period('M').astype(str)
+            df_cat['total_cost'] = df_cat['price'] * df_cat['units_sold']
+            df_cat = df_cat.dropna(subset=['year_month', 'product_category', 'units_sold', 'total_cost'])
 
             category_cost_df = (
-                df.groupby(['month', 'product_category'])
+                df_cat.groupby(['year_month', 'product_category'])
                 .agg(
                     total_units_sold=('units_sold', 'sum'),
                     total_cost=('total_cost', 'sum')
@@ -408,8 +467,14 @@ def upload():
                 .reset_index()
             )
 
-            category_cost_df['total_units_sold'] = category_cost_df['total_units_sold'].astype(int)
-            category_cost_df['total_cost'] = category_cost_df['total_cost'].astype(int)
+            # Show only the most recent N months (where N == selected forecast months)
+            month_keys = sorted(category_cost_df['year_month'].unique())
+            last_n = month_keys[-months:] if month_keys else []
+            if last_n:
+                category_cost_df = category_cost_df[category_cost_df['year_month'].isin(last_n)]
+
+            category_cost_df['total_units_sold'] = category_cost_df['total_units_sold'].round().astype(int)
+            category_cost_df['total_cost'] = category_cost_df['total_cost'].round().astype(int)
             category_cost_table = category_cost_df.to_dict(orient='records')
 
         # ---------- STORE FOR DOWNLOAD (avoid huge cookies) ----------
@@ -421,6 +486,7 @@ def upload():
                 'Past Predicted Trend': past_pred_trend,
                 'Future Forecast Trend': future_trend,
             },
+            "future_forecast_table": future_forecast_table,
             "category_cost_table": category_cost_table,
             "past_image": past_image,
             "future_image": future_image,
@@ -445,6 +511,7 @@ def upload():
             past_actual_trend=past_actual_trend,
             past_pred_trend=past_pred_trend,
             future_trend=future_trend,
+            future_forecast_table=future_forecast_table,
             category_cost_table=category_cost_table
         )
     except Exception:
@@ -454,23 +521,49 @@ def upload():
 # ---------- DOWNLOAD EXCEL ----------
 @app.route('/download/excel')
 def download_excel():
-    report = _load_report_from_session()
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+
+    try:
+        report = _load_report_from_session()
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
+
     report_id = session.get("report_id")
     path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
 
     with pd.ExcelWriter(path, engine='openpyxl') as writer:
         pd.DataFrame([report.get('metrics', {})]).to_excel(writer, sheet_name="Metrics", index=False)
         pd.DataFrame([report.get('insights', {})]).to_excel(writer, sheet_name="Insights", index=False)
+        pd.DataFrame([report.get('trends', {})]).to_excel(writer, sheet_name="Trends", index=False)
+        pd.DataFrame(report.get('future_forecast_table', [])).to_excel(
+            writer, sheet_name="Future_Forecast", index=False
+        )
         pd.DataFrame(report.get('category_cost_table', [])).to_excel(
             writer, sheet_name="Monthwise_Category_Cost", index=False
         )
+
+    @after_this_request
+    def _remove_generated_excel(response):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return response
 
     return send_file(path, as_attachment=True)
 
 # ---------- DOWNLOAD PDF ----------
 @app.route('/download/pdf')
 def download_pdf():
-    report = _load_report_from_session()
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+
+    try:
+        report = _load_report_from_session()
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
+
     report_id = session.get("report_id")
     path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
     c = canvas.Canvas(path, pagesize=A4)
@@ -480,14 +573,25 @@ def download_pdf():
     c.drawString(50, height - 50, "Retail Demand Forecasting Report")
 
     c.setFont("Helvetica", 11)
+    top_margin = 50
+    bottom_margin = 50
     y = height - 100
 
+    def ensure_space(needed: float) -> None:
+        nonlocal y
+        if y - needed < bottom_margin:
+            c.showPage()
+            c.setFont("Helvetica", 11)
+            y = height - top_margin
+
     for k, v in (report.get('metrics') or {}).items():
+        ensure_space(20)
         c.drawString(50, y, f"{k}: {v}")
         y -= 20
 
     y -= 20
     for k, v in (report.get('insights') or {}).items():
+        ensure_space(20)
         c.drawString(50, y, f"{k}: {v}")
         y -= 20
 
@@ -495,22 +599,83 @@ def download_pdf():
     trends = report.get('trends') or {}
     if trends:
         y -= 10
+        ensure_space(40)
         c.setFont("Helvetica-Bold", 11)
         c.drawString(50, y, "Trend Summary")
         y -= 20
         c.setFont("Helvetica", 11)
         for k, v in trends.items():
+            ensure_space(18)
             c.drawString(50, y, f"{k}: {v}")
             y -= 18
 
+    # Future forecast values (month -> predicted sales)
+    future_table = report.get('future_forecast_table') or []
+    if future_table:
+        y -= 10
+        ensure_space(40)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y, "Future Forecast Values")
+        y -= 20
+        c.setFont("Helvetica", 11)
+        for row in future_table:
+            ensure_space(16)
+            m = row.get('Month')
+            v = row.get('Predicted_Sales')
+            c.drawString(50, y, f"Month {m}: {v} units")
+            y -= 16
+
+    # Category table (recent N months)
+    cat_rows = report.get('category_cost_table') or []
+    if cat_rows:
+        y -= 10
+        ensure_space(40)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y, "Category Cost & Stock (Recent Months)")
+        y -= 20
+        c.setFont("Helvetica", 10)
+        for row in cat_rows:
+            ensure_space(14)
+            ym = row.get('year_month') or row.get('month')
+            cat = row.get('product_category')
+            units = row.get('total_units_sold')
+            cost = row.get('total_cost')
+            c.drawString(50, y, f"{ym} | {cat} | Units: {units} | Cost: {cost}")
+            y -= 14
+
     past_image = report.get("past_image")
     future_image = report.get("future_image")
+
+    image_w = 500
+    image_h = 200
+    gap = 20
+
     if past_image:
-        c.drawImage(os.path.join(GRAPH_DIR, past_image), 50, 250, 500, 200)
+        ensure_space(image_h + gap + 14)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y, "Past Sales: Actual vs Predicted")
+        y -= 14
+        c.drawImage(os.path.join(GRAPH_DIR, past_image), 50, y - image_h, image_w, image_h)
+        y -= image_h + gap
+
     if future_image:
-        c.drawImage(os.path.join(GRAPH_DIR, future_image), 50, 20, 500, 200)
+        ensure_space(image_h + gap + 14)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y, "Future Forecast")
+        y -= 14
+        c.drawImage(os.path.join(GRAPH_DIR, future_image), 50, y - image_h, image_w, image_h)
+        y -= image_h + gap
 
     c.save()
+
+    @after_this_request
+    def _remove_generated_pdf(response):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return response
+
     return send_file(path, as_attachment=True)
 
 if __name__ == "__main__":
