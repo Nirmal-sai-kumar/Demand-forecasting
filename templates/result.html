@@ -120,18 +120,42 @@
 
     <!-- GRAPH 1 -->
     <div class="card">
-        <h2>Actual vs Predicted Sales — Trend: {{ past_actual_trend }}</h2>
+        <h2>Actual vs Predicted Sales (Weekly Averages)</h2>
         <img src="{{ url_for('static', filename=past_image) }}">
         <p class="no-data" style="margin-top: 12px;">
             Actual trend: <strong>{{ past_actual_trend }}</strong> &nbsp;|&nbsp;
             Predicted trend: <strong>{{ past_pred_trend }}</strong>
         </p>
+        <p class="no-data" style="margin-top: 6px;">
+            Trend is calculated from weekly average values.
+        </p>
     </div>
 
     <!-- GRAPH 2 -->
     <div class="card">
-        <h2>Future Sales Forecast ({{ months }} Month{{ 's' if months > 1 else '' }}) — Trend Graph: {{ future_trend }}</h2>
+        <h2>Future Sales Forecast ({{ months }} Month{{ 's' if months > 1 else '' }}) — Forecast Trend: {{ future_trend }}</h2>
         <img src="{{ url_for('static', filename=future_image) }}">
+    </div>
+
+    <!-- FUTURE FORECAST VALUES -->
+    <div class="card">
+        <h2>Future Forecast Values ({{ months }} Month{{ 's' if months > 1 else '' }})</h2>
+        {% if future_forecast_table %}
+        <table>
+            <tr>
+                <th>Month</th>
+                <th>Predicted Sales (Units)</th>
+            </tr>
+            {% for row in future_forecast_table %}
+            <tr>
+                <td>{{ row.Month }}</td>
+                <td>{{ row.Predicted_Sales }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p class="no-data">No future forecast values available.</p>
+        {% endif %}
     </div>
 
     <!-- BUSINESS INSIGHTS -->
@@ -154,7 +178,7 @@
 
     <!-- FINAL REVIEWER FEATURE -->
     <div class="card">
-        <h2>Month-wise Category Cost & Stock Analysis</h2>
+        <h2>Category Cost & Stock Analysis (Recent {{ months }} Month{{ 's' if months > 1 else '' }})</h2>
 
         {% if category_cost_table %}
         <table>
@@ -167,7 +191,7 @@
 
             {% for row in category_cost_table %}
             <tr>
-                <td>{{ row.month }}</td>
+                <td>{{ row.year_month }}</td>
                 <td>{{ row.product_category }}</td>
                 <td>{{ row.total_units_sold }}</td>
                 <td>₹ {{ row.total_cost }}</td>
