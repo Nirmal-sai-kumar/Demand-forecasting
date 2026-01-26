@@ -1,21 +1,54 @@
+# Retail Demand Forecasting
+
+## Setup Instructions
+
+Create and activate virtual environment:
+
 ```powershell
-# 1) Go to project folder
-# 2) Create + activate virtual environment
 python -m venv .venv
-
-# PowerShell:
 .\.venv\Scripts\Activate.ps1
+```
 
-# CMD:
-# .\.venv\Scripts\activate.bat
+Install dependencies:
 
-# 3) Install all dependencies (CORRECT)
+```powershell
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
 
-# 4) Train + save model (creates: model\xgb_model.joblib and graphs\xgb_graph.png)
+Train the model:
+
+```powershell
 python ml_model_xgb.py
+```
 
-# 5) Run the web app
+Run the web app:
+
+```powershell
 python app.py
+```
+
+## Project Structure
+
+```
+Retail_Demand_Forecasting/
+│
+├── app.py
+├── ml_model_xgb.py
+├── README.md
+├── requirements.txt
+├── supabase_client.py
+├── users.csv
+├── __pycache__/
+├── dataset/
+├── downloads/
+├── graphs/
+├── model/
+│   └── xgb_model.joblib
+└── templates/
+    ├── index.html
+    ├── login.html
+    ├── register.html
+    ├── result.html
+    └── upload.html
 ```
