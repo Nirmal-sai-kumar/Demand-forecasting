@@ -1,15 +1,21 @@
 import os
+from dotenv import load_dotenv
 from supabase import Client, create_client
 from supabase.lib.client_options import ClientOptions
 
 
 def get_supabase(access_token: str | None = None) -> Client:
-    url = os.getenv("VITE_SUPABASE_URL")
-    key = os.getenv("VITE_SUPABASE_ANON_KEY")
+    # Ensure local development can read variables from .env.
+    # In production, environment variables should be set by the hosting platform.
+    load_dotenv(override=True)
+
+    # Support common naming conventions.
+    url = os.getenv("VITE_SUPABASE_URL") or os.getenv("SUPABASE_URL")
+    key = os.getenv("VITE_SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY")
 
     if not url or not key:
         raise RuntimeError(
-            "Missing Supabase config. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in .env"
+            "Missing Supabase config. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY (or SUPABASE_URL/SUPABASE_ANON_KEY) in .env"
         )
 
     # If you pass a user session access token, Supabase will apply RLS policies
