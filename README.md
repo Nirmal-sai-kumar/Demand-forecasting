@@ -28,6 +28,24 @@ Run the web app:
 python app.py
 ```
 
+## Supabase Auth Notes (Login/Register/Forgot Password)
+
+This app uses **Supabase Auth** for login/registration.
+
+- Ensure your `.env` contains:
+    - `VITE_SUPABASE_URL`
+    - `VITE_SUPABASE_ANON_KEY`
+    - (recommended) `APP_BASE_URL` (your deployed base URL, e.g. `https://your-app.onrender.com`)
+
+If `APP_BASE_URL` is not set, links sent by email (confirm email / password reset) may redirect to `http://127.0.0.1:5000`.
+
+In Supabase Dashboard → **Auth** → **URL Configuration**, add these to **Additional Redirect URLs**:
+- `http://127.0.0.1:5000/auth/callback`
+- `http://127.0.0.1:5000/reset-password`
+- and your deployed equivalents:
+    - `https://<your-domain>/auth/callback`
+    - `https://<your-domain>/reset-password`
+
 ## Project Structure
 
 ```
