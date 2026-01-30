@@ -63,6 +63,21 @@
             font-size: 14px;
         }
 
+        .forgot-link {
+            margin-top: 12px;
+            font-size: 13px;
+        }
+
+        .forgot-link a {
+            color: #1f4037;
+            font-weight: bold;
+            text-decoration: none;
+        }
+
+        .forgot-link a:hover {
+            text-decoration: underline;
+        }
+
         .register-link a {
             color: #1f4037;
             font-weight: bold;
@@ -91,12 +106,16 @@
     <h2>Retail Demand Forecasting</h2>
     <p>Login to access sales forecasting dashboard</p>
 
-    <form method="POST" action="/">
+    <form method="POST" action="{{ url_for('login') }}">
         <input type="text" name="username" placeholder="Email" required>
         <input type="password" name="password" placeholder="Password" required>
 
         <button type="submit">Login</button>
     </form>
+
+    <div class="forgot-link">
+        <a href="{{ url_for('forgot_password') }}">Forgot password?</a>
+    </div>
 
     {% if error %}
         <div class="error">{{ error }}</div>
@@ -107,7 +126,7 @@
     {% endif %}
 
     <div class="register-link">
-        New user? <a href="/register">Register here</a>
+        New user? <a href="{{ url_for('register') }}">Register here</a>
     </div>
 </div>
 

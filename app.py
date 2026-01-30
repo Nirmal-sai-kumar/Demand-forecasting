@@ -54,7 +54,13 @@ MAX_FORECAST_MONTHS = 12
 
 app = Flask(__name__)
 app.static_folder = GRAPH_DIR
-app.secret_key = "retail_secret_key"
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "retail_secret_key")
+
+# Session cookie defaults (helps login sessions behave consistently)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
 # Base URL for auth redirects (set in .env if needed)
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://127.0.0.1:5000").rstrip("/")
@@ -73,6 +79,23 @@ model = joblib.load(MODEL_PATH)
 # depending on version + pandas integration. Use a safe wrapper that disables
 # feature validation when supported.
 FEATURE_COLS = ["lag_1", "lag_7", "roll_mean_7", "roll_mean_30"]
+
+
+def _resp_get(obj, key: str):
+    """Safely read a key from supabase-py responses across versions."""
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _first_non_empty(*values: str | None) -> str | None:
+    for v in values:
+        if v is None:
+            continue
+        v = str(v).strip()
+        if v:
+            return v
+    return None
 
 
 def _safe_predict(m, X):
@@ -142,8 +165,11 @@ def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float =
 def login():
     if request.method == 'POST':
         # Supabase Auth expects an email for sign-in.
-        email = request.form['username'].strip().lower()
-        pwd = request.form['password']
+        email_raw = _first_non_empty(request.form.get('username'), request.form.get('email'))
+        pwd = request.form.get('password')
+        if not email_raw or not pwd:
+            return render_template("login.html", error="Please enter email and password")
+        email = email_raw.lower()
 
         try:
             sb = get_supabase()
@@ -156,23 +182,35 @@ def login():
                     "login.html",
                     error="Email not confirmed. Please confirm from your inbox, then login."
                 )
+            if "invalid login credentials" in msg_lower or "invalid_grant" in msg_lower:
+                return render_template("login.html", error="Invalid email or password")
             return render_template("login.html", error=f"Supabase login error: {msg}")
 
-        if getattr(res, "user", None) is None:
-            return render_template("login.html", error="Invalid credentials")
+        user_obj = _resp_get(res, "user")
+        session_obj = _resp_get(res, "session")
+
+        if user_obj is None:
+            return render_template("login.html", error="Invalid email or password")
 
         # If Confirm Email is enabled, Supabase can return a user but no session.
-        if getattr(res, "session", None) is None:
+        if session_obj is None:
             return render_template(
                 "login.html",
                 error="Login blocked. Please confirm your email first, then login."
             )
 
+        access_token = _resp_get(session_obj, "access_token")
+        refresh_token = _resp_get(session_obj, "refresh_token")
+        if not access_token:
+            return render_template("login.html", error="Login failed. Please try again.")
+
+        # Avoid stale data by clearing any previous session before setting new values.
+        session.clear()
         session['logged_in'] = True
-        session['user_id'] = res.user.id
-        session['user_email'] = res.user.email
-        session['access_token'] = res.session.access_token
-        session['refresh_token'] = res.session.refresh_token
+        session['user_id'] = _resp_get(user_obj, "id")
+        session['user_email'] = _resp_get(user_obj, "email")
+        session['access_token'] = access_token
+        session['refresh_token'] = refresh_token
 
         # Best-effort: fetch profile (requires your RLS policies + access token)
         try:
@@ -180,7 +218,7 @@ def login():
             profile_res = (
                 sb_user.table("profiles")
                 .select("id, username")
-                .eq("id", res.user.id)
+                .eq("id", session['user_id'])
                 .maybe_single()
                 .execute()
             )
@@ -198,14 +236,19 @@ def login():
 def register():
     if request.method == 'POST':
         # Supabase Auth expects an email for sign-up.
-        email = request.form['username'].strip().lower()
+        email_raw = _first_non_empty(request.form.get('username'), request.form.get('email'))
+        if not email_raw:
+            return render_template("register.html", error="Please enter your email")
+        email = email_raw.lower()
         # Optional username field (if not provided, derive from email prefix)
         username = (request.form.get('profile_username') or "").strip()
         if not username and '@' in email:
             username = email.split('@', 1)[0]
 
-        pwd = request.form['password']
-        confirm = request.form['confirm']
+        pwd = request.form.get('password')
+        confirm = request.form.get('confirm') or request.form.get('confirm_password')
+        if not pwd or not confirm:
+            return render_template("register.html", error="Please enter and confirm your password")
 
         if pwd != confirm:
             return render_template("register.html", error="Passwords do not match")
@@ -226,12 +269,35 @@ def register():
                 }
             )
         except Exception as e:
-            return render_template("register.html", error=f"Supabase error: {e}")
+            msg = str(e)
+            msg_lower = msg.lower()
+            if "already registered" in msg_lower or "user already registered" in msg_lower:
+                return render_template("register.html", error="User already exists. Please login.")
+            if "invalid email" in msg_lower:
+                return render_template("register.html", error="Please enter a valid email address")
+            if "weak_password" in msg_lower or "password" in msg_lower and "weak" in msg_lower:
+                return render_template("register.html", error="Password is too weak. Try a stronger one.")
+            return render_template("register.html", error=f"Supabase error: {msg}")
 
-        if getattr(res, "user", None) is None:
+        user_obj = _resp_get(res, "user")
+        session_obj = _resp_get(res, "session")
+
+        if user_obj is None:
             return render_template("register.html", error="Registration failed")
 
-        # With email confirmation enabled, res.session may be None: that's still a success.
+        # With email confirmation enabled, session may be None: that's still a success.
+        # If email confirmation is disabled, Supabase may return a session; we can auto-login.
+        access_token = _resp_get(session_obj, "access_token")
+        refresh_token = _resp_get(session_obj, "refresh_token")
+        if access_token:
+            session.clear()
+            session['logged_in'] = True
+            session['user_id'] = _resp_get(user_obj, "id")
+            session['user_email'] = _resp_get(user_obj, "email")
+            session['access_token'] = access_token
+            session['refresh_token'] = refresh_token
+            return redirect(url_for('home'))
+
         return render_template(
             "register.html",
             success="Registration successful. Check your email to confirm, then login."
@@ -257,6 +323,59 @@ def auth_callback():
         "login.html",
         error=None,
         info="Email confirmed. You can login now."
+    )
+
+
+# ---------- FORGOT / RESET PASSWORD ----------
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = (request.form.get('email') or "").strip().lower()
+        if not email:
+            return render_template("forgot_password.html", error="Please enter your email.")
+
+        try:
+            sb = get_supabase()
+            redirect_to = f"{APP_BASE_URL}/reset-password"
+
+            # supabase-py has had slightly different method signatures across versions
+            try:
+                sb.auth.reset_password_email(email, {"redirect_to": redirect_to})
+            except TypeError:
+                sb.auth.reset_password_email(email)
+            except AttributeError:
+                # older method name
+                sb.auth.reset_password_for_email(email, {"redirect_to": redirect_to})
+
+            return render_template(
+                "forgot_password.html",
+                info="If an account exists for that email, a password reset link has been sent."
+            )
+        except Exception as e:
+            return render_template("forgot_password.html", error=f"Unable to send reset email: {e}")
+
+    return render_template("forgot_password.html")
+
+
+@app.route('/reset-password', methods=['GET'])
+def reset_password():
+    # The Supabase recovery link typically includes tokens in the URL fragment (#...)
+    # which the server cannot read. The template uses JS to read the fragment and
+    # complete the password update via supabase-js.
+    supabase_url = os.getenv("VITE_SUPABASE_URL", "")
+    supabase_anon_key = os.getenv("VITE_SUPABASE_ANON_KEY", "")
+    if not supabase_url or not supabase_anon_key:
+        return render_template(
+            "reset_password.html",
+            error="Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.",
+            supabase_url="",
+            supabase_anon_key="",
+        )
+
+    return render_template(
+        "reset_password.html",
+        supabase_url=supabase_url,
+        supabase_anon_key=supabase_anon_key,
     )
 
 # ---------- HOME ----------
