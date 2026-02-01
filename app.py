@@ -256,6 +256,9 @@ def register():
         try:
             sb = get_supabase()
 
+            # Choose redirect base: prefer explicit APP_BASE_URL, otherwise use current request host.
+            redirect_base = os.getenv("APP_BASE_URL") or request.url_root.rstrip('/')
+
             # Send username in user metadata so your DB trigger can populate public.profiles.username
             res = sb.auth.sign_up(
                 {
@@ -264,7 +267,7 @@ def register():
                     "options": {
                         "data": {"username": username},
                         # Ensure the confirmation link redirects back to this Flask app
-                        "emailRedirectTo": f"{APP_BASE_URL}/auth/callback",
+                        "emailRedirectTo": f"{redirect_base}/auth/callback",
                     },
                 }
             )
@@ -336,7 +339,9 @@ def forgot_password():
 
         try:
             sb = get_supabase()
-            redirect_to = f"{APP_BASE_URL}/reset-password"
+            # Prefer explicit APP_BASE_URL, otherwise use the current request host so links work
+            redirect_base = os.getenv("APP_BASE_URL") or request.url_root.rstrip('/')
+            redirect_to = f"{redirect_base}/reset-password"
 
             # supabase-py has had slightly different method signatures across versions
             try:
