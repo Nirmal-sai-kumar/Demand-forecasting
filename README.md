@@ -14,7 +14,7 @@ Flask web app for retail demand forecasting using an XGBoost model. The UI suppo
 
 ```powershell
 python -m venv .venv
-\.\.venv\Scripts\Activate.ps1
+\.venv\Scripts\Activate.ps1
 ```
 
 ### 2) Install dependencies
@@ -82,7 +82,6 @@ Otherwise it trains a legacy univariate model and saves:
 
 - `model/xgb_model.joblib`
 
-Note: The Flask app currently engineers only univariate lag/rolling features (`lag_1`, `lag_7`, `roll_mean_7`, `roll_mean_30`). If you point `MODEL_PATH` at the multifeature model, you will also need to update the app’s feature engineering to provide the additional inputs.
 
 ## Supabase Auth Notes (Login/Register/Forgot Password)
 
