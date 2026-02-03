@@ -14,7 +14,7 @@ Flask web app for retail demand forecasting using an XGBoost model. The UI suppo
 
 ```powershell
 python -m venv .venv
-\.venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1
 ```
 
 ### 2) Install dependencies
