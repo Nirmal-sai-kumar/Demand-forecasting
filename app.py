@@ -794,26 +794,101 @@ def download_pdf():
             app.logger.exception("Failed registering TTF font: %s", font_path)
             return False
 
+    def _download_file(url: str, dest_path: str, timeout_s: int = 20) -> bool:
+        """Download a file to dest_path. Used only as a last-resort for PDF font availability."""
+        try:
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            # Avoid re-downloading if already present.
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 10_000:
+                return True
+            import urllib.request
+
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "RetailDemandForecasting/1.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                data = resp.read()
+            # Basic sanity check (TTF/OTF fonts are not tiny)
+            if not data or len(data) < 10_000:
+                return False
+            with open(dest_path, "wb") as f:
+                f.write(data)
+            return True
+        except Exception:
+            app.logger.exception("Failed downloading file: %s", url)
+            return False
+
     try:
+        # Try to find a Unicode-capable TTF font on the host so the Rupee symbol (₹) renders.
+        # Render.com typically runs on Linux, where Windows font paths do not exist.
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Optional repo-bundled fonts (recommended for consistent deploys).
+        # You may add a font file later at one of these locations.
+        repo_regular = [
+            os.path.join(base_dir, "static", "fonts", "DejaVuSans.ttf"),
+            os.path.join(base_dir, "static", "fonts", "NotoSans-Regular.ttf"),
+            os.path.join(base_dir, "fonts", "DejaVuSans.ttf"),
+            os.path.join(base_dir, "fonts", "NotoSans-Regular.ttf"),
+        ]
+        repo_bold = [
+            os.path.join(base_dir, "static", "fonts", "DejaVuSans-Bold.ttf"),
+            os.path.join(base_dir, "static", "fonts", "NotoSans-Bold.ttf"),
+            os.path.join(base_dir, "fonts", "DejaVuSans-Bold.ttf"),
+            os.path.join(base_dir, "fonts", "NotoSans-Bold.ttf"),
+        ]
+
+        # Linux system fonts (common in containers/Render)
+        linux_regular = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+        linux_bold = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ]
+
+        # Windows system fonts
         windir = os.environ.get("WINDIR", r"C:\\Windows")
         fonts_dir = os.path.join(windir, "Fonts")
-        # Order matters: prefer fonts commonly available on Windows that include ₹.
-        regular_candidates = [
+        windows_regular = [
             os.path.join(fonts_dir, "segoeui.ttf"),
             os.path.join(fonts_dir, "seguisym.ttf"),
             os.path.join(fonts_dir, "arial.ttf"),
         ]
-        bold_candidates = [
+        windows_bold = [
             os.path.join(fonts_dir, "segoeuib.ttf"),
             os.path.join(fonts_dir, "arialbd.ttf"),
         ]
+
+        regular_candidates = repo_regular + linux_regular + windows_regular
+        bold_candidates = repo_bold + linux_bold + windows_bold
 
         if any(_try_register_ttf("PDFUnicode", p) for p in regular_candidates):
             FONT_REGULAR = "PDFUnicode"
         if any(_try_register_ttf("PDFUnicode-Bold", p) for p in bold_candidates):
             FONT_BOLD = "PDFUnicode-Bold"
 
-        # If we could only register a Unicode-capable regular font (common on some Windows installs),
+        # Final fallback for hosted environments (e.g., Render/Linux):
+        # if no suitable system font exists, download a Unicode-capable font into RUNTIME_DIR.
+        if FONT_REGULAR == "Helvetica":
+            fonts_cache_dir = os.path.join(RUNTIME_DIR, "pdf_fonts")
+            dejavu_regular_path = os.path.join(fonts_cache_dir, "DejaVuSans.ttf")
+            dejavu_bold_path = os.path.join(fonts_cache_dir, "DejaVuSans-Bold.ttf")
+            dejavu_regular_url = "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf/DejaVuSans.ttf"
+            dejavu_bold_url = "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf/DejaVuSans-Bold.ttf"
+
+            if _download_file(dejavu_regular_url, dejavu_regular_path) and _try_register_ttf("PDFUnicode", dejavu_regular_path):
+                FONT_REGULAR = "PDFUnicode"
+            if _download_file(dejavu_bold_url, dejavu_bold_path) and _try_register_ttf("PDFUnicode-Bold", dejavu_bold_path):
+                FONT_BOLD = "PDFUnicode-Bold"
+
+        # If we could only register a Unicode-capable regular font,
         # use it for header text as well so the Rupee symbol (₹) renders correctly.
         if FONT_REGULAR != "Helvetica" and FONT_BOLD in ("Helvetica-Bold", "Helvetica"):
             FONT_BOLD = FONT_REGULAR
