@@ -29,6 +29,8 @@ from dotenv import load_dotenv
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from werkzeug.utils import secure_filename
 
 from supabase_client import get_supabase
@@ -777,6 +779,48 @@ def download_pdf():
     c = canvas.Canvas(path, pagesize=A4)
     width, height = A4
 
+    # Prefer a Unicode-capable TrueType font so the Rupee symbol (₹) renders correctly.
+    # Fall back to built-in Helvetica if we can't register any TTF.
+    FONT_REGULAR = "Helvetica"
+    FONT_BOLD = "Helvetica-Bold"
+
+    def _try_register_ttf(font_name: str, font_path: str) -> bool:
+        if not font_path or not os.path.exists(font_path):
+            return False
+        try:
+            pdfmetrics.registerFont(TTFont(font_name, font_path))
+            return True
+        except Exception:
+            app.logger.exception("Failed registering TTF font: %s", font_path)
+            return False
+
+    try:
+        windir = os.environ.get("WINDIR", r"C:\\Windows")
+        fonts_dir = os.path.join(windir, "Fonts")
+        # Order matters: prefer fonts commonly available on Windows that include ₹.
+        regular_candidates = [
+            os.path.join(fonts_dir, "segoeui.ttf"),
+            os.path.join(fonts_dir, "seguisym.ttf"),
+            os.path.join(fonts_dir, "arial.ttf"),
+        ]
+        bold_candidates = [
+            os.path.join(fonts_dir, "segoeuib.ttf"),
+            os.path.join(fonts_dir, "arialbd.ttf"),
+        ]
+
+        if any(_try_register_ttf("PDFUnicode", p) for p in regular_candidates):
+            FONT_REGULAR = "PDFUnicode"
+        if any(_try_register_ttf("PDFUnicode-Bold", p) for p in bold_candidates):
+            FONT_BOLD = "PDFUnicode-Bold"
+
+        # If we could only register a Unicode-capable regular font (common on some Windows installs),
+        # use it for header text as well so the Rupee symbol (₹) renders correctly.
+        if FONT_REGULAR != "Helvetica" and FONT_BOLD in ("Helvetica-Bold", "Helvetica"):
+            FONT_BOLD = FONT_REGULAR
+    except Exception:
+        # Never fail PDF creation due to font detection issues.
+        app.logger.exception("Font auto-detection failed; continuing with built-in fonts")
+
     top_margin = 50
     bottom_margin = 50
     left = 50
@@ -784,7 +828,7 @@ def download_pdf():
 
     def new_page(font_size: int = 11) -> float:
         c.showPage()
-        c.setFont("Helvetica", font_size)
+        c.setFont(FONT_REGULAR, font_size)
         return height - top_margin
 
     def ensure_space(y: float, needed: float, font_size: int = 11) -> float:
@@ -794,10 +838,17 @@ def download_pdf():
 
     def draw_section_title(y: float, title: str) -> float:
         y = ensure_space(y, 24, font_size=11)
-        c.setFont("Helvetica-Bold", 12)
+        c.setFont(FONT_BOLD, 12)
         c.drawString(left, y, title)
-        c.setFont("Helvetica", 11)
+        c.setFont(FONT_REGULAR, 11)
         return y - 18
+
+    def draw_centered_title(y: float, title: str) -> float:
+        y = ensure_space(y, 30, font_size=11)
+        c.setFont(FONT_BOLD, 16)
+        c.drawCentredString(width / 2, y, title)
+        c.setFont(FONT_REGULAR, 11)
+        return y - 28
 
     def draw_kv_lines(y: float, items: dict, line_height: float = 16) -> float:
         for k, v in items.items():
@@ -806,35 +857,86 @@ def download_pdf():
             y -= line_height
         return y
 
-    def draw_table(y: float, headers: list[str], rows: list[list[str]], col_widths: list[float], row_h: float = 18) -> float:
+    def draw_table(
+        y: float,
+        headers: list[str],
+        rows: list[list[str]],
+        col_widths: list[float],
+        row_h: float = 22,
+        grid_line_width: float = 2.2,
+        outer_line_width: float = 2.8,
+    ) -> float:
+        """Draw a paginated table.
+
+        - Repeats header on each page
+        - Keeps borders tight to rendered rows (no extra empty boxed area)
+        """
+
         table_w = sum(col_widths)
-        y = ensure_space(y, row_h * (len(rows) + 2))
 
-        # Header
-        c.setFont("Helvetica-Bold", 10)
-        x = left
-        for header, w in zip(headers, col_widths):
-            c.rect(x, y - row_h, w, row_h, stroke=1, fill=0)
-            c.drawString(x + 4, y - row_h + 5, str(header))
-            x += w
-        y -= row_h
+        def _baseline(y_top: float, h: float, font_size: int) -> float:
+            # y_top is the top boundary of the row. drawString uses baseline.
+            return y_top - h + (h - font_size) / 2 + 3
 
-        # Rows
-        c.setFont("Helvetica", 10)
-        for row in rows:
-            y = ensure_space(y, row_h)
+        def _draw_header(y_top: float) -> float:
+            c.setFont(FONT_BOLD, 11)
+            x = left
+            for header, w in zip(headers, col_widths):
+                c.rect(x, y_top - row_h, w, row_h, stroke=1, fill=0)
+                c.drawCentredString(x + (w / 2), _baseline(y_top, row_h, 11), str(header))
+                x += w
+            return y_top - row_h
+
+        def _draw_row(y_top: float, row: list[str]) -> float:
+            c.setFont(FONT_REGULAR, 11)
             x = left
             for cell, w in zip(row, col_widths):
-                c.rect(x, y - row_h, w, row_h, stroke=1, fill=0)
-                c.drawString(x + 4, y - row_h + 5, str(cell))
+                c.rect(x, y_top - row_h, w, row_h, stroke=1, fill=0)
+                c.drawCentredString(x + (w / 2), _baseline(y_top, row_h, 11), str(cell))
                 x += w
-            y -= row_h
+            return y_top - row_h
 
-        c.setFont("Helvetica", 11)
+        prev_line_width = getattr(c, "_lineWidth", 1)
+        c.setLineWidth(grid_line_width)
+
+        # Ensure we have room for at least header + one row; otherwise start a new page.
+        min_needed = row_h * 2
+        y = ensure_space(y, min_needed)
+
+        segment_top = y
+        segment_rows = 0
+        y = _draw_header(y)
+
+        for row in rows:
+            # Need space for the next row (and a small buffer) on the current page.
+            if y - row_h < bottom_margin:
+                # Close current page segment with an outer border matching rendered height.
+                segment_h = row_h * (1 + segment_rows)
+                c.setLineWidth(outer_line_width)
+                c.rect(left, segment_top - segment_h, table_w, segment_h, stroke=1, fill=0)
+                c.setLineWidth(grid_line_width)
+
+                # Next page segment
+                y = new_page(font_size=11)
+                y = ensure_space(y, min_needed)
+                segment_top = y
+                segment_rows = 0
+                y = _draw_header(y)
+
+            y = _draw_row(y, row)
+            segment_rows += 1
+
+        # Close final segment border
+        segment_h = row_h * (1 + segment_rows)
+        c.setLineWidth(outer_line_width)
+        c.rect(left, segment_top - segment_h, table_w, segment_h, stroke=1, fill=0)
+
+        c.setLineWidth(prev_line_width)
+        c.setFont(FONT_REGULAR, 11)
         return y - 10
 
     # ---------- PAGE 1: Title + Graphs first ----------
-    c.setFont("Helvetica-Bold", 14)
+    c.setFont(FONT_BOLD, 14)
     c.drawString(left, height - 50, "Retail Demand Forecasting Report")
 
     y = height - 80
@@ -848,7 +950,7 @@ def download_pdf():
 
     if past_image:
         y = ensure_space(y, image_h + gap + 18)
-        c.setFont("Helvetica-Bold", 12)
+        c.setFont(FONT_BOLD, 12)
         c.drawString(left, y, "Actual vs Predicted Sales (Weekly Averages)")
         y -= 16
         c.drawImage(
@@ -867,7 +969,7 @@ def download_pdf():
         title = "Future Sales Forecast"
         if months:
             title = f"Future Sales Forecast ({months} Month{'s' if months > 1 else ''})"
-        c.setFont("Helvetica-Bold", 12)
+        c.setFont(FONT_BOLD, 12)
         c.drawString(left, y, title)
         y -= 16
         c.drawImage(
@@ -901,7 +1003,10 @@ def download_pdf():
     # ---------- CATEGORY COST & STOCK TABLE ----------
     cat_rows = report.get('category_cost_table') or []
     if cat_rows:
-        y = draw_section_title(y, "Category Cost & Stock Analysis (Forecast Months)")
+        # Put the report table on a dedicated page, with a header line above the table (same page).
+        y = new_page(font_size=11)
+        section_title = "Category Cost & Stock Analysis (Forecast Months)"
+        y = draw_centered_title(y, section_title)
         headers = ["Month", "Product Category", "Units Sold", "Total Cost (₹)"]
         rows = []
         for r in cat_rows:
