@@ -1,50 +1,128 @@
 # Retail Demand Forecasting
 
-## Setup Instructions
+Flask web app for retail demand forecasting using an XGBoost model. The UI supports uploading a dataset (CSV/Excel) and forecasting 1–12 months ahead. Authentication (login/register/forgot password) is handled via Supabase Auth.
 
-Create and activate virtual environment:
+## Prerequisites
+
+- Python 3.9+ recommended
+- Windows PowerShell (commands below use PowerShell)
+- A Supabase project (required to log in and use the upload/forecast UI)
+
+## Quickstart (Local)
+
+### 1) Create and activate a virtual environment
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1
 ```
 
-Install dependencies:
+### 2) Install dependencies
 
 ```powershell
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Train the model:
+### 3) Configure environment variables (.env)
+
+Create a `.env` file in the project root:
+
+```env
+# Local base URL used to construct safe Supabase redirect URLs
+APP_BASE_URL=http://127.0.0.1:5000
+
+# Recommended for session security
+FLASK_SECRET_KEY=change-me
+
+# Required for login/register flows
+SUPABASE_URL=https://<your-project-ref>.supabase.co
+SUPABASE_ANON_KEY=<your-supabase-anon-key>
+```
+
+`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` are also accepted as aliases.
+
+### 4) Ensure the model exists (train if needed)
+
+The app loads the model from `model/xgb_model.joblib` by default. If that file is missing, train it:
 
 ```powershell
 python ml_model_xgb.py
 ```
 
-Run the web app:
+### 5) Run the web app
 
 ```powershell
 python app.py
 ```
 
+Open: `http://127.0.0.1:5000`
+
+## Using the App (Upload & Forecast)
+
+- Upload file types: `.csv`, `.xlsx`, `.xls`
+- Required columns (case-insensitive):
+  - `date`
+  - `units_sold`
+- Minimum history: at least 30 rows/days of sales history
+- Forecast horizon: 1–12 months (the UI validates this)
+
+## Model Training Notes (ml_model_xgb.py)
+
+The training script reads `dataset/retail_sales_forecasting.xlsx` and requires at least:
+
+- `date`
+- `units_sold`
+
+If the dataset also contains store/product + price/promo columns, the script will train a multivariate pipeline model and save:
+
+- `model/xgb_model_multifeature.joblib`
+
+Otherwise it trains a legacy univariate model and saves:
+
+- `model/xgb_model.joblib`
+
+
 ## Supabase Auth Notes (Login/Register/Forgot Password)
 
 This app uses **Supabase Auth** for login/registration.
 
-- Ensure your `.env` contains:
-    - `VITE_SUPABASE_URL`
-    - `VITE_SUPABASE_ANON_KEY`
-    - (recommended) `APP_BASE_URL` (your deployed base URL, e.g. `https://your-app.onrender.com`)
+- Ensure your `.env` contains (server-side names preferred; `VITE_*` names are accepted as aliases):
+    - `SUPABASE_URL` (or `VITE_SUPABASE_URL`)
+    - `SUPABASE_ANON_KEY` (or `VITE_SUPABASE_ANON_KEY`)
+    - `APP_BASE_URL` (your deployed base URL, e.g. `https://your-app.onrender.com`)
+    - `FLASK_SECRET_KEY` (recommended for production session security)
 
-If `APP_BASE_URL` is not set, links sent by email (confirm email / password reset) may redirect to `http://127.0.0.1:5000`.
+`APP_BASE_URL` is used to construct safe redirect URLs for Supabase Auth flows (email confirmation / reset password).
 
 In Supabase Dashboard → **Auth** → **URL Configuration**, add these to **Additional Redirect URLs**:
+
 - `http://127.0.0.1:5000/auth/callback`
 - `http://127.0.0.1:5000/reset-password`
 - and your deployed equivalents:
     - `https://<your-domain>/auth/callback`
     - `https://<your-domain>/reset-password`
+
+## Environment Variables
+
+The app reads configuration from environment variables (and `.env` for local development). Defaults are applied safely if values are missing or invalid.
+
+- `SUPABASE_URL` / `VITE_SUPABASE_URL`: Supabase project URL
+- `SUPABASE_ANON_KEY` / `VITE_SUPABASE_ANON_KEY`: Supabase anon key
+- `APP_BASE_URL`: Base URL used to construct safe redirect URLs for Supabase email flows
+- `FLASK_SECRET_KEY`: Flask session secret (recommended for production session security)
+- `MODEL_PATH`: Optional override for the model joblib path (defaults to `model/xgb_model.joblib`)
+- `RUNTIME_DIR`: Optional writable temp directory for graphs/downloads (defaults to OS temp)
+- `TREND_EPS`: Optional float threshold for trend labeling (default `0.01`)
+- `CLEANUP_MAX_AGE_HOURS`: Optional float age threshold for runtime cleanup (default `24`)
+
+## Troubleshooting
+
+- PowerShell venv activation blocked: run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+- Login/Register not working: verify `SUPABASE_URL` and `SUPABASE_ANON_KEY` are set and not placeholders
+- Redirect errors during email confirmation/reset: ensure `APP_BASE_URL` matches the URLs added in Supabase “Additional Redirect URLs”
+- Model missing at startup: run `python ml_model_xgb.py` or set `MODEL_PATH`
+- Upload errors: confirm your file has `date` and `units_sold` columns and at least 30 days/rows
 
 ## Project Structure
 
@@ -62,11 +140,14 @@ Retail_Demand_Forecasting/
 ├── downloads/
 ├── graphs/
 ├── model/
-│   └── xgb_model.joblib
+│   ├── xgb_model.joblib
+│   └── xgb_model_multifeature.joblib
 └── templates/
     ├── index.html
     ├── login.html
     ├── register.html
+    ├── forgot_password.html
+    ├── reset_password.html
     ├── result.html
     └── upload.html
 ```
