@@ -5,6 +5,7 @@ joblib
 matplotlib
 scikit-learn
 openpyxl
+xlrd>=2.0.1
 reportlab
 xgboost
 python-dotenv
