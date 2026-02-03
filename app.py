@@ -23,6 +23,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 from dotenv import load_dotenv
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -177,6 +178,14 @@ def login():
         except Exception as e:
             msg = str(e)
             msg_lower = msg.lower()
+            if "getaddrinfo failed" in msg_lower or "name or service not known" in msg_lower:
+                return render_template(
+                    "login.html",
+                    error=(
+                        "Cannot connect to Supabase (DNS/network error). "
+                        "Check your internet connection and that VITE_SUPABASE_URL in .env is correct (https://<project-ref>.supabase.co)."
+                    ),
+                )
             if "email not confirmed" in msg_lower or "email_not_confirmed" in msg_lower:
                 return render_template(
                     "login.html",
@@ -274,6 +283,14 @@ def register():
         except Exception as e:
             msg = str(e)
             msg_lower = msg.lower()
+            if "getaddrinfo failed" in msg_lower or "name or service not known" in msg_lower:
+                return render_template(
+                    "register.html",
+                    error=(
+                        "Cannot connect to Supabase (DNS/network error). "
+                        "Check your internet connection and that VITE_SUPABASE_URL in .env is correct (https://<project-ref>.supabase.co)."
+                    ),
+                )
             if "already registered" in msg_lower or "user already registered" in msg_lower:
                 return render_template("register.html", error="User already exists. Please login.")
             if "invalid email" in msg_lower:
@@ -357,6 +374,16 @@ def forgot_password():
                 info="If an account exists for that email, a password reset link has been sent."
             )
         except Exception as e:
+            msg = str(e)
+            msg_lower = msg.lower()
+            if "getaddrinfo failed" in msg_lower or "name or service not known" in msg_lower:
+                return render_template(
+                    "forgot_password.html",
+                    error=(
+                        "Cannot connect to Supabase (DNS/network error). "
+                        "Check your internet connection and that VITE_SUPABASE_URL in .env is correct (https://<project-ref>.supabase.co)."
+                    ),
+                )
             return render_template("forgot_password.html", error=f"Unable to send reset email: {e}")
 
     return render_template("forgot_password.html")
@@ -514,6 +541,12 @@ def upload():
         plt.title("Actual vs Predicted Sales (Weekly)")
         plt.xlabel("Date")
         plt.ylabel("Units Sold")
+        # Show month names only (no year) on the x-axis
+        ax = plt.gca()
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+        plt.xticks(rotation=0)
+        plt.tight_layout()
         plt.savefig(past_path)
         plt.close()
 
@@ -545,7 +578,7 @@ def upload():
         )
 
         future_df = pd.DataFrame({
-            "Month": range(1, months + 1),
+            "Month": list(range(1, months + 1)),
             "Predicted_Sales": monthly_pred.round().astype(int).values,
         })
 
@@ -560,6 +593,7 @@ def upload():
         plt.ylabel("Predicted Sales (Units)")
         plt.xticks(future_df['Month'].astype(int).tolist())
         plt.grid(True)
+        plt.tight_layout()
         plt.savefig(future_path)
         plt.close()
 
@@ -573,36 +607,86 @@ def upload():
             "Low demand expected. Avoid overstocking."
         )
 
-        # ---------- OPTIONAL CATEGORY COST TABLE ----------
+        # ---------- OPTIONAL CATEGORY COST TABLE (FUTURE FORECAST MONTHS) ----------
+        # Requirement: show forecast months (1..N), NOT recent historical months, and month as numbers only.
         category_cost_table = []
         if 'price' in df.columns and 'product_category' in df.columns:
-            df_cat = df.copy()
+            df_cat = df[['date', 'product_category', 'units_sold', 'price']].copy()
+            df_cat['date'] = pd.to_datetime(df_cat['date'], errors='coerce')
             df_cat['price'] = pd.to_numeric(df_cat['price'], errors='coerce')
-            df_cat['year_month'] = df_cat['date'].dt.to_period('M').astype(str)
-            df_cat['total_cost'] = df_cat['price'] * df_cat['units_sold']
-            df_cat = df_cat.dropna(subset=['year_month', 'product_category', 'units_sold', 'total_cost'])
+            df_cat['units_sold'] = pd.to_numeric(df_cat['units_sold'], errors='coerce')
+            df_cat = df_cat.dropna(subset=['date', 'product_category', 'units_sold', 'price'])
 
-            category_cost_df = (
-                df_cat.groupby(['year_month', 'product_category'])
-                .agg(
-                    total_units_sold=('units_sold', 'sum'),
-                    total_cost=('total_cost', 'sum')
+            if not df_cat.empty:
+                # Build historical monthly totals per category
+                df_cat['year_month'] = df_cat['date'].dt.to_period('M')
+                df_cat['total_cost'] = df_cat['price'] * df_cat['units_sold']
+
+                monthly_cat = (
+                    df_cat.groupby(['year_month', 'product_category'])
+                    .agg(
+                        units=('units_sold', 'sum'),
+                        cost=('total_cost', 'sum'),
+                    )
+                    .reset_index()
                 )
-                .reset_index()
-            )
 
-            # Show only the most recent N months (where N == selected forecast months)
-            month_keys = sorted(category_cost_df['year_month'].unique())
-            last_n = month_keys[-months:] if month_keys else []
-            if last_n:
-                category_cost_df = category_cost_df[category_cost_df['year_month'].isin(last_n)]
+                # Use the most recent months available (up to the requested forecast horizon)
+                month_keys = sorted(monthly_cat['year_month'].unique())
+                recent_months = month_keys[-months:] if month_keys else []
+                if recent_months:
+                    recent = monthly_cat[monthly_cat['year_month'].isin(recent_months)].copy()
+                else:
+                    recent = monthly_cat.copy()
 
-            category_cost_df['total_units_sold'] = category_cost_df['total_units_sold'].round().astype(int)
-            category_cost_df['total_cost'] = category_cost_df['total_cost'].round().astype(int)
-            category_cost_table = category_cost_df.to_dict(orient='records')
+                if not recent.empty:
+                    # Average monthly units per category from the uploaded dataset
+                    avg_units_by_cat = recent.groupby('product_category')['units'].mean()
+                    baseline_total = float(avg_units_by_cat.sum())
+
+                    # Units-weighted average price per category from the uploaded dataset
+                    price_weighted = df_cat.groupby('product_category').apply(
+                        lambda g: (g['price'] * g['units_sold']).sum() / max(g['units_sold'].sum(), 1.0)
+                    )
+                    price_weighted = price_weighted.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+                    if baseline_total > 0:
+                        # Scale using the forecast's *relative* month-to-month changes,
+                        # but keep the magnitude based on the uploaded dataset.
+                        forecast_vals = future_df['Predicted_Sales'].astype(float).values
+                        denom = float(np.mean(forecast_vals)) if forecast_vals.size else 1.0
+                        denom = denom if denom != 0 else 1.0
+
+                        categories = avg_units_by_cat.index.tolist()
+
+                        for i in range(1, months + 1):
+                            rel = float(forecast_vals[i - 1]) / denom
+                            target_total = baseline_total * rel
+
+                            # Allocate to categories proportionally to historical averages
+                            remaining = target_total
+                            for idx, cat in enumerate(categories):
+                                if idx == len(categories) - 1:
+                                    units = max(0, int(round(remaining)))
+                                else:
+                                    share = float(avg_units_by_cat.loc[cat]) / baseline_total
+                                    units = max(0, int(round(target_total * share)))
+                                    remaining -= units
+
+                                avg_price = float(price_weighted.get(cat, 0.0))
+                                total_cost = int(round(units * avg_price))
+                                category_cost_table.append(
+                                    {
+                                        'month': i,
+                                        'product_category': str(cat),
+                                        'total_units_sold': int(units),
+                                        'total_cost': int(total_cost),
+                                    }
+                                )
 
         # ---------- STORE FOR DOWNLOAD (avoid huge cookies) ----------
         report = {
+            "months": months,
             "metrics": {'MAE': mae, 'RMSE': rmse, 'R2': r2},
             "insights": {'Average Demand': avg_demand, 'Recommendation': recommendation},
             "trends": {
@@ -693,102 +777,143 @@ def download_pdf():
     c = canvas.Canvas(path, pagesize=A4)
     width, height = A4
 
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, height - 50, "Retail Demand Forecasting Report")
-
-    c.setFont("Helvetica", 11)
     top_margin = 50
     bottom_margin = 50
-    y = height - 100
+    left = 50
+    right = 50
 
-    def ensure_space(needed: float) -> None:
-        nonlocal y
+    def new_page(font_size: int = 11) -> float:
+        c.showPage()
+        c.setFont("Helvetica", font_size)
+        return height - top_margin
+
+    def ensure_space(y: float, needed: float, font_size: int = 11) -> float:
         if y - needed < bottom_margin:
-            c.showPage()
-            c.setFont("Helvetica", 11)
-            y = height - top_margin
+            return new_page(font_size=font_size)
+        return y
 
-    for k, v in (report.get('metrics') or {}).items():
-        ensure_space(20)
-        c.drawString(50, y, f"{k}: {v}")
-        y -= 20
-
-    y -= 20
-    for k, v in (report.get('insights') or {}).items():
-        ensure_space(20)
-        c.drawString(50, y, f"{k}: {v}")
-        y -= 20
-
-    # Add trend summary if present
-    trends = report.get('trends') or {}
-    if trends:
-        y -= 10
-        ensure_space(40)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(50, y, "Trend Summary")
-        y -= 20
+    def draw_section_title(y: float, title: str) -> float:
+        y = ensure_space(y, 24, font_size=11)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(left, y, title)
         c.setFont("Helvetica", 11)
-        for k, v in trends.items():
-            ensure_space(18)
-            c.drawString(50, y, f"{k}: {v}")
-            y -= 18
+        return y - 18
 
-    # Future forecast values (month -> predicted sales)
-    future_table = report.get('future_forecast_table') or []
-    if future_table:
-        y -= 10
-        ensure_space(40)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(50, y, "Future Forecast Values")
-        y -= 20
-        c.setFont("Helvetica", 11)
-        for row in future_table:
-            ensure_space(16)
-            m = row.get('Month')
-            v = row.get('Predicted_Sales')
-            c.drawString(50, y, f"Month {m}: {v} units")
-            y -= 16
+    def draw_kv_lines(y: float, items: dict, line_height: float = 16) -> float:
+        for k, v in items.items():
+            y = ensure_space(y, line_height)
+            c.drawString(left, y, f"{k}: {v}")
+            y -= line_height
+        return y
 
-    # Category table (recent N months)
-    cat_rows = report.get('category_cost_table') or []
-    if cat_rows:
-        y -= 10
-        ensure_space(40)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(50, y, "Category Cost & Stock (Recent Months)")
-        y -= 20
+    def draw_table(y: float, headers: list[str], rows: list[list[str]], col_widths: list[float], row_h: float = 18) -> float:
+        table_w = sum(col_widths)
+        y = ensure_space(y, row_h * (len(rows) + 2))
+
+        # Header
+        c.setFont("Helvetica-Bold", 10)
+        x = left
+        for header, w in zip(headers, col_widths):
+            c.rect(x, y - row_h, w, row_h, stroke=1, fill=0)
+            c.drawString(x + 4, y - row_h + 5, str(header))
+            x += w
+        y -= row_h
+
+        # Rows
         c.setFont("Helvetica", 10)
-        for row in cat_rows:
-            ensure_space(14)
-            ym = row.get('year_month') or row.get('month')
-            cat = row.get('product_category')
-            units = row.get('total_units_sold')
-            cost = row.get('total_cost')
-            c.drawString(50, y, f"{ym} | {cat} | Units: {units} | Cost: {cost}")
-            y -= 14
+        for row in rows:
+            y = ensure_space(y, row_h)
+            x = left
+            for cell, w in zip(row, col_widths):
+                c.rect(x, y - row_h, w, row_h, stroke=1, fill=0)
+                c.drawString(x + 4, y - row_h + 5, str(cell))
+                x += w
+            y -= row_h
+
+        c.setFont("Helvetica", 11)
+        return y - 10
+
+    # ---------- PAGE 1: Title + Graphs first ----------
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(left, height - 50, "Retail Demand Forecasting Report")
+
+    y = height - 80
+    image_w = width - left - right
+    image_h = 240
+    gap = 18
 
     past_image = report.get("past_image")
     future_image = report.get("future_image")
-
-    image_w = 500
-    image_h = 200
-    gap = 20
+    months = int(report.get("months") or 0)
 
     if past_image:
-        ensure_space(image_h + gap + 14)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(50, y, "Past Sales: Actual vs Predicted")
-        y -= 14
-        c.drawImage(os.path.join(GRAPH_DIR, past_image), 50, y - image_h, image_w, image_h)
+        y = ensure_space(y, image_h + gap + 18)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(left, y, "Actual vs Predicted Sales (Weekly Averages)")
+        y -= 16
+        c.drawImage(
+            os.path.join(GRAPH_DIR, past_image),
+            left,
+            y - image_h,
+            image_w,
+            image_h,
+            preserveAspectRatio=True,
+            anchor='c',
+        )
         y -= image_h + gap
 
     if future_image:
-        ensure_space(image_h + gap + 14)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(50, y, "Future Forecast")
-        y -= 14
-        c.drawImage(os.path.join(GRAPH_DIR, future_image), 50, y - image_h, image_w, image_h)
+        y = ensure_space(y, image_h + gap + 18)
+        title = "Future Sales Forecast"
+        if months:
+            title = f"Future Sales Forecast ({months} Month{'s' if months > 1 else ''})"
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(left, y, title)
+        y -= 16
+        c.drawImage(
+            os.path.join(GRAPH_DIR, future_image),
+            left,
+            y - image_h,
+            image_w,
+            image_h,
+            preserveAspectRatio=True,
+            anchor='c',
+        )
         y -= image_h + gap
+
+    # Start details after graphs (new page so opening the PDF shows graphs first)
+    y = new_page(font_size=11)
+
+    # ---------- BUSINESS INSIGHTS ----------
+    insights = report.get('insights') or {}
+    if insights:
+        y = draw_section_title(y, "Business Insights & Recommendation")
+        y = draw_kv_lines(y, insights)
+        y -= 8
+
+    # ---------- TREND SUMMARY ----------
+    trends = report.get('trends') or {}
+    if trends:
+        y = draw_section_title(y, "Trend Summary")
+        y = draw_kv_lines(y, trends, line_height=15)
+        y -= 8
+
+    # ---------- CATEGORY COST & STOCK TABLE ----------
+    cat_rows = report.get('category_cost_table') or []
+    if cat_rows:
+        y = draw_section_title(y, "Category Cost & Stock Analysis (Forecast Months)")
+        headers = ["Month", "Product Category", "Units Sold", "Total Cost (₹)"]
+        rows = []
+        for r in cat_rows:
+            m = r.get('month') or ""
+            rows.append([
+                str(m),
+                str(r.get('product_category', '')),
+                str(r.get('total_units_sold', '')),
+                f"₹ {r.get('total_cost', '')}",
+            ])
+        col_widths = [70, width - left - right - (70 + 90 + 120), 90, 120]
+        y = draw_table(y, headers, rows, col_widths=col_widths)
 
     c.save()
 

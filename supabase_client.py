@@ -1,4 +1,5 @@
 import os
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from supabase.lib.client_options import ClientOptions
@@ -16,6 +17,18 @@ def get_supabase(access_token: str | None = None) -> Client:
     if not url or not key:
         raise RuntimeError(
             "Missing Supabase config. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY (or SUPABASE_URL/SUPABASE_ANON_KEY) in .env"
+        )
+
+    # Catch common copy/paste placeholders early.
+    if "YOUR_PROJECT_REF" in url or "YOUR_SUPABASE_ANON_KEY" in key:
+        raise RuntimeError(
+            "Supabase config looks like placeholders. Replace VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in .env with real values from your Supabase project settings."
+        )
+
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(
+            "Invalid VITE_SUPABASE_URL. It should look like https://<project-ref>.supabase.co"
         )
 
     # If you pass a user session access token, Supabase will apply RLS policies

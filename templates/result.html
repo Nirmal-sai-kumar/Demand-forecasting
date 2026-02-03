@@ -137,26 +137,6 @@
         <img src="{{ url_for('static', filename=future_image) }}">
     </div>
 
-    <!-- FUTURE FORECAST VALUES -->
-    <div class="card">
-        <h2>Future Forecast Values ({{ months }} Month{{ 's' if months > 1 else '' }})</h2>
-        {% if future_forecast_table %}
-        <table>
-            <tr>
-                <th>Month</th>
-                <th>Predicted Sales (Units)</th>
-            </tr>
-            {% for row in future_forecast_table %}
-            <tr>
-                <td>{{ row.Month }}</td>
-                <td>{{ row.Predicted_Sales }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-        {% else %}
-        <p class="no-data">No future forecast values available.</p>
-        {% endif %}
-    </div>
 
     <!-- BUSINESS INSIGHTS -->
     <div class="card">
@@ -178,7 +158,7 @@
 
     <!-- FINAL REVIEWER FEATURE -->
     <div class="card">
-        <h2>Category Cost & Stock Analysis (Recent {{ months }} Month{{ 's' if months > 1 else '' }})</h2>
+        <h2>Category Cost & Stock Analysis (Forecast {{ months }} Month{{ 's' if months > 1 else '' }})</h2>
 
         {% if category_cost_table %}
         <table>
@@ -191,7 +171,7 @@
 
             {% for row in category_cost_table %}
             <tr>
-                <td>{{ row.year_month }}</td>
+                <td>{{ row.month }}</td>
                 <td>{{ row.product_category }}</td>
                 <td>{{ row.total_units_sold }}</td>
                 <td>₹ {{ row.total_cost }}</td>
