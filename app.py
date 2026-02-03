@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from typing import List, Union
 from uuid import uuid4
@@ -51,8 +52,8 @@ os.makedirs(GRAPH_DIR, exist_ok=True)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 ALLOWED_UPLOAD_EXTS = {".csv", ".xlsx", ".xls"}
-TREND_EPS_DEFAULT = float(os.getenv("TREND_EPS", "0.01"))
-CLEANUP_MAX_AGE_HOURS = float(os.getenv("CLEANUP_MAX_AGE_HOURS", "24"))
+DEFAULT_TREND_EPS = 0.01
+DEFAULT_CLEANUP_MAX_AGE_HOURS = 24.0
 MAX_FORECAST_MONTHS = 12
 
 app = Flask(__name__)
@@ -67,6 +68,35 @@ app.config.update(
 
 # Base URL for auth redirects (set in .env if needed)
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://127.0.0.1:5000").rstrip("/")
+
+
+def _get_env_float(name: str, default: float) -> float:
+    """Parse a float environment variable safely.
+
+    - Never raises due to invalid user-provided env var values.
+    - Avoids parsing at import time by being called from request-time helpers.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(str(raw).strip())
+        if not np.isfinite(value):
+            return float(default)
+        return value
+    except Exception:
+        return float(default)
+
+
+def _get_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        value = int(str(raw).strip())
+        return value
+    except Exception:
+        return int(default)
 
 # ---------- LOAD MODEL ----------
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(BASE_DIR, "model", "xgb_model.joblib"))
@@ -123,12 +153,11 @@ def _load_report_from_session() -> dict:
         return json.load(f)
 
 
-def _cleanup_runtime_dirs(max_age_hours: float = CLEANUP_MAX_AGE_HOURS) -> None:
+def _cleanup_runtime_dirs(max_age_hours: float | None = None) -> None:
     """Best-effort cleanup of temp files to prevent disk growth on Render."""
-    try:
-        max_age_seconds = float(max_age_hours) * 3600.0
-    except Exception:
-        max_age_seconds = 24.0 * 3600.0
+    if max_age_hours is None:
+        max_age_hours = _get_env_float("CLEANUP_MAX_AGE_HOURS", DEFAULT_CLEANUP_MAX_AGE_HOURS)
+    max_age_seconds = _get_env_float("CLEANUP_MAX_AGE_HOURS", float(max_age_hours)) * 3600.0
 
     now = time.time()
     for directory in (UPLOAD_DIR, GRAPH_DIR, DOWNLOAD_DIR):
@@ -142,13 +171,18 @@ def _cleanup_runtime_dirs(max_age_hours: float = CLEANUP_MAX_AGE_HOURS) -> None:
                     if age > max_age_seconds:
                         os.remove(path)
                 except OSError:
+                    # Cleanup failures should not affect user-facing responses.
+                    app.logger.warning("Cleanup: failed removing file: %s", path)
                     continue
         except OSError:
+            app.logger.warning("Cleanup: failed listing dir: %s", directory)
             continue
 
 
-def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float = TREND_EPS_DEFAULT) -> str:
+def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float | None = None) -> str:
     """Return a human-friendly trend label based on the fitted slope."""
+    if eps is None:
+        eps = _get_env_float("TREND_EPS", DEFAULT_TREND_EPS)
     values = np.asarray(series, dtype=float)
     values = values[np.isfinite(values)]
     if values.size < 2:
@@ -162,6 +196,174 @@ def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float =
     if slope < -eps:
         return "Downward"
     return "Flat"
+
+
+# ------------------------------
+# PDF Font caching / idempotent registration
+# ------------------------------
+
+_PDF_FONT_LOCK = threading.Lock()
+_PDF_FONT_NAMES: tuple[str, str] | None = None
+
+
+def _looks_like_font_bytes(data: bytes) -> bool:
+    """Basic validation to avoid caching HTML error pages as fonts."""
+    if not data or len(data) < 12:
+        return False
+    head = data[:4]
+    # TrueType: 0x00010000, OpenType: 'OTTO', TTC: 'ttcf'
+    return head in (b"\x00\x01\x00\x00", b"OTTO", b"ttcf")
+
+
+def _atomic_write_bytes(dest_path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    tmp_path = dest_path + f".{uuid4().hex}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    # Atomic replace prevents corrupted cache state under concurrent writers.
+    os.replace(tmp_path, dest_path)
+
+
+def _font_file_is_valid(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+        return head in (b"\x00\x01\x00\x00", b"OTTO", b"ttcf")
+    except OSError:
+        return False
+
+
+def _ensure_cached_font(url: str, dest_path: str, timeout_s: int = 20) -> bool:
+    """Ensure a font file exists at dest_path.
+
+    Uses atomic rename to avoid corruption under concurrency.
+    Performs simple signature validation; registration will further validate.
+    """
+    try:
+        if os.path.exists(dest_path) and _font_file_is_valid(dest_path):
+            return True
+
+        import urllib.request
+
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "RetailDemandForecasting/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = resp.read()
+        if not _looks_like_font_bytes(data):
+            return False
+        _atomic_write_bytes(dest_path, data)
+        return _font_file_is_valid(dest_path)
+    except Exception:
+        app.logger.exception("Failed ensuring cached font: %s", url)
+        return False
+
+
+def _register_ttf_if_needed(font_name: str, font_path: str) -> bool:
+    """Register a TTF/OTF font idempotently (safe to call multiple times)."""
+    try:
+        if not font_path or not os.path.exists(font_path):
+            return False
+        if font_name in pdfmetrics.getRegisteredFontNames():
+            return True
+        pdfmetrics.registerFont(TTFont(font_name, font_path))
+        return True
+    except Exception:
+        app.logger.exception("Failed registering TTF font: %s", font_path)
+        return False
+
+
+def _get_pdf_font_names() -> tuple[str, str]:
+    """Return (regular_font_name, bold_font_name) for PDF rendering.
+
+    - Caches discovery results per-process to avoid repeated filesystem scans.
+    - Ensures consistent regular/bold pairing.
+    - Safe under concurrent requests.
+    """
+    global _PDF_FONT_NAMES
+    with _PDF_FONT_LOCK:
+        if _PDF_FONT_NAMES is not None:
+            return _PDF_FONT_NAMES
+
+        font_regular = "Helvetica"
+        font_bold = "Helvetica-Bold"
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        repo_regular = [
+            os.path.join(base_dir, "static", "fonts", "DejaVuSans.ttf"),
+            os.path.join(base_dir, "static", "fonts", "NotoSans-Regular.ttf"),
+            os.path.join(base_dir, "fonts", "DejaVuSans.ttf"),
+            os.path.join(base_dir, "fonts", "NotoSans-Regular.ttf"),
+        ]
+        repo_bold = [
+            os.path.join(base_dir, "static", "fonts", "DejaVuSans-Bold.ttf"),
+            os.path.join(base_dir, "static", "fonts", "NotoSans-Bold.ttf"),
+            os.path.join(base_dir, "fonts", "DejaVuSans-Bold.ttf"),
+            os.path.join(base_dir, "fonts", "NotoSans-Bold.ttf"),
+        ]
+
+        linux_regular = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+        linux_bold = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ]
+
+        windir = os.environ.get("WINDIR", r"C:\\Windows")
+        fonts_dir = os.path.join(windir, "Fonts")
+        windows_regular = [
+            os.path.join(fonts_dir, "segoeui.ttf"),
+            os.path.join(fonts_dir, "seguisym.ttf"),
+            os.path.join(fonts_dir, "arial.ttf"),
+        ]
+        windows_bold = [
+            os.path.join(fonts_dir, "segoeuib.ttf"),
+            os.path.join(fonts_dir, "arialbd.ttf"),
+        ]
+
+        regular_candidates = repo_regular + linux_regular + windows_regular
+        bold_candidates = repo_bold + linux_bold + windows_bold
+
+        # Prefer system/repo fonts first (no network dependency)
+        if any(_register_ttf_if_needed("PDFUnicode", p) for p in regular_candidates):
+            font_regular = "PDFUnicode"
+        if any(_register_ttf_if_needed("PDFUnicode-Bold", p) for p in bold_candidates):
+            font_bold = "PDFUnicode-Bold"
+
+        # If bold isn't available but regular is, keep pairing consistent.
+        if font_regular != "Helvetica" and font_bold in ("Helvetica-Bold", "Helvetica"):
+            font_bold = font_regular
+
+        # Final fallback: cache-download DejaVu into runtime dir.
+        if font_regular == "Helvetica":
+            fonts_cache_dir = os.path.join(RUNTIME_DIR, "pdf_fonts")
+            dejavu_regular_path = os.path.join(fonts_cache_dir, "DejaVuSans.ttf")
+            dejavu_bold_path = os.path.join(fonts_cache_dir, "DejaVuSans-Bold.ttf")
+            dejavu_regular_url = "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf/DejaVuSans.ttf"
+            dejavu_bold_url = "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf/DejaVuSans-Bold.ttf"
+
+            if _ensure_cached_font(dejavu_regular_url, dejavu_regular_path) and _register_ttf_if_needed(
+                "PDFUnicode", dejavu_regular_path
+            ):
+                font_regular = "PDFUnicode"
+            if _ensure_cached_font(dejavu_bold_url, dejavu_bold_path) and _register_ttf_if_needed(
+                "PDFUnicode-Bold", dejavu_bold_path
+            ):
+                font_bold = "PDFUnicode-Bold"
+
+            if font_regular != "Helvetica" and font_bold in ("Helvetica-Bold", "Helvetica"):
+                font_bold = font_regular
+
+        _PDF_FONT_NAMES = (font_regular, font_bold)
+        return _PDF_FONT_NAMES
 
 # ---------- LOGIN ----------
 @app.route('/', methods=['GET', 'POST'])
@@ -178,24 +380,16 @@ def login():
             sb = get_supabase()
             res = sb.auth.sign_in_with_password({"email": email, "password": pwd})
         except Exception as e:
-            msg = str(e)
-            msg_lower = msg.lower()
-            if "getaddrinfo failed" in msg_lower or "name or service not known" in msg_lower:
-                return render_template(
-                    "login.html",
-                    error=(
-                        "Cannot connect to Supabase (DNS/network error). "
-                        "Check your internet connection and that VITE_SUPABASE_URL in .env is correct (https://<project-ref>.supabase.co)."
-                    ),
-                )
+            # Avoid leaking internal configuration or stack traces to users.
+            app.logger.exception("Supabase sign-in failed")
+            msg_lower = str(e).lower()
             if "email not confirmed" in msg_lower or "email_not_confirmed" in msg_lower:
-                return render_template(
-                    "login.html",
-                    error="Email not confirmed. Please confirm from your inbox, then login."
-                )
+                return render_template("login.html", error="Email not confirmed. Please confirm from your inbox, then login.")
             if "invalid login credentials" in msg_lower or "invalid_grant" in msg_lower:
                 return render_template("login.html", error="Invalid email or password")
-            return render_template("login.html", error=f"Supabase login error: {msg}")
+            if "missing supabase config" in msg_lower:
+                return render_template("login.html", error="Login is temporarily unavailable due to a server configuration issue.")
+            return render_template("login.html", error="Login failed. Please try again later.")
 
         user_obj = _resp_get(res, "user")
         session_obj = _resp_get(res, "session")
@@ -236,8 +430,8 @@ def login():
             if getattr(profile_res, "data", None):
                 session['username'] = profile_res.data.get('username')
         except Exception:
-            # Don't block login if profile fetch fails
-            pass
+            # Don't block login if profile fetch fails, but don't fail silently.
+            app.logger.warning("Profile fetch failed for user_id=%s", session.get('user_id'), exc_info=True)
 
         return redirect(url_for('home'))
     return render_template("login.html")
@@ -267,8 +461,8 @@ def register():
         try:
             sb = get_supabase()
 
-            # Choose redirect base: prefer explicit APP_BASE_URL, otherwise use current request host.
-            redirect_base = os.getenv("APP_BASE_URL") or request.url_root.rstrip('/')
+            # Never construct redirect URLs from request headers (open redirect risk).
+            redirect_base = APP_BASE_URL
 
             # Send username in user metadata so your DB trigger can populate public.profiles.username
             res = sb.auth.sign_up(
@@ -283,23 +477,18 @@ def register():
                 }
             )
         except Exception as e:
+            app.logger.exception("Supabase sign-up failed")
             msg = str(e)
             msg_lower = msg.lower()
-            if "getaddrinfo failed" in msg_lower or "name or service not known" in msg_lower:
-                return render_template(
-                    "register.html",
-                    error=(
-                        "Cannot connect to Supabase (DNS/network error). "
-                        "Check your internet connection and that VITE_SUPABASE_URL in .env is correct (https://<project-ref>.supabase.co)."
-                    ),
-                )
             if "already registered" in msg_lower or "user already registered" in msg_lower:
                 return render_template("register.html", error="User already exists. Please login.")
             if "invalid email" in msg_lower:
                 return render_template("register.html", error="Please enter a valid email address")
             if "weak_password" in msg_lower or "password" in msg_lower and "weak" in msg_lower:
                 return render_template("register.html", error="Password is too weak. Try a stronger one.")
-            return render_template("register.html", error=f"Supabase error: {msg}")
+            if "missing supabase config" in msg_lower:
+                return render_template("register.html", error="Registration is temporarily unavailable due to a server configuration issue.")
+            return render_template("register.html", error="Registration failed. Please try again later.")
 
         user_obj = _resp_get(res, "user")
         session_obj = _resp_get(res, "session")
@@ -358,8 +547,8 @@ def forgot_password():
 
         try:
             sb = get_supabase()
-            # Prefer explicit APP_BASE_URL, otherwise use the current request host so links work
-            redirect_base = os.getenv("APP_BASE_URL") or request.url_root.rstrip('/')
+            # Never construct redirect URLs from request headers (open redirect risk).
+            redirect_base = APP_BASE_URL
             redirect_to = f"{redirect_base}/reset-password"
 
             # supabase-py has had slightly different method signatures across versions
@@ -376,17 +565,11 @@ def forgot_password():
                 info="If an account exists for that email, a password reset link has been sent."
             )
         except Exception as e:
-            msg = str(e)
-            msg_lower = msg.lower()
-            if "getaddrinfo failed" in msg_lower or "name or service not known" in msg_lower:
-                return render_template(
-                    "forgot_password.html",
-                    error=(
-                        "Cannot connect to Supabase (DNS/network error). "
-                        "Check your internet connection and that VITE_SUPABASE_URL in .env is correct (https://<project-ref>.supabase.co)."
-                    ),
-                )
-            return render_template("forgot_password.html", error=f"Unable to send reset email: {e}")
+            app.logger.exception("Supabase reset password email failed")
+            msg_lower = str(e).lower()
+            if "missing supabase config" in msg_lower:
+                return render_template("forgot_password.html", error="Password reset is temporarily unavailable due to a server configuration issue.")
+            return render_template("forgot_password.html", error="Unable to send reset email. Please try again later.")
 
     return render_template("forgot_password.html")
 
@@ -396,12 +579,14 @@ def reset_password():
     # The Supabase recovery link typically includes tokens in the URL fragment (#...)
     # which the server cannot read. The template uses JS to read the fragment and
     # complete the password update via supabase-js.
-    supabase_url = os.getenv("VITE_SUPABASE_URL", "")
-    supabase_anon_key = os.getenv("VITE_SUPABASE_ANON_KEY", "")
+    # Support both server-side and Vite-style variable names.
+    supabase_url = os.getenv("SUPABASE_URL") or os.getenv("VITE_SUPABASE_URL") or ""
+    supabase_anon_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_ANON_KEY") or ""
     if not supabase_url or not supabase_anon_key:
+        app.logger.error("Reset password page requested but Supabase env vars are missing")
         return render_template(
             "reset_password.html",
-            error="Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.",
+            error="Password reset is not configured on this server.",
             supabase_url="",
             supabase_anon_key="",
         )
@@ -468,10 +653,20 @@ def upload():
         dataset_path = os.path.join(UPLOAD_DIR, f"{report_id}{ext or '.xlsx'}")
         file.save(dataset_path)
 
-        if ext == ".csv":
-            df = pd.read_csv(dataset_path)
-        else:
-            df = pd.read_excel(dataset_path)
+        try:
+            if ext == ".csv":
+                df = pd.read_csv(dataset_path)
+            elif ext == ".xls":
+                # .xls requires xlrd; keep error message user-friendly.
+                df = pd.read_excel(dataset_path, engine="xlrd")
+            else:
+                df = pd.read_excel(dataset_path)
+        except Exception:
+            app.logger.exception("Failed reading uploaded file: %s", filename)
+            return render_template(
+                "index.html",
+                error="Unable to read the uploaded file. Please upload a valid .csv or Excel file.",
+            ), 400
 
         df.columns = df.columns.str.lower().str.strip()
 
@@ -753,15 +948,17 @@ def download_excel():
             writer, sheet_name="Monthwise_Category_Cost", index=False
         )
 
-    @after_this_request
-    def _remove_generated_excel(response):
+    response = send_file(path, as_attachment=True)
+
+    @response.call_on_close
+    def _remove_generated_excel() -> None:
         try:
             os.remove(path)
         except OSError:
-            pass
-        return response
+            # Cleanup failures must not affect user response.
+            app.logger.warning("Failed removing generated Excel: %s", path)
 
-    return send_file(path, as_attachment=True)
+    return response
 
 # ---------- DOWNLOAD PDF ----------
 @app.route('/download/pdf')
@@ -780,121 +977,8 @@ def download_pdf():
     width, height = A4
 
     # Prefer a Unicode-capable TrueType font so the Rupee symbol (₹) renders correctly.
-    # Fall back to built-in Helvetica if we can't register any TTF.
-    FONT_REGULAR = "Helvetica"
-    FONT_BOLD = "Helvetica-Bold"
-
-    def _try_register_ttf(font_name: str, font_path: str) -> bool:
-        if not font_path or not os.path.exists(font_path):
-            return False
-        try:
-            pdfmetrics.registerFont(TTFont(font_name, font_path))
-            return True
-        except Exception:
-            app.logger.exception("Failed registering TTF font: %s", font_path)
-            return False
-
-    def _download_file(url: str, dest_path: str, timeout_s: int = 20) -> bool:
-        """Download a file to dest_path. Used only as a last-resort for PDF font availability."""
-        try:
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            # Avoid re-downloading if already present.
-            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 10_000:
-                return True
-            import urllib.request
-
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "RetailDemandForecasting/1.0",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                data = resp.read()
-            # Basic sanity check (TTF/OTF fonts are not tiny)
-            if not data or len(data) < 10_000:
-                return False
-            with open(dest_path, "wb") as f:
-                f.write(data)
-            return True
-        except Exception:
-            app.logger.exception("Failed downloading file: %s", url)
-            return False
-
-    try:
-        # Try to find a Unicode-capable TTF font on the host so the Rupee symbol (₹) renders.
-        # Render.com typically runs on Linux, where Windows font paths do not exist.
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-
-        # Optional repo-bundled fonts (recommended for consistent deploys).
-        # You may add a font file later at one of these locations.
-        repo_regular = [
-            os.path.join(base_dir, "static", "fonts", "DejaVuSans.ttf"),
-            os.path.join(base_dir, "static", "fonts", "NotoSans-Regular.ttf"),
-            os.path.join(base_dir, "fonts", "DejaVuSans.ttf"),
-            os.path.join(base_dir, "fonts", "NotoSans-Regular.ttf"),
-        ]
-        repo_bold = [
-            os.path.join(base_dir, "static", "fonts", "DejaVuSans-Bold.ttf"),
-            os.path.join(base_dir, "static", "fonts", "NotoSans-Bold.ttf"),
-            os.path.join(base_dir, "fonts", "DejaVuSans-Bold.ttf"),
-            os.path.join(base_dir, "fonts", "NotoSans-Bold.ttf"),
-        ]
-
-        # Linux system fonts (common in containers/Render)
-        linux_regular = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        ]
-        linux_bold = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-        ]
-
-        # Windows system fonts
-        windir = os.environ.get("WINDIR", r"C:\\Windows")
-        fonts_dir = os.path.join(windir, "Fonts")
-        windows_regular = [
-            os.path.join(fonts_dir, "segoeui.ttf"),
-            os.path.join(fonts_dir, "seguisym.ttf"),
-            os.path.join(fonts_dir, "arial.ttf"),
-        ]
-        windows_bold = [
-            os.path.join(fonts_dir, "segoeuib.ttf"),
-            os.path.join(fonts_dir, "arialbd.ttf"),
-        ]
-
-        regular_candidates = repo_regular + linux_regular + windows_regular
-        bold_candidates = repo_bold + linux_bold + windows_bold
-
-        if any(_try_register_ttf("PDFUnicode", p) for p in regular_candidates):
-            FONT_REGULAR = "PDFUnicode"
-        if any(_try_register_ttf("PDFUnicode-Bold", p) for p in bold_candidates):
-            FONT_BOLD = "PDFUnicode-Bold"
-
-        # Final fallback for hosted environments (e.g., Render/Linux):
-        # if no suitable system font exists, download a Unicode-capable font into RUNTIME_DIR.
-        if FONT_REGULAR == "Helvetica":
-            fonts_cache_dir = os.path.join(RUNTIME_DIR, "pdf_fonts")
-            dejavu_regular_path = os.path.join(fonts_cache_dir, "DejaVuSans.ttf")
-            dejavu_bold_path = os.path.join(fonts_cache_dir, "DejaVuSans-Bold.ttf")
-            dejavu_regular_url = "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf/DejaVuSans.ttf"
-            dejavu_bold_url = "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf/DejaVuSans-Bold.ttf"
-
-            if _download_file(dejavu_regular_url, dejavu_regular_path) and _try_register_ttf("PDFUnicode", dejavu_regular_path):
-                FONT_REGULAR = "PDFUnicode"
-            if _download_file(dejavu_bold_url, dejavu_bold_path) and _try_register_ttf("PDFUnicode-Bold", dejavu_bold_path):
-                FONT_BOLD = "PDFUnicode-Bold"
-
-        # If we could only register a Unicode-capable regular font,
-        # use it for header text as well so the Rupee symbol (₹) renders correctly.
-        if FONT_REGULAR != "Helvetica" and FONT_BOLD in ("Helvetica-Bold", "Helvetica"):
-            FONT_BOLD = FONT_REGULAR
-    except Exception:
-        # Never fail PDF creation due to font detection issues.
-        app.logger.exception("Font auto-detection failed; continuing with built-in fonts")
+    # Cached per-process to avoid repeated filesystem scans and repeated registration.
+    FONT_REGULAR, FONT_BOLD = _get_pdf_font_names()
 
     top_margin = 50
     bottom_margin = 50
@@ -903,6 +987,8 @@ def download_pdf():
 
     def new_page(font_size: int = 11) -> float:
         c.showPage()
+        # Explicitly restore canvas state to avoid relying on ReportLab defaults.
+        c.setLineWidth(1)
         c.setFont(FONT_REGULAR, font_size)
         return height - top_margin
 
@@ -971,7 +1057,7 @@ def download_pdf():
                 x += w
             return y_top - row_h
 
-        prev_line_width = getattr(c, "_lineWidth", 1)
+        # Always restore to a known line width; avoid accessing ReportLab internals.
         c.setLineWidth(grid_line_width)
 
         # Ensure we have room for at least header + one row; otherwise start a new page.
@@ -1006,7 +1092,7 @@ def download_pdf():
         c.setLineWidth(outer_line_width)
         c.rect(left, segment_top - segment_h, table_w, segment_h, stroke=1, fill=0)
 
-        c.setLineWidth(prev_line_width)
+        c.setLineWidth(1)
         c.setFont(FONT_REGULAR, 11)
         return y - 10
 
@@ -1097,15 +1183,17 @@ def download_pdf():
 
     c.save()
 
-    @after_this_request
-    def _remove_generated_pdf(response):
+    response = send_file(path, as_attachment=True)
+
+    @response.call_on_close
+    def _remove_generated_pdf() -> None:
         try:
             os.remove(path)
         except OSError:
-            pass
-        return response
+            # Cleanup failures must not affect user response.
+            app.logger.warning("Failed removing generated PDF: %s", path)
 
-    return send_file(path, as_attachment=True)
+    return response
 
 if __name__ == "__main__":
     app.run(debug=True)
