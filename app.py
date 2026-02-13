@@ -1,44 +1,71 @@
+from dataclasses import dataclass
 from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request
 import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
+from urllib.parse import urlparse
 from typing import List, Union
 from uuid import uuid4
 
-import pandas as pd
 import numpy as np
+
+# Keep app import lightweight during unit tests.
+UNIT_TESTING = os.getenv("UNIT_TESTING") == "1"
+
+import pandas as pd
 import joblib
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    def load_dotenv(*_args, **_kwargs):
+        return False
+
+# Load secrets/config from .env (do not commit .env)
+# Must run before reading env-driven globals (e.g., RUNTIME_DIR).
+load_dotenv(override=True)
 
 # ---------- RUNTIME DIR (set early for Matplotlib) ----------
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", tempfile.gettempdir())
-MPLCONFIG_DIR = os.path.join(RUNTIME_DIR, "matplotlib")
-os.makedirs(MPLCONFIG_DIR, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", MPLCONFIG_DIR)
 
-# Ensure matplotlib uses a non-GUI backend in production (Render/Linux)
-os.environ.setdefault("MPLBACKEND", "Agg")
+if not UNIT_TESTING:
+    MPLCONFIG_DIR = os.path.join(RUNTIME_DIR, "matplotlib")
+    os.makedirs(MPLCONFIG_DIR, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", MPLCONFIG_DIR)
+    os.environ.setdefault("MPLBACKEND", "Agg")
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+    import matplotlib
 
-from dotenv import load_dotenv
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+else:
+    plt = None
+    mdates = None
+    mean_absolute_error = None
+    mean_squared_error = None
+    r2_score = None
+    A4 = None
+    canvas = None
+    pdfmetrics = None
+    TTFont = None
 from werkzeug.utils import secure_filename
 
-from supabase_client import get_supabase
-
-# Load secrets/config from .env (do not commit .env)
-load_dotenv(override=True)
+if not UNIT_TESTING:
+    from supabase_client import get_supabase
+else:
+    def get_supabase(access_token: str | None = None):
+        raise RuntimeError("Supabase client is unavailable in UNIT_TESTING mode")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -57,9 +84,64 @@ DEFAULT_TREND_EPS = 0.01
 DEFAULT_CLEANUP_MAX_AGE_HOURS = 24.0
 MAX_FORECAST_MONTHS = 12
 
+
+class CacheWriteError(RuntimeError):
+    """Raised when writing a cache/temp file fails."""
+
+
+class InvalidResetTokens(ValueError):
+    """Raised when required password reset tokens are missing or invalid."""
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Application configuration parsed once at startup from environment variables."""
+
+    app_base_url: str
+    flask_secret_key: str
+    trend_eps: float
+    cleanup_max_age_hours: float
+    supabase_url: str
+    supabase_anon_key: str
+
+    @staticmethod
+    def from_env() -> "AppConfig":
+        def _safe_float_env(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None:
+                return float(default)
+            try:
+                value = float(str(raw).strip())
+                if not np.isfinite(value):
+                    return float(default)
+                return value
+            except Exception:
+                return float(default)
+
+        app_base_url = (os.getenv("APP_BASE_URL", "http://127.0.0.1:5000") or "http://127.0.0.1:5000").rstrip("/")
+        flask_secret_key = os.getenv("FLASK_SECRET_KEY", "retail_secret_key")
+        trend_eps = _safe_float_env("TREND_EPS", DEFAULT_TREND_EPS)
+        cleanup_max_age_hours = _safe_float_env("CLEANUP_MAX_AGE_HOURS", DEFAULT_CLEANUP_MAX_AGE_HOURS)
+
+        # Support both server-side and Vite-style variable names.
+        supabase_url = (os.getenv("SUPABASE_URL") or os.getenv("VITE_SUPABASE_URL") or "").strip()
+        supabase_anon_key = (os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_ANON_KEY") or "").strip()
+
+        return AppConfig(
+            app_base_url=app_base_url,
+            flask_secret_key=flask_secret_key,
+            trend_eps=float(trend_eps),
+            cleanup_max_age_hours=float(cleanup_max_age_hours),
+            supabase_url=supabase_url,
+            supabase_anon_key=supabase_anon_key,
+        )
+
+
+CONFIG = AppConfig.from_env()
+
+
 app = Flask(__name__)
 app.static_folder = GRAPH_DIR
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "retail_secret_key")
+app.secret_key = CONFIG.flask_secret_key
 
 # Session cookie defaults (helps login sessions behave consistently)
 app.config.update(
@@ -67,8 +149,8 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
-# Base URL for auth redirects (set in .env if needed)
-APP_BASE_URL = os.getenv("APP_BASE_URL", "http://127.0.0.1:5000").rstrip("/")
+# Base URL for auth redirects
+APP_BASE_URL = CONFIG.app_base_url
 
 
 def _get_env_float(name: str, default: float) -> float:
@@ -90,6 +172,11 @@ def _get_env_float(name: str, default: float) -> float:
 
 
 def _get_env_int(name: str, default: int) -> int:
+    """Parse an int environment variable safely.
+
+    - Never raises due to invalid user-provided env var values.
+    - Avoids parsing at import time by being called from configuration helpers.
+    """
     raw = os.getenv(name)
     if raw is None:
         return int(default)
@@ -101,12 +188,15 @@ def _get_env_int(name: str, default: int) -> int:
 
 # ---------- LOAD MODEL ----------
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(BASE_DIR, "model", "xgb_model.joblib"))
-if not os.path.exists(MODEL_PATH):
-    raise RuntimeError(
-        f"Missing model file: {MODEL_PATH}. "
-        "Commit model/xgb_model.joblib to the deployed branch, or set MODEL_PATH."
-    )
-model = joblib.load(MODEL_PATH)
+if os.getenv("SKIP_MODEL_LOAD") == "1":
+    model = None
+else:
+    if not os.path.exists(MODEL_PATH):
+        raise RuntimeError(
+            f"Missing model file: {MODEL_PATH}. "
+            "Commit model/xgb_model.joblib to the deployed branch, or set MODEL_PATH."
+        )
+    model = joblib.load(MODEL_PATH)
 
 
 # XGBoost can raise "data did not contain feature names" on some deployments
@@ -157,6 +247,25 @@ _PASSWORD_MIN_LEN = 8
 _PASSWORD_UPPER_RE = re.compile(r"[A-Z]")
 _PASSWORD_DIGIT_RE = re.compile(r"\d")
 _PASSWORD_SPECIAL_RE = re.compile(r"[^A-Za-z0-9]")
+
+
+def _password_policy_payload() -> dict:
+    """Password policy rendered to templates for client-side validation.
+
+    Keep this as the single source of truth so server + client can't drift.
+    """
+    return {
+        "min_len": _PASSWORD_MIN_LEN,
+        "upper_pattern": _PASSWORD_UPPER_RE.pattern,
+        "digit_pattern": _PASSWORD_DIGIT_RE.pattern,
+        "special_pattern": _PASSWORD_SPECIAL_RE.pattern,
+        "labels": {
+            "len": "At least 8 characters",
+            "upper": "One capital letter (A-Z)",
+            "digit": "One number (0-9)",
+            "special": "One special character (e.g., !@#$)",
+        },
+    }
 
 
 def _sanitize_public_error_message(msg: str | None, limit: int = 300) -> str:
@@ -237,14 +346,24 @@ def _friendly_register_error(err: Exception) -> str:
         return "Password is weak: must be at least 8 characters and include 1 capital letter (A-Z), 1 number (0-9), and 1 special character (e.g., !@#$)."
 
     if "invalid email" in msg_lower:
-        return "Please enter a valid email address"
+        return "Please enter a valid email address."
+
+    # Rate limiting / abuse protection
+    if (
+        "rate limit" in msg_lower
+        or "too many requests" in msg_lower
+        or "over_email_send_rate_limit" in msg_lower
+        or "429" in msg_lower
+    ):
+        return "Too many attempts. Please wait and try again later."
 
     if "missing supabase config" in msg_lower:
         return "Registration is temporarily unavailable due to a server configuration issue."
 
-    # Fallback: show the sanitized Supabase error so users know why it failed.
-    # (This may still be a little technical, but it's clearer than a generic message.)
-    return raw_msg or "Registration failed. Please try again later."
+    # Never return raw/sanitized backend errors to users.
+    if raw_msg:
+        app.logger.warning("Supabase sign-up failed (sanitized): %s", raw_msg)
+    return "Registration failed. Please try again later."
 
 
 def _safe_predict(m, X):
@@ -257,6 +376,46 @@ def _safe_predict(m, X):
         return m.predict(X, validate_features=False)
     except TypeError:
         return m.predict(X)
+
+
+def _sanitize_next_path(next_url: str | None) -> str | None:
+    """Return a safe internal redirect target.
+
+    Only allows relative paths (e.g. '/home') or same-host absolute URLs for APP_BASE_URL.
+    Returns None for unsafe targets.
+    """
+    if not next_url:
+        return None
+    candidate = str(next_url).strip()
+    if not candidate:
+        return None
+
+    parsed = urlparse(candidate)
+    if not parsed.scheme and not parsed.netloc:
+        return candidate if candidate.startswith("/") else None
+
+    try:
+        base = urlparse(APP_BASE_URL)
+    except Exception:
+        return None
+
+    if parsed.scheme == base.scheme and parsed.netloc == base.netloc:
+        path = parsed.path or "/"
+        if parsed.query:
+            path = path + "?" + parsed.query
+        if parsed.fragment:
+            path = path + "#" + parsed.fragment
+        return path
+    return None
+
+
+def _read_dataset_file(path: str, ext: str) -> pd.DataFrame:
+    """Read uploaded dataset into a DataFrame based on extension."""
+    if ext == ".csv":
+        return pd.read_csv(path)
+    if ext == ".xls":
+        return pd.read_excel(path, engine="xlrd")
+    return pd.read_excel(path)
 
 
 def _load_report_from_session() -> dict:
@@ -272,8 +431,8 @@ def _load_report_from_session() -> dict:
 def _cleanup_runtime_dirs(max_age_hours: float | None = None) -> None:
     """Best-effort cleanup of temp files to prevent disk growth on Render."""
     if max_age_hours is None:
-        max_age_hours = _get_env_float("CLEANUP_MAX_AGE_HOURS", DEFAULT_CLEANUP_MAX_AGE_HOURS)
-    max_age_seconds = _get_env_float("CLEANUP_MAX_AGE_HOURS", float(max_age_hours)) * 3600.0
+        max_age_hours = CONFIG.cleanup_max_age_hours
+    max_age_seconds = float(max_age_hours) * 3600.0
 
     now = time.time()
     for directory in (UPLOAD_DIR, GRAPH_DIR, DOWNLOAD_DIR):
@@ -298,7 +457,7 @@ def _cleanup_runtime_dirs(max_age_hours: float | None = None) -> None:
 def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float | None = None) -> str:
     """Return a human-friendly trend label based on the fitted slope."""
     if eps is None:
-        eps = _get_env_float("TREND_EPS", DEFAULT_TREND_EPS)
+        eps = CONFIG.trend_eps
     values = np.asarray(series, dtype=float)
     values = values[np.isfinite(values)]
     if values.size < 2:
@@ -321,6 +480,19 @@ def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float |
 _PDF_FONT_LOCK = threading.Lock()
 _PDF_FONT_NAMES: tuple[str, str] | None = None
 
+_FONT_CACHE_LOCKS_GUARD = threading.Lock()
+_FONT_CACHE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _get_path_lock(path: str) -> threading.Lock:
+    """Return a stable per-path lock for in-process concurrency control."""
+    with _FONT_CACHE_LOCKS_GUARD:
+        lock = _FONT_CACHE_LOCKS.get(path)
+        if lock is None:
+            lock = threading.Lock()
+            _FONT_CACHE_LOCKS[path] = lock
+        return lock
+
 
 def _looks_like_font_bytes(data: bytes) -> bool:
     """Basic validation to avoid caching HTML error pages as fonts."""
@@ -332,14 +504,30 @@ def _looks_like_font_bytes(data: bytes) -> bool:
 
 
 def _atomic_write_bytes(dest_path: str, data: bytes) -> None:
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    dest_dir = os.path.dirname(dest_path) or "."
+    os.makedirs(dest_dir, exist_ok=True)
     tmp_path = dest_path + f".{uuid4().hex}.tmp"
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    # Atomic replace prevents corrupted cache state under concurrent writers.
-    os.replace(tmp_path, dest_path)
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Atomic replace prevents corrupted cache state under concurrent writers.
+        try:
+            os.replace(tmp_path, dest_path)
+        except OSError as replace_err:
+            # Cross-device / filesystem fallback.
+            try:
+                shutil.copyfile(tmp_path, dest_path)
+            except Exception:
+                raise CacheWriteError(f"Failed writing cache file: {dest_path}") from replace_err
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def _font_file_is_valid(path: str) -> bool:
@@ -358,21 +546,22 @@ def _ensure_cached_font(url: str, dest_path: str, timeout_s: int = 20) -> bool:
     Performs simple signature validation; registration will further validate.
     """
     try:
-        if os.path.exists(dest_path) and _font_file_is_valid(dest_path):
-            return True
+        with _get_path_lock(dest_path):
+            if os.path.exists(dest_path) and _font_file_is_valid(dest_path):
+                return True
 
-        import urllib.request
+            import urllib.request
 
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "RetailDemandForecasting/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            data = resp.read()
-        if not _looks_like_font_bytes(data):
-            return False
-        _atomic_write_bytes(dest_path, data)
-        return _font_file_is_valid(dest_path)
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "RetailDemandForecasting/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                data = resp.read()
+            if not _looks_like_font_bytes(data):
+                return False
+            _atomic_write_bytes(dest_path, data)
+            return _font_file_is_valid(dest_path)
     except Exception:
         app.logger.exception("Failed ensuring cached font: %s", url)
         return False
@@ -489,7 +678,7 @@ def login():
         email_raw = _first_non_empty(request.form.get('username'), request.form.get('email'))
         pwd = request.form.get('password')
         if not email_raw or not pwd:
-            return render_template("login.html", error="Please enter email and password")
+            return render_template("login.html", error="Please enter email and password.")
         email = email_raw.lower()
 
         try:
@@ -502,7 +691,7 @@ def login():
             if "email not confirmed" in msg_lower or "email_not_confirmed" in msg_lower:
                 return render_template("login.html", error="Email not confirmed. Please confirm from your inbox, then login.")
             if "invalid login credentials" in msg_lower or "invalid_grant" in msg_lower:
-                return render_template("login.html", error="Invalid email or password")
+                return render_template("login.html", error="Invalid email or password.")
             if "missing supabase config" in msg_lower:
                 return render_template("login.html", error="Login is temporarily unavailable due to a server configuration issue.")
             return render_template("login.html", error="Login failed. Please try again later.")
@@ -511,7 +700,7 @@ def login():
         session_obj = _resp_get(res, "session")
 
         if user_obj is None:
-            return render_template("login.html", error="Invalid email or password")
+            return render_template("login.html", error="Invalid email or password.")
 
         # If Confirm Email is enabled, Supabase can return a user but no session.
         if session_obj is None:
@@ -523,7 +712,7 @@ def login():
         access_token = _resp_get(session_obj, "access_token")
         refresh_token = _resp_get(session_obj, "refresh_token")
         if not access_token:
-            return render_template("login.html", error="Login failed. Please try again.")
+            return render_template("login.html", error="Login failed. Please try again later.")
 
         # Avoid stale data by clearing any previous session before setting new values.
         session.clear()
@@ -555,11 +744,12 @@ def login():
 # ---------- REGISTER ----------
 @app.route('/register', methods=['GET', 'POST'])
 def register():
+    policy = _password_policy_payload()
     if request.method == 'POST':
         # Supabase Auth expects an email for sign-up.
         email_raw = _first_non_empty(request.form.get('username'), request.form.get('email'))
         if not email_raw:
-            return render_template("register.html", error="Please enter your email")
+            return render_template("register.html", error="Please enter your email.", password_policy=policy)
         email = email_raw.lower()
         # Optional username field (if not provided, derive from email prefix)
         username = (request.form.get('profile_username') or "").strip()
@@ -569,14 +759,14 @@ def register():
         pwd = request.form.get('password')
         confirm = request.form.get('confirm') or request.form.get('confirm_password')
         if not pwd or not confirm:
-            return render_template("register.html", error="Please enter and confirm your password")
+            return render_template("register.html", error="Please enter and confirm your password.", password_policy=policy)
 
         if pwd != confirm:
-            return render_template("register.html", error="Passwords do not match")
+            return render_template("register.html", error="Passwords do not match.", password_policy=policy)
 
         strength_err = _password_strength_error(pwd)
         if strength_err:
-            return render_template("register.html", error=strength_err)
+            return render_template("register.html", error=strength_err, password_policy=policy)
 
         try:
             sb = get_supabase()
@@ -598,13 +788,13 @@ def register():
             )
         except Exception as e:
             app.logger.exception("Supabase sign-up failed")
-            return render_template("register.html", error=_friendly_register_error(e))
+            return render_template("register.html", error=_friendly_register_error(e), password_policy=policy)
 
         user_obj = _resp_get(res, "user")
         session_obj = _resp_get(res, "session")
 
         if user_obj is None:
-            return render_template("register.html", error="Registration failed")
+            return render_template("register.html", error="Registration failed. Please try again later.", password_policy=policy)
 
         # Some Supabase/Auth configurations return 200 with a user but no new identity
         # when the email already exists. Treat that as a duplicate-email outcome so
@@ -614,6 +804,7 @@ def register():
             return render_template(
                 "register.html",
                 error="This email is already registered. Reset password instead.",
+                password_policy=policy,
             )
 
         # With email confirmation enabled, session may be None: that's still a success.
@@ -631,10 +822,11 @@ def register():
 
         return render_template(
             "register.html",
-            success="Registration successful. Check your email to confirm, then login."
+            success="Registration successful. Check your email to confirm, then login.",
+            password_policy=policy,
         )
 
-    return render_template("register.html")
+    return render_template("register.html", password_policy=policy)
 
 
 @app.route('/auth/callback')
@@ -647,8 +839,10 @@ def auth_callback():
     err = request.args.get('error') or request.args.get('error_code')
     err_desc = request.args.get('error_description')
     if err or err_desc:
-        msg = err_desc or err
-        return render_template("login.html", error=f"Email confirmation failed: {msg}")
+        raw_msg = _sanitize_public_error_message(err_desc or err)
+        if raw_msg:
+            app.logger.warning("Auth callback error (sanitized): %s", raw_msg)
+        return render_template("login.html", error="Email confirmation failed. Please try again.")
 
     return render_template(
         "login.html",
@@ -699,9 +893,8 @@ def reset_password():
     # The Supabase recovery link typically includes tokens in the URL fragment (#...)
     # which the server cannot read. The template uses JS to read the fragment and
     # complete the password update via supabase-js.
-    # Support both server-side and Vite-style variable names.
-    supabase_url = os.getenv("SUPABASE_URL") or os.getenv("VITE_SUPABASE_URL") or ""
-    supabase_anon_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_ANON_KEY") or ""
+    supabase_url = CONFIG.supabase_url
+    supabase_anon_key = CONFIG.supabase_anon_key
     if not supabase_url or not supabase_anon_key:
         app.logger.error("Reset password page requested but Supabase env vars are missing")
         return render_template(
@@ -709,6 +902,20 @@ def reset_password():
             error="Password reset is not configured on this server.",
             supabase_url="",
             supabase_anon_key="",
+        )
+
+    # Optional query-param tokens (some auth flows may use query instead of hash)
+    access_q = (request.args.get("access_token") or "").strip()
+    refresh_q = (request.args.get("refresh_token") or "").strip()
+    try:
+        if (access_q or refresh_q) and not (access_q and refresh_q):
+            raise InvalidResetTokens("missing_query_tokens")
+    except InvalidResetTokens:
+        return render_template(
+            "reset_password.html",
+            error="Missing recovery tokens. Please open this page from the reset email link.",
+            supabase_url=supabase_url,
+            supabase_anon_key=supabase_anon_key,
         )
 
     return render_template(
@@ -774,13 +981,7 @@ def upload():
         file.save(dataset_path)
 
         try:
-            if ext == ".csv":
-                df = pd.read_csv(dataset_path)
-            elif ext == ".xls":
-                # .xls requires xlrd; keep error message user-friendly.
-                df = pd.read_excel(dataset_path, engine="xlrd")
-            else:
-                df = pd.read_excel(dataset_path)
+            df = _read_dataset_file(dataset_path, ext)
         except Exception:
             app.logger.exception("Failed reading uploaded file: %s", filename)
             return render_template(
