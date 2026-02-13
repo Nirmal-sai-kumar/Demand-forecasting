@@ -40,9 +40,10 @@
             margin: 10px 0;
             border-radius: 5px;
             border: 1px solid #ccc;
+            box-sizing: border-box;
         }
 
-        button {
+        button[type="submit"] {
             width: 100%;
             padding: 12px;
             margin-top: 15px;
@@ -54,7 +55,7 @@
             cursor: pointer;
         }
 
-        button:hover {
+        button[type="submit"]:hover {
             background: #163128;
         }
 
@@ -97,6 +98,34 @@
             color: green;
             margin-top: 10px;
         }
+
+        .password-wrap {
+            position: relative;
+            width: 100%;
+        }
+
+        .password-wrap input {
+            padding-right: 44px;
+        }
+
+        .pwd-toggle {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 28px;
+            height: 28px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            user-select: none;
+            background: transparent;
+            border: none;
+            padding: 0;
+            font-size: 18px;
+            line-height: 1;
+        }
     </style>
 </head>
 
@@ -108,7 +137,10 @@
 
     <form method="POST" action="{{ url_for('login') }}">
         <input type="text" name="username" placeholder="Email" required>
-        <input type="password" name="password" placeholder="Password" required>
+        <div class="password-wrap">
+            <input type="password" id="pwd" name="password" placeholder="Password" required>
+            <button id="pwdToggle" class="pwd-toggle" type="button" aria-label="Show password">🙈</button>
+        </div>
 
         <button type="submit">Login</button>
     </form>
@@ -129,6 +161,28 @@
         New user? <a href="{{ url_for('register') }}">Register here</a>
     </div>
 </div>
+
+<script>
+(function () {
+    const pwd = document.getElementById('pwd');
+    const toggle = document.getElementById('pwdToggle');
+    if (!pwd || !toggle) return;
+
+    function setState(isHidden) {
+        toggle.textContent = isHidden ? '🙈' : '👀';
+        toggle.setAttribute('aria-label', isHidden ? 'Show password' : 'Hide password');
+    }
+
+    function onToggle() {
+        const isHidden = pwd.type === 'password';
+        pwd.type = isHidden ? 'text' : 'password';
+        setState(!isHidden);
+    }
+
+    setState(true);
+    toggle.addEventListener('click', onToggle);
+})();
+</script>
 
 </body>
 </html>
