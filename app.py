@@ -360,10 +360,37 @@ def _friendly_register_error(err: Exception) -> str:
     if "missing supabase config" in msg_lower:
         return "Registration is temporarily unavailable due to a server configuration issue."
 
+    # Network / timeout errors (request may have been processed server-side)
+    if (
+        "timed out" in msg_lower
+        or "readtimeout" in msg_lower
+        or "timeout" in msg_lower
+        or "connection" in msg_lower and "timeout" in msg_lower
+    ):
+        return (
+            "Registration request timed out. If you received a confirmation email, your registration was successful. "
+            "Otherwise, please try again."
+        )
+
     # Never return raw/sanitized backend errors to users.
-    if raw_msg:
+    if raw_msg and not UNIT_TESTING:
         app.logger.warning("Supabase sign-up failed (sanitized): %s", raw_msg)
     return "Registration failed. Please try again later."
+
+
+def _is_transient_signup_error(err: Exception) -> bool:
+    """Return True for transient/network sign-up failures.
+
+    Supabase (GoTrue) can still create the user and send the confirmation email even if
+    the client times out waiting for the response.
+    """
+    msg = _sanitize_public_error_message(str(err)).lower()
+    return (
+        "timed out" in msg
+        or "readtimeout" in msg
+        or "timeout" in msg
+        or ("connection" in msg and "timeout" in msg)
+    )
 
 
 def _safe_predict(m, X):
@@ -787,6 +814,21 @@ def register():
                 }
             )
         except Exception as e:
+            # A network timeout can occur even if Supabase already created the user and
+            # sent the confirmation email. Treat it as an indeterminate-but-likely-success
+            # outcome with clear next steps.
+            if _is_transient_signup_error(e):
+                if not UNIT_TESTING:
+                    app.logger.warning("Supabase sign-up timed out: %s", _sanitize_public_error_message(str(e)))
+                return render_template(
+                    "register.html",
+                    success=(
+                        "If you received a confirmation email, your registration was successful. "
+                        "Please confirm your email, then login."
+                    ),
+                    password_policy=policy,
+                )
+
             app.logger.exception("Supabase sign-up failed")
             return render_template("register.html", error=_friendly_register_error(e), password_policy=policy)
 
@@ -795,17 +837,6 @@ def register():
 
         if user_obj is None:
             return render_template("register.html", error="Registration failed. Please try again later.", password_policy=policy)
-
-        # Some Supabase/Auth configurations return 200 with a user but no new identity
-        # when the email already exists. Treat that as a duplicate-email outcome so
-        # the UI doesn't misleadingly say "Registration successful".
-        identities_count = _get_identities_count(user_obj)
-        if session_obj is None and identities_count == 0:
-            return render_template(
-                "register.html",
-                error="This email is already registered. Reset password instead.",
-                password_policy=policy,
-            )
 
         # With email confirmation enabled, session may be None: that's still a success.
         # If email confirmation is disabled, Supabase may return a session; we can auto-login.
@@ -840,7 +871,7 @@ def auth_callback():
     err_desc = request.args.get('error_description')
     if err or err_desc:
         raw_msg = _sanitize_public_error_message(err_desc or err)
-        if raw_msg:
+        if raw_msg and not UNIT_TESTING:
             app.logger.warning("Auth callback error (sanitized): %s", raw_msg)
         return render_template("login.html", error="Email confirmation failed. Please try again.")
 
@@ -896,7 +927,8 @@ def reset_password():
     supabase_url = CONFIG.supabase_url
     supabase_anon_key = CONFIG.supabase_anon_key
     if not supabase_url or not supabase_anon_key:
-        app.logger.error("Reset password page requested but Supabase env vars are missing")
+        if not UNIT_TESTING:
+            app.logger.warning("Reset password page requested but Supabase env vars are missing")
         return render_template(
             "reset_password.html",
             error="Password reset is not configured on this server.",
