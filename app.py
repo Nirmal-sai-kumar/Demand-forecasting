@@ -436,6 +436,13 @@ def _sanitize_next_path(next_url: str | None) -> str | None:
     return None
 
 
+def _issue_form_nonce(session_key: str) -> str:
+    """Issue and store a one-time form nonce in the user session."""
+    nonce = uuid4().hex
+    session[session_key] = nonce
+    return nonce
+
+
 def _read_dataset_file(path: str, ext: str) -> pd.DataFrame:
     """Read uploaded dataset into a DataFrame based on extension."""
     if ext == ".csv":
@@ -772,11 +779,29 @@ def login():
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     policy = _password_policy_payload()
+    nonce_key = "register_nonce"
     if request.method == 'POST':
+        form_nonce = (request.form.get(nonce_key) or "").strip()
+        expected_nonce = (session.pop(nonce_key, None) or "").strip()
+        if not form_nonce or not expected_nonce or form_nonce != expected_nonce:
+            return render_template(
+                "register.html",
+                error=(
+                    "Registration already submitted. If you received a confirmation email, please confirm it, then login."
+                ),
+                password_policy=policy,
+                register_nonce=_issue_form_nonce(nonce_key),
+            )
+
         # Supabase Auth expects an email for sign-up.
         email_raw = _first_non_empty(request.form.get('username'), request.form.get('email'))
         if not email_raw:
-            return render_template("register.html", error="Please enter your email.", password_policy=policy)
+            return render_template(
+                "register.html",
+                error="Please enter your email.",
+                password_policy=policy,
+                register_nonce=_issue_form_nonce(nonce_key),
+            )
         email = email_raw.lower()
         # Optional username field (if not provided, derive from email prefix)
         username = (request.form.get('profile_username') or "").strip()
@@ -786,14 +811,29 @@ def register():
         pwd = request.form.get('password')
         confirm = request.form.get('confirm') or request.form.get('confirm_password')
         if not pwd or not confirm:
-            return render_template("register.html", error="Please enter and confirm your password.", password_policy=policy)
+            return render_template(
+                "register.html",
+                error="Please enter and confirm your password.",
+                password_policy=policy,
+                register_nonce=_issue_form_nonce(nonce_key),
+            )
 
         if pwd != confirm:
-            return render_template("register.html", error="Passwords do not match.", password_policy=policy)
+            return render_template(
+                "register.html",
+                error="Passwords do not match.",
+                password_policy=policy,
+                register_nonce=_issue_form_nonce(nonce_key),
+            )
 
         strength_err = _password_strength_error(pwd)
         if strength_err:
-            return render_template("register.html", error=strength_err, password_policy=policy)
+            return render_template(
+                "register.html",
+                error=strength_err,
+                password_policy=policy,
+                register_nonce=_issue_form_nonce(nonce_key),
+            )
 
         try:
             sb = get_supabase()
@@ -827,16 +867,27 @@ def register():
                         "Please confirm your email, then login."
                     ),
                     password_policy=policy,
+                    form_disabled=True,
                 )
 
             app.logger.exception("Supabase sign-up failed")
-            return render_template("register.html", error=_friendly_register_error(e), password_policy=policy)
+            return render_template(
+                "register.html",
+                error=_friendly_register_error(e),
+                password_policy=policy,
+                register_nonce=_issue_form_nonce(nonce_key),
+            )
 
         user_obj = _resp_get(res, "user")
         session_obj = _resp_get(res, "session")
 
         if user_obj is None:
-            return render_template("register.html", error="Registration failed. Please try again later.", password_policy=policy)
+            return render_template(
+                "register.html",
+                error="Registration failed. Please try again later.",
+                password_policy=policy,
+                register_nonce=_issue_form_nonce(nonce_key),
+            )
 
         # With email confirmation enabled, session may be None: that's still a success.
         # If email confirmation is disabled, Supabase may return a session; we can auto-login.
@@ -855,9 +906,14 @@ def register():
             "register.html",
             success="Registration successful. Check your email to confirm, then login.",
             password_policy=policy,
+            form_disabled=True,
         )
 
-    return render_template("register.html", password_policy=policy)
+    return render_template(
+        "register.html",
+        password_policy=policy,
+        register_nonce=_issue_form_nonce(nonce_key),
+    )
 
 
 @app.route('/auth/callback')
