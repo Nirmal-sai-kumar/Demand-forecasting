@@ -5,10 +5,19 @@ from supabase import Client, create_client
 from supabase.lib.client_options import ClientOptions
 
 
-def get_supabase(access_token: str | None = None) -> Client:
+def _read_supabase_config() -> tuple[str, str]:
     # Support common naming conventions.
-    url = os.getenv("VITE_SUPABASE_URL") or os.getenv("SUPABASE_URL")
-    key = os.getenv("VITE_SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY")
+    url = os.getenv("VITE_SUPABASE_URL") or os.getenv("SUPABASE_URL") or ""
+    key = os.getenv("VITE_SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY") or ""
+    return url, key
+
+
+_SUPABASE_URL, _SUPABASE_KEY = _read_supabase_config()
+
+
+def get_supabase(access_token: str | None = None) -> Client:
+    url = _SUPABASE_URL
+    key = _SUPABASE_KEY
 
     if not url or not key:
         raise RuntimeError(

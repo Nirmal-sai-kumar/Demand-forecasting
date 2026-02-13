@@ -60,12 +60,12 @@ Open: `http://127.0.0.1:5000`
 
 ## Using the App (Upload & Forecast)
 
-- Upload file types: `.csv`, `.xlsx`, `.xls`
-- Required columns (case-insensitive):
   - `date`
   - `units_sold`
-- Minimum history: at least 30 rows/days of sales history
-- Forecast horizon: 1–12 months (the UI validates this)
+
+### Excel notes
+- `.xlsx` is read using `openpyxl`.
+- `.xls` is read using `xlrd` (v2+ supports **only** the legacy `.xls` format). If you can, prefer exporting to `.xlsx`.
 
 ## Model Training Notes (ml_model_xgb.py)
 

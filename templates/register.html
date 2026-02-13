@@ -101,7 +101,11 @@
 <div class="container">
     <h2>Register</h2>
 
-    <p id="clientError" class="error" style="display:none;"></p>
+    <script>
+        window.PASSWORD_POLICY = {{ password_policy|default({})|tojson }};
+    </script>
+
+    <p id="clientError" class="error" style="display:none;" role="alert" aria-atomic="true" tabindex="-1"></p>
 
     <form method="POST">
         <input type="email" name="username" placeholder="Email" required>
@@ -110,11 +114,17 @@
         <input type="password" id="password" name="password" placeholder="Password" minlength="8" required>
         <input type="password" id="confirm" name="confirm" placeholder="Confirm Password" minlength="8" required>
 
-        <ul id="pwReqs" class="pw-reqs">
-            <li id="reqLen" class="req-miss">At least 8 characters</li>
-            <li id="reqUpper" class="req-miss">One capital letter (A-Z)</li>
-            <li id="reqNum" class="req-miss">One number (0-9)</li>
-            <li id="reqSpec" class="req-miss">One special character (e.g., !@#$)</li>
+        <ul id="pwReqs" class="pw-reqs" aria-live="polite">
+            {% set labels = (password_policy.get('labels', {}) if password_policy else {}) %}
+            {% set lbl_len = labels.get('len', 'At least 8 characters') %}
+            {% set lbl_upper = labels.get('upper', 'One capital letter (A-Z)') %}
+            {% set lbl_digit = labels.get('digit', 'One number (0-9)') %}
+            {% set lbl_special = labels.get('special', 'One special character (e.g., !@#$)') %}
+
+            <li id="reqLen" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_len }}">✗ {{ lbl_len }}</li>
+            <li id="reqUpper" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_upper }}">✗ {{ lbl_upper }}</li>
+            <li id="reqNum" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_digit }}">✗ {{ lbl_digit }}</li>
+            <li id="reqSpec" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_special }}">✗ {{ lbl_special }}</li>
         </ul>
         <button type="submit">Register</button>
     </form>
@@ -141,6 +151,7 @@
         if (!errEl) return;
         errEl.textContent = msg;
         errEl.style.display = 'block';
+        try { errEl.focus(); } catch (e) {}
     }
 
     function clearErr() {
@@ -152,11 +163,17 @@
     function passwordStrengthError(pw) {
         if (!pw) return 'Please enter a password.';
 
+        const policy = window.PASSWORD_POLICY || {};
+        const minLen = Number(policy.min_len || 8);
+        const upperRe = new RegExp(policy.upper_pattern || '[A-Z]');
+        const digitRe = new RegExp(policy.digit_pattern || '\\d');
+        const specialRe = new RegExp(policy.special_pattern || '[^A-Za-z0-9]');
+
         const missing = [];
-        if (pw.length < 8) missing.push('at least 8 characters');
-        if (!/[A-Z]/.test(pw)) missing.push('one capital letter (A-Z)');
-        if (!/\d/.test(pw)) missing.push('one number (0-9)');
-        if (!/[^A-Za-z0-9]/.test(pw)) missing.push('one special character (e.g., !@#$)');
+        if (pw.length < minLen) missing.push('at least 8 characters');
+        if (!upperRe.test(pw)) missing.push('one capital letter (A-Z)');
+        if (!digitRe.test(pw)) missing.push('one number (0-9)');
+        if (!specialRe.test(pw)) missing.push('one special character (e.g., !@#$)');
 
         if (missing.length === 0) return null;
 
@@ -169,21 +186,30 @@
     function setReq(el, ok) {
         if (!el) return;
         el.className = ok ? 'req-met' : 'req-miss';
+        el.setAttribute('aria-checked', ok ? 'true' : 'false');
+        const label = el.getAttribute('data-label') || '';
+        el.textContent = (ok ? '✓ ' : '✗ ') + label;
     }
 
     function updateChecklist(pw) {
         const reqBox = document.getElementById('pwReqs');
         if (!reqBox) return;
 
+        const policy = window.PASSWORD_POLICY || {};
+        const minLen = Number(policy.min_len || 8);
+        const upperRe = new RegExp(policy.upper_pattern || '[A-Z]');
+        const digitRe = new RegExp(policy.digit_pattern || '\\d');
+        const specialRe = new RegExp(policy.special_pattern || '[^A-Za-z0-9]');
+
         // Show only once user starts interacting
         if (pw && pw.length > 0) {
             reqBox.style.display = 'block';
         }
 
-        setReq(document.getElementById('reqLen'), pw.length >= 8);
-        setReq(document.getElementById('reqUpper'), /[A-Z]/.test(pw));
-        setReq(document.getElementById('reqNum'), /\d/.test(pw));
-        setReq(document.getElementById('reqSpec'), /[^A-Za-z0-9]/.test(pw));
+        setReq(document.getElementById('reqLen'), pw.length >= minLen);
+        setReq(document.getElementById('reqUpper'), upperRe.test(pw));
+        setReq(document.getElementById('reqNum'), digitRe.test(pw));
+        setReq(document.getElementById('reqSpec'), specialRe.test(pw));
     }
 
     if (!form || !passwordEl || !confirmEl) return;
