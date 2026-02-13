@@ -63,6 +63,29 @@
             font-weight: bold;
         }
 
+        .pw-reqs {
+            display: none;
+            text-align: left;
+            font-size: 12px;
+            color: #666;
+            margin-top: 6px;
+            padding-left: 18px;
+        }
+
+        .pw-reqs li {
+            margin: 4px 0;
+        }
+
+        .req-met {
+            color: green;
+            font-weight: bold;
+        }
+
+        .req-miss {
+            color: red;
+            font-weight: bold;
+        }
+
         a {
             display: block;
             margin-top: 15px;
@@ -78,11 +101,21 @@
 <div class="container">
     <h2>Register</h2>
 
+    <p id="clientError" class="error" style="display:none;"></p>
+
     <form method="POST">
-        <input type="text" name="username" placeholder="Email" required>
+        <input type="email" name="username" placeholder="Email" required>
         <input type="text" name="profile_username" placeholder="Username (optional)">
-        <input type="password" name="password" placeholder="Password" required>
-        <input type="password" name="confirm" placeholder="Confirm Password" required>
+
+        <input type="password" id="password" name="password" placeholder="Password" minlength="8" required>
+        <input type="password" id="confirm" name="confirm" placeholder="Confirm Password" minlength="8" required>
+
+        <ul id="pwReqs" class="pw-reqs">
+            <li id="reqLen" class="req-miss">At least 8 characters</li>
+            <li id="reqUpper" class="req-miss">One capital letter (A-Z)</li>
+            <li id="reqNum" class="req-miss">One number (0-9)</li>
+            <li id="reqSpec" class="req-miss">One special character (e.g., !@#$)</li>
+        </ul>
         <button type="submit">Register</button>
     </form>
 
@@ -96,6 +129,103 @@
 
     <a href="{{ url_for('login') }}">Back to Login</a>
 </div>
+
+<script>
+(function () {
+    const form = document.querySelector('form');
+    const errEl = document.getElementById('clientError');
+    const passwordEl = document.getElementById('password');
+    const confirmEl = document.getElementById('confirm');
+
+    function showErr(msg) {
+        if (!errEl) return;
+        errEl.textContent = msg;
+        errEl.style.display = 'block';
+    }
+
+    function clearErr() {
+        if (!errEl) return;
+        errEl.textContent = '';
+        errEl.style.display = 'none';
+    }
+
+    function passwordStrengthError(pw) {
+        if (!pw) return 'Please enter a password.';
+
+        const missing = [];
+        if (pw.length < 8) missing.push('at least 8 characters');
+        if (!/[A-Z]/.test(pw)) missing.push('one capital letter (A-Z)');
+        if (!/\d/.test(pw)) missing.push('one number (0-9)');
+        if (!/[^A-Za-z0-9]/.test(pw)) missing.push('one special character (e.g., !@#$)');
+
+        if (missing.length === 0) return null;
+
+        if (missing.length === 1 && missing[0] === 'at least 8 characters') {
+            return 'Password is weak: must be at least 8 characters.';
+        }
+        return 'Password is weak. Missing: ' + missing.join(', ') + '.';
+    }
+
+    function setReq(el, ok) {
+        if (!el) return;
+        el.className = ok ? 'req-met' : 'req-miss';
+    }
+
+    function updateChecklist(pw) {
+        const reqBox = document.getElementById('pwReqs');
+        if (!reqBox) return;
+
+        // Show only once user starts interacting
+        if (pw && pw.length > 0) {
+            reqBox.style.display = 'block';
+        }
+
+        setReq(document.getElementById('reqLen'), pw.length >= 8);
+        setReq(document.getElementById('reqUpper'), /[A-Z]/.test(pw));
+        setReq(document.getElementById('reqNum'), /\d/.test(pw));
+        setReq(document.getElementById('reqSpec'), /[^A-Za-z0-9]/.test(pw));
+    }
+
+    if (!form || !passwordEl || !confirmEl) return;
+
+    // Show checklist on focus, hide if empty on blur
+    passwordEl.addEventListener('focus', function () {
+        const reqBox = document.getElementById('pwReqs');
+        if (reqBox) reqBox.style.display = 'block';
+        updateChecklist(passwordEl.value || '');
+    });
+
+    passwordEl.addEventListener('blur', function () {
+        const reqBox = document.getElementById('pwReqs');
+        const pw = passwordEl.value || '';
+        if (reqBox && pw.length === 0) reqBox.style.display = 'none';
+    });
+
+    passwordEl.addEventListener('input', function () {
+        updateChecklist(passwordEl.value || '');
+    });
+
+    form.addEventListener('submit', function (e) {
+        clearErr();
+        const pw = passwordEl.value || '';
+        const confirm = confirmEl.value || '';
+
+        updateChecklist(pw);
+
+        if (pw !== confirm) {
+            e.preventDefault();
+            showErr('Passwords do not match.');
+            return;
+        }
+
+        const err = passwordStrengthError(pw);
+        if (err) {
+            e.preventDefault();
+            showErr(err);
+        }
+    });
+})();
+</script>
 
 </body>
 </html>

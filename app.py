@@ -2,6 +2,7 @@ from flask import Flask, request, render_template, redirect, url_for, session, s
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -121,6 +122,27 @@ def _resp_get(obj, key: str):
     return getattr(obj, key, None)
 
 
+def _get_identities_count(user_obj) -> int | None:
+    """Best-effort read Supabase user.identities count across versions."""
+    if user_obj is None:
+        return None
+    try:
+        identities = _resp_get(user_obj, "identities")
+        if identities is None and isinstance(user_obj, dict):
+            identities = user_obj.get("identities")
+        if identities is None:
+            return None
+        if isinstance(identities, (list, tuple)):
+            return len(identities)
+        # Some clients might expose identities as an iterable-like
+        try:
+            return len(list(identities))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 def _first_non_empty(*values: str | None) -> str | None:
     for v in values:
         if v is None:
@@ -129,6 +151,100 @@ def _first_non_empty(*values: str | None) -> str | None:
         if v:
             return v
     return None
+
+
+_PASSWORD_MIN_LEN = 8
+_PASSWORD_UPPER_RE = re.compile(r"[A-Z]")
+_PASSWORD_DIGIT_RE = re.compile(r"\d")
+_PASSWORD_SPECIAL_RE = re.compile(r"[^A-Za-z0-9]")
+
+
+def _sanitize_public_error_message(msg: str | None, limit: int = 300) -> str:
+    """Best-effort sanitize exception text for displaying to end users."""
+    if not msg:
+        return ""
+    s = str(msg)
+    s = s.replace("\r", " ").replace("\n", " ")
+    # Strip some common wrapper prefixes from supabase-py
+    s = re.sub(r"AuthApiError\([^)]*\):\s*", "", s)
+    s = re.sub(r"APIError\([^)]*\):\s*", "", s)
+    s = re.sub(r"HTTPError\([^)]*\):\s*", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > limit:
+        s = s[:limit].rstrip() + "…"
+    return s
+
+
+def _password_missing_requirements(password: str) -> list[str]:
+    missing: list[str] = []
+    if len(password) < _PASSWORD_MIN_LEN:
+        missing.append("at least 8 characters")
+    if _PASSWORD_UPPER_RE.search(password) is None:
+        missing.append("one capital letter (A-Z)")
+    if _PASSWORD_DIGIT_RE.search(password) is None:
+        missing.append("one number (0-9)")
+    if _PASSWORD_SPECIAL_RE.search(password) is None:
+        missing.append("one special character (e.g., !@#$)")
+    return missing
+
+
+def _password_strength_error(password: str | None) -> str | None:
+    """Return a user-facing error string if password is weak, else None.
+
+    Rules:
+    - length >= 8
+    - at least 1 uppercase letter
+    - at least 1 number
+    - at least 1 special character (any non-alphanumeric)
+    """
+    pw = (password or "")
+    if not pw:
+        return "Please enter a password."
+
+    missing = _password_missing_requirements(pw)
+    if not missing:
+        return None
+
+    if missing == ["at least 8 characters"]:
+        return "Password is weak: must be at least 8 characters."
+
+    return "Password is weak. Missing: " + ", ".join(missing) + "."
+
+
+def _friendly_register_error(err: Exception) -> str:
+    """Map Supabase sign_up errors to consistent user-friendly messages."""
+    raw_msg = _sanitize_public_error_message(str(err))
+    msg_lower = raw_msg.lower()
+
+    # Duplicate email (wording varies by supabase-py / GoTrue)
+    if (
+        "already registered" in msg_lower
+        or "user already registered" in msg_lower
+        or "already exists" in msg_lower
+        or "email already" in msg_lower
+        or "email" in msg_lower and "in use" in msg_lower
+    ):
+        return "This email is already registered. Reset password instead."
+
+    # Weak password (wording varies)
+    if (
+        "weak_password" in msg_lower
+        or ("password" in msg_lower and "weak" in msg_lower)
+        or ("password" in msg_lower and "strength" in msg_lower)
+        or ("password" in msg_lower and "at least" in msg_lower)
+        or ("password" in msg_lower and "short" in msg_lower)
+    ):
+        return "Password is weak: must be at least 8 characters and include 1 capital letter (A-Z), 1 number (0-9), and 1 special character (e.g., !@#$)."
+
+    if "invalid email" in msg_lower:
+        return "Please enter a valid email address"
+
+    if "missing supabase config" in msg_lower:
+        return "Registration is temporarily unavailable due to a server configuration issue."
+
+    # Fallback: show the sanitized Supabase error so users know why it failed.
+    # (This may still be a little technical, but it's clearer than a generic message.)
+    return raw_msg or "Registration failed. Please try again later."
 
 
 def _safe_predict(m, X):
@@ -458,6 +574,10 @@ def register():
         if pwd != confirm:
             return render_template("register.html", error="Passwords do not match")
 
+        strength_err = _password_strength_error(pwd)
+        if strength_err:
+            return render_template("register.html", error=strength_err)
+
         try:
             sb = get_supabase()
 
@@ -478,23 +598,23 @@ def register():
             )
         except Exception as e:
             app.logger.exception("Supabase sign-up failed")
-            msg = str(e)
-            msg_lower = msg.lower()
-            if "already registered" in msg_lower or "user already registered" in msg_lower:
-                return render_template("register.html", error="User already exists. Please login.")
-            if "invalid email" in msg_lower:
-                return render_template("register.html", error="Please enter a valid email address")
-            if "weak_password" in msg_lower or "password" in msg_lower and "weak" in msg_lower:
-                return render_template("register.html", error="Password is too weak. Try a stronger one.")
-            if "missing supabase config" in msg_lower:
-                return render_template("register.html", error="Registration is temporarily unavailable due to a server configuration issue.")
-            return render_template("register.html", error="Registration failed. Please try again later.")
+            return render_template("register.html", error=_friendly_register_error(e))
 
         user_obj = _resp_get(res, "user")
         session_obj = _resp_get(res, "session")
 
         if user_obj is None:
             return render_template("register.html", error="Registration failed")
+
+        # Some Supabase/Auth configurations return 200 with a user but no new identity
+        # when the email already exists. Treat that as a duplicate-email outcome so
+        # the UI doesn't misleadingly say "Registration successful".
+        identities_count = _get_identities_count(user_obj)
+        if session_obj is None and identities_count == 0:
+            return render_template(
+                "register.html",
+                error="This email is already registered. Reset password instead.",
+            )
 
         # With email confirmation enabled, session may be None: that's still a success.
         # If email confirmation is disabled, Supabase may return a session; we can auto-login.
