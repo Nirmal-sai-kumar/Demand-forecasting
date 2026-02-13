@@ -34,9 +34,38 @@
             margin: 10px 0;
             border-radius: 5px;
             border: 1px solid #ccc;
+            box-sizing: border-box;
         }
 
-        button {
+        .password-wrap {
+            position: relative;
+            width: 100%;
+        }
+
+        .password-wrap input {
+            padding-right: 44px;
+        }
+
+        .pwd-toggle {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 28px;
+            height: 28px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            user-select: none;
+            background: transparent;
+            border: none;
+            padding: 0;
+            font-size: 18px;
+            line-height: 1;
+        }
+
+        button[type="submit"] {
             width: 100%;
             padding: 12px;
             background: #1f4037;
@@ -47,7 +76,7 @@
             cursor: pointer;
         }
 
-        button:hover {
+        button[type="submit"]:hover {
             background: #163128;
         }
 
@@ -107,12 +136,21 @@
 
     <p id="clientError" class="error" style="display:none;" role="alert" aria-atomic="true" tabindex="-1"></p>
 
-    <form method="POST">
-        <input type="email" name="username" placeholder="Email" required>
-        <input type="text" name="profile_username" placeholder="Username (optional)">
+    <form id="registerForm" method="POST">
+        <input type="hidden" name="register_nonce" value="{{ register_nonce|default('') }}">
 
-        <input type="password" id="password" name="password" placeholder="Password" minlength="8" required>
-        <input type="password" id="confirm" name="confirm" placeholder="Confirm Password" minlength="8" required>
+        <input type="email" name="username" placeholder="Email" required {% if form_disabled %}disabled{% endif %}>
+        <input type="text" name="profile_username" placeholder="Username (optional)" {% if form_disabled %}disabled{% endif %}>
+
+        <div class="password-wrap">
+            <input type="password" id="password" name="password" placeholder="Password" minlength="8" required {% if form_disabled %}disabled{% endif %}>
+            <button id="passwordToggle" class="pwd-toggle" type="button" aria-label="Show password">🙈</button>
+        </div>
+
+        <div class="password-wrap">
+            <input type="password" id="confirm" name="confirm" placeholder="Confirm Password" minlength="8" required {% if form_disabled %}disabled{% endif %}>
+            <button id="confirmToggle" class="pwd-toggle" type="button" aria-label="Show password">🙈</button>
+        </div>
 
         <ul id="pwReqs" class="pw-reqs" aria-live="polite">
             {% set labels = (password_policy.get('labels', {}) if password_policy else {}) %}
@@ -126,7 +164,7 @@
             <li id="reqNum" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_digit }}">✗ {{ lbl_digit }}</li>
             <li id="reqSpec" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_special }}">✗ {{ lbl_special }}</li>
         </ul>
-        <button type="submit">Register</button>
+        <button id="registerBtn" type="submit" {% if form_disabled %}disabled{% endif %}>Register</button>
     </form>
 
     {% if success %}
@@ -142,10 +180,32 @@
 
 <script>
 (function () {
-    const form = document.querySelector('form');
+    const form = document.getElementById('registerForm');
     const errEl = document.getElementById('clientError');
     const passwordEl = document.getElementById('password');
     const confirmEl = document.getElementById('confirm');
+    const submitBtn = document.getElementById('registerBtn');
+
+    function bindPasswordToggle(inputId, toggleId) {
+        const input = document.getElementById(inputId);
+        const toggle = document.getElementById(toggleId);
+        if (!input || !toggle) return;
+
+        function setState(isHidden) {
+            toggle.textContent = isHidden ? '🙈' : '👀';
+            toggle.setAttribute('aria-label', isHidden ? 'Show password' : 'Hide password');
+        }
+
+        function onToggle() {
+            if (input.disabled) return;
+            const isHidden = input.type === 'password';
+            input.type = isHidden ? 'text' : 'password';
+            setState(!isHidden);
+        }
+
+        setState(true);
+        toggle.addEventListener('click', onToggle);
+    }
 
     function showErr(msg) {
         if (!errEl) return;
@@ -214,6 +274,9 @@
 
     if (!form || !passwordEl || !confirmEl) return;
 
+    bindPasswordToggle('password', 'passwordToggle');
+    bindPasswordToggle('confirm', 'confirmToggle');
+
     // Show checklist on focus, hide if empty on blur
     passwordEl.addEventListener('focus', function () {
         const reqBox = document.getElementById('pwReqs');
@@ -232,6 +295,11 @@
     });
 
     form.addEventListener('submit', function (e) {
+        if (form.dataset.submitted === '1') {
+            e.preventDefault();
+            return;
+        }
+
         clearErr();
         const pw = passwordEl.value || '';
         const confirm = confirmEl.value || '';
@@ -248,6 +316,19 @@
         if (err) {
             e.preventDefault();
             showErr(err);
+            form.dataset.submitted = '0';
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Register';
+            }
+            return;
+        }
+
+        // Passed client-side validation: prevent double-submit and show progress.
+        form.dataset.submitted = '1';
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Registering...';
         }
     });
 })();
