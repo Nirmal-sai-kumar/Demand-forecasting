@@ -89,6 +89,7 @@
             justify-content: center;
             gap: 20px;
             margin-top: 20px;
+            align-items: center;
         }
 
         .download-buttons a {
@@ -102,6 +103,18 @@
 
         .download-buttons a:hover {
             background: #1a252f;
+        }
+
+        .status-text {
+            color: #2c3e50;
+            font-weight: bold;
+            min-width: 180px;
+            text-align: left;
+        }
+
+        .download-buttons a[aria-disabled="true"] {
+            opacity: 0.7;
+            pointer-events: none;
         }
     </style>
 </head>
@@ -153,6 +166,8 @@
         <div class="download-buttons">
             <a href="/download/excel">📥 Download Excel</a>
             <a href="/download/pdf">📄 Download PDF</a>
+            <a href="#" id="emailPdfBtn">📧 Email</a>
+            <span id="emailStatus" class="status-text" role="status" aria-live="polite"></span>
         </div>
     </div>
 
@@ -184,6 +199,57 @@
     </div>
 
 </div>
+
+<script>
+(function () {
+    const btn = document.getElementById('emailPdfBtn');
+    const statusEl = document.getElementById('emailStatus');
+    if (!btn) return;
+
+    function setStatus(text) {
+        if (!statusEl) return;
+        statusEl.textContent = text || '';
+    }
+
+    function setSending(sending) {
+        if (sending) {
+            btn.setAttribute('aria-disabled', 'true');
+            btn.dataset.prevText = btn.textContent;
+            btn.textContent = '📧 Sending...';
+        } else {
+            btn.removeAttribute('aria-disabled');
+            btn.textContent = btn.dataset.prevText || '📧 Email';
+            delete btn.dataset.prevText;
+        }
+    }
+
+    btn.addEventListener('click', async function (e) {
+        e.preventDefault();
+        const email = (window.prompt('Enter email address to send the PDF report:') || '').trim();
+        if (!email) return;
+
+        setStatus('Sending PDF...');
+        setSending(true);
+
+        try {
+            const res = await fetch('/email/pdf', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email })
+            });
+            const data = await res.json().catch(() => null);
+            const msg = (data && data.message) ? data.message : (res.ok ? 'PDF sent.' : 'Failed to send PDF.');
+            setStatus(msg);
+            window.alert(msg);
+        } catch (err) {
+            setStatus('Failed to send PDF.');
+            window.alert('Failed to send PDF. Please try again later.');
+        } finally {
+            setSending(false);
+        }
+    });
+})();
+</script>
 
 </body>
 </html>

@@ -38,6 +38,16 @@ FLASK_SECRET_KEY=change-me
 # Required for login/register flows
 SUPABASE_URL=https://<your-project-ref>.supabase.co
 SUPABASE_ANON_KEY=<your-supabase-anon-key>
+
+# Optional: Enable emailing the generated PDF report (result page “Email” button)
+# Example (Gmail): SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, SMTP_USE_TLS=true
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_FROM=
+SMTP_USERNAME=
+SMTP_PASSWORD=
+SMTP_USE_TLS=true
+SMTP_USE_SSL=false
 ```
 
 `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` are also accepted as aliases.
@@ -115,6 +125,16 @@ The app reads configuration from environment variables (and `.env` for local dev
 - `RUNTIME_DIR`: Optional writable temp directory for graphs/downloads (defaults to OS temp)
 - `TREND_EPS`: Optional float threshold for trend labeling (default `0.01`)
 - `CLEANUP_MAX_AGE_HOURS`: Optional float age threshold for runtime cleanup (default `24`)
+
+Emailing the PDF report (optional):
+
+- `SMTP_HOST`: SMTP server host (required to email PDFs)
+- `SMTP_PORT`: SMTP server port (default `587`)
+- `SMTP_FROM`: From address (required)
+- `SMTP_USERNAME`: SMTP username (optional)
+- `SMTP_PASSWORD`: SMTP password / app password (optional)
+- `SMTP_USE_TLS`: Use STARTTLS (default `true`)
+- `SMTP_USE_SSL`: Use implicit SSL (default `false`)
 
 ## Troubleshooting
 
