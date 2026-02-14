@@ -1,5 +1,10 @@
 from dataclasses import dataclass
-from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request
+from datetime import datetime, timezone
+from email.message import EmailMessage
+import smtplib
+import ssl
+
+from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request, jsonify
 import json
 import logging
 import os
@@ -97,6 +102,7 @@ class AppConfig:
     """Application configuration parsed once at startup from environment variables."""
 
     app_base_url: str
+    email_redirect_base_url: str
     flask_secret_key: str
     trend_eps: float
     cleanup_max_age_hours: float
@@ -118,6 +124,13 @@ class AppConfig:
                 return float(default)
 
         app_base_url = (os.getenv("APP_BASE_URL", "http://127.0.0.1:5000") or "http://127.0.0.1:5000").rstrip("/")
+        # Base URL to embed in emailed links (confirmation + password reset).
+        # Set this to your deployed domain in production.
+        email_redirect_base_url = (
+            os.getenv("EMAIL_REDIRECT_BASE_URL")
+            or os.getenv("PUBLIC_BASE_URL")
+            or app_base_url
+        ).rstrip("/")
         flask_secret_key = os.getenv("FLASK_SECRET_KEY", "retail_secret_key")
         trend_eps = _safe_float_env("TREND_EPS", DEFAULT_TREND_EPS)
         cleanup_max_age_hours = _safe_float_env("CLEANUP_MAX_AGE_HOURS", DEFAULT_CLEANUP_MAX_AGE_HOURS)
@@ -128,6 +141,7 @@ class AppConfig:
 
         return AppConfig(
             app_base_url=app_base_url,
+            email_redirect_base_url=email_redirect_base_url,
             flask_secret_key=flask_secret_key,
             trend_eps=float(trend_eps),
             cleanup_max_age_hours=float(cleanup_max_age_hours),
@@ -186,6 +200,296 @@ def _get_env_int(name: str, default: int) -> int:
     except Exception:
         return int(default)
 
+
+def _get_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    v = str(raw).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(default)
+
+
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _is_valid_email_address(value: str | None) -> bool:
+    if not value:
+        return False
+    v = str(value).strip()
+    if not v or len(v) > 254:
+        return False
+    return _EMAIL_RE.match(v) is not None
+
+
+def _get_smtp_config() -> dict:
+    """Return SMTP config from environment.
+
+    Required:
+    - SMTP_HOST
+    - SMTP_PORT
+    - SMTP_FROM
+    Optional:
+    - SMTP_USERNAME
+    - SMTP_PASSWORD
+    - SMTP_USE_TLS (default true)
+    - SMTP_USE_SSL (default false)
+    """
+    host = (os.getenv("SMTP_HOST") or "").strip()
+    port = _get_env_int("SMTP_PORT", 587)
+    from_email = (os.getenv("SMTP_FROM") or "").strip()
+    username = (os.getenv("SMTP_USERNAME") or "").strip()
+    password = (os.getenv("SMTP_PASSWORD") or "").strip()
+    use_ssl = _get_env_bool("SMTP_USE_SSL", False)
+    use_tls = _get_env_bool("SMTP_USE_TLS", True)
+    return {
+        "host": host,
+        "port": int(port),
+        "from_email": from_email,
+        "username": username,
+        "password": password,
+        "use_ssl": bool(use_ssl),
+        "use_tls": bool(use_tls),
+    }
+
+
+def _send_email_with_pdf_attachment(to_email: str, subject: str, body: str, pdf_bytes: bytes, filename: str) -> None:
+    cfg = _get_smtp_config()
+    if not cfg.get("host") or not cfg.get("from_email") or not cfg.get("port"):
+        raise RuntimeError("missing_smtp_config")
+
+    username = (cfg.get("username") or "").strip()
+    password = (cfg.get("password") or "").strip()
+    if (username and not password) or (password and not username):
+        raise RuntimeError("missing_smtp_config")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg["from_email"]
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=filename,
+    )
+
+    context = ssl.create_default_context()
+
+    if cfg["use_ssl"]:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context) as server:
+            if username and password:
+                server.login(username, password)
+            server.send_message(msg)
+        return
+
+    with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+        server.ehlo()
+        if cfg["use_tls"]:
+            server.starttls(context=context)
+            server.ehlo()
+        if username and password:
+            server.login(username, password)
+        server.send_message(msg)
+
+
+def _build_pdf_report_file(report: dict, path: str) -> None:
+    """Generate the PDF report at the given path."""
+    c = canvas.Canvas(path, pagesize=A4)
+    width, height = A4
+
+    # Prefer a Unicode-capable TrueType font so the Rupee symbol (₹) renders correctly.
+    FONT_REGULAR, FONT_BOLD = _get_pdf_font_names()
+
+    top_margin = 50
+    bottom_margin = 50
+    left = 50
+    right = 50
+
+    def new_page(font_size: int = 11) -> float:
+        c.showPage()
+        c.setLineWidth(1)
+        c.setFont(FONT_REGULAR, font_size)
+        return height - top_margin
+
+    def ensure_space(y: float, needed: float, font_size: int = 11) -> float:
+        if y - needed < bottom_margin:
+            return new_page(font_size=font_size)
+        return y
+
+    def draw_section_title(y: float, title: str) -> float:
+        y = ensure_space(y, 24, font_size=11)
+        c.setFont(FONT_BOLD, 12)
+        c.drawString(left, y, title)
+        c.setFont(FONT_REGULAR, 11)
+        return y - 18
+
+    def draw_centered_title(y: float, title: str) -> float:
+        y = ensure_space(y, 30, font_size=11)
+        c.setFont(FONT_BOLD, 16)
+        c.drawCentredString(width / 2, y, title)
+        c.setFont(FONT_REGULAR, 11)
+        return y - 28
+
+    def draw_kv_lines(y: float, items: dict, line_height: float = 16) -> float:
+        for k, v in items.items():
+            y = ensure_space(y, line_height)
+            c.drawString(left, y, f"{k}: {v}")
+            y -= line_height
+        return y
+
+    def draw_table(
+        y: float,
+        headers: list[str],
+        rows: list[list[str]],
+        col_widths: list[float],
+        row_h: float = 22,
+        grid_line_width: float = 2.2,
+        outer_line_width: float = 2.8,
+    ) -> float:
+        table_w = sum(col_widths)
+
+        def _baseline(y_top: float, h: float, font_size: int) -> float:
+            return y_top - h + (h - font_size) / 2 + 3
+
+        def _draw_header(y_top: float) -> float:
+            c.setFont(FONT_BOLD, 11)
+            x = left
+            for header, w in zip(headers, col_widths):
+                c.rect(x, y_top - row_h, w, row_h, stroke=1, fill=0)
+                c.drawCentredString(x + (w / 2), _baseline(y_top, row_h, 11), str(header))
+                x += w
+            return y_top - row_h
+
+        def _draw_row(y_top: float, row: list[str]) -> float:
+            c.setFont(FONT_REGULAR, 11)
+            x = left
+            for cell, w in zip(row, col_widths):
+                c.rect(x, y_top - row_h, w, row_h, stroke=1, fill=0)
+                c.drawCentredString(x + (w / 2), _baseline(y_top, row_h, 11), str(cell))
+                x += w
+            return y_top - row_h
+
+        c.setLineWidth(grid_line_width)
+        min_needed = row_h * 2
+        y = ensure_space(y, min_needed)
+
+        segment_top = y
+        segment_rows = 0
+        y = _draw_header(y)
+
+        for row in rows:
+            if y - row_h < bottom_margin:
+                segment_h = row_h * (1 + segment_rows)
+                c.setLineWidth(outer_line_width)
+                c.rect(left, segment_top - segment_h, table_w, segment_h, stroke=1, fill=0)
+                c.setLineWidth(grid_line_width)
+
+                y = new_page(font_size=11)
+                y = ensure_space(y, min_needed)
+                segment_top = y
+                segment_rows = 0
+                y = _draw_header(y)
+
+            y = _draw_row(y, row)
+            segment_rows += 1
+
+        segment_h = row_h * (1 + segment_rows)
+        c.setLineWidth(outer_line_width)
+        c.rect(left, segment_top - segment_h, table_w, segment_h, stroke=1, fill=0)
+
+        c.setLineWidth(1)
+        c.setFont(FONT_REGULAR, 11)
+        return y - 10
+
+    # ---------- PAGE 1: Title + Graphs first ----------
+    c.setFont(FONT_BOLD, 14)
+    c.drawString(left, height - 50, "Retail Demand Forecasting Report")
+
+    y = height - 80
+    image_w = width - left - right
+    image_h = 240
+    gap = 18
+
+    past_image = report.get("past_image")
+    future_image = report.get("future_image")
+    months = int(report.get("months") or 0)
+
+    if past_image:
+        y = ensure_space(y, image_h + gap + 18)
+        c.setFont(FONT_BOLD, 12)
+        c.drawString(left, y, "Actual vs Predicted Sales (Weekly Averages)")
+        y -= 16
+        c.drawImage(
+            os.path.join(GRAPH_DIR, past_image),
+            left,
+            y - image_h,
+            image_w,
+            image_h,
+            preserveAspectRatio=True,
+            anchor='c',
+        )
+        y -= image_h + gap
+
+    if future_image:
+        y = ensure_space(y, image_h + gap + 18)
+        title = "Future Sales Forecast"
+        if months:
+            title = f"Future Sales Forecast ({months} Month{'s' if months > 1 else ''})"
+        c.setFont(FONT_BOLD, 12)
+        c.drawString(left, y, title)
+        y -= 16
+        c.drawImage(
+            os.path.join(GRAPH_DIR, future_image),
+            left,
+            y - image_h,
+            image_w,
+            image_h,
+            preserveAspectRatio=True,
+            anchor='c',
+        )
+        y -= image_h + gap
+
+    # Start details after graphs
+    y = new_page(font_size=11)
+
+    insights = report.get('insights') or {}
+    if insights:
+        y = draw_section_title(y, "Business Insights & Recommendation")
+        y = draw_kv_lines(y, insights)
+        y -= 8
+
+    trends = report.get('trends') or {}
+    if trends:
+        y = draw_section_title(y, "Trend Summary")
+        y = draw_kv_lines(y, trends, line_height=15)
+        y -= 8
+
+    cat_rows = report.get('category_cost_table') or []
+    if cat_rows:
+        y = new_page(font_size=11)
+        section_title = "Category Cost & Stock Analysis (Forecast Months)"
+        y = draw_centered_title(y, section_title)
+        headers = ["Month", "Product Category", "Units Sold", "Total Cost (₹)"]
+        rows = []
+        for r in cat_rows:
+            m = r.get('month') or ""
+            rows.append([
+                str(m),
+                str(r.get('product_category', '')),
+                str(r.get('total_units_sold', '')),
+                f"₹ {r.get('total_cost', '')}",
+            ])
+        col_widths = [70, width - left - right - (70 + 90 + 120), 90, 120]
+        y = draw_table(y, headers, rows, col_widths=col_widths)
+
+    c.save()
+
 # ---------- LOAD MODEL ----------
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(BASE_DIR, "model", "xgb_model.joblib"))
 if os.getenv("SKIP_MODEL_LOAD") == "1":
@@ -231,6 +535,57 @@ def _get_identities_count(user_obj) -> int | None:
             return None
     except Exception:
         return None
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    """Parse an ISO8601-ish datetime string safely (best-effort)."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Python's fromisoformat doesn't accept 'Z' suffix.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _looks_like_existing_user_after_signup(user_obj) -> bool:
+    """Heuristic: True if sign_up appears to have returned an existing account.
+
+    Some Supabase Auth configurations return a success-like response for existing
+    emails (to reduce account enumeration), but do not send a confirmation email.
+    We detect that case to display a clear "already registered" message.
+
+    We keep this conservative to avoid misclassifying legitimate new signups.
+    """
+    if user_obj is None:
+        return False
+
+    identities_count = _get_identities_count(user_obj)
+    if identities_count is None or identities_count > 0:
+        return False
+
+    # If the user is already confirmed, it must be an existing account.
+    if _resp_get(user_obj, "email_confirmed_at") or _resp_get(user_obj, "confirmed_at"):
+        return True
+
+    created_at = _resp_get(user_obj, "created_at")
+    created_dt = _parse_iso_datetime(created_at)
+    if not created_dt:
+        return False
+
+    now = datetime.now(timezone.utc)
+    age_s = (now - created_dt).total_seconds()
+    # If the account is older than a few minutes and identities are empty, it's
+    # very likely an existing account (not a fresh sign-up).
+    return age_s > 300
 
 
 def _first_non_empty(*values: str | None) -> str | None:
@@ -839,7 +1194,7 @@ def register():
             sb = get_supabase()
 
             # Never construct redirect URLs from request headers (open redirect risk).
-            redirect_base = APP_BASE_URL
+            redirect_base = CONFIG.email_redirect_base_url
 
             # Send username in user metadata so your DB trigger can populate public.profiles.username
             res = sb.auth.sign_up(
@@ -885,6 +1240,15 @@ def register():
             return render_template(
                 "register.html",
                 error="Registration failed. Please try again later.",
+                password_policy=policy,
+                register_nonce=_issue_form_nonce(nonce_key),
+            )
+
+        # If Supabase returned an existing-user-shaped response, show a clear message.
+        if _looks_like_existing_user_after_signup(user_obj):
+            return render_template(
+                "register.html",
+                error="This email is already registered. Please login or reset your password.",
                 password_policy=policy,
                 register_nonce=_issue_form_nonce(nonce_key),
             )
@@ -949,7 +1313,7 @@ def forgot_password():
         try:
             sb = get_supabase()
             # Never construct redirect URLs from request headers (open redirect risk).
-            redirect_base = APP_BASE_URL
+            redirect_base = CONFIG.email_redirect_base_url
             redirect_to = f"{redirect_base}/reset-password"
 
             # supabase-py has had slightly different method signatures across versions
@@ -1382,215 +1746,7 @@ def download_pdf():
 
     report_id = session.get("report_id")
     path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
-    c = canvas.Canvas(path, pagesize=A4)
-    width, height = A4
-
-    # Prefer a Unicode-capable TrueType font so the Rupee symbol (₹) renders correctly.
-    # Cached per-process to avoid repeated filesystem scans and repeated registration.
-    FONT_REGULAR, FONT_BOLD = _get_pdf_font_names()
-
-    top_margin = 50
-    bottom_margin = 50
-    left = 50
-    right = 50
-
-    def new_page(font_size: int = 11) -> float:
-        c.showPage()
-        # Explicitly restore canvas state to avoid relying on ReportLab defaults.
-        c.setLineWidth(1)
-        c.setFont(FONT_REGULAR, font_size)
-        return height - top_margin
-
-    def ensure_space(y: float, needed: float, font_size: int = 11) -> float:
-        if y - needed < bottom_margin:
-            return new_page(font_size=font_size)
-        return y
-
-    def draw_section_title(y: float, title: str) -> float:
-        y = ensure_space(y, 24, font_size=11)
-        c.setFont(FONT_BOLD, 12)
-        c.drawString(left, y, title)
-        c.setFont(FONT_REGULAR, 11)
-        return y - 18
-
-    def draw_centered_title(y: float, title: str) -> float:
-        y = ensure_space(y, 30, font_size=11)
-        c.setFont(FONT_BOLD, 16)
-        c.drawCentredString(width / 2, y, title)
-        c.setFont(FONT_REGULAR, 11)
-        return y - 28
-
-    def draw_kv_lines(y: float, items: dict, line_height: float = 16) -> float:
-        for k, v in items.items():
-            y = ensure_space(y, line_height)
-            c.drawString(left, y, f"{k}: {v}")
-            y -= line_height
-        return y
-
-    def draw_table(
-        y: float,
-        headers: list[str],
-        rows: list[list[str]],
-        col_widths: list[float],
-        row_h: float = 22,
-        grid_line_width: float = 2.2,
-        outer_line_width: float = 2.8,
-    ) -> float:
-        """Draw a paginated table.
-
-        - Repeats header on each page
-        - Keeps borders tight to rendered rows (no extra empty boxed area)
-        """
-
-        table_w = sum(col_widths)
-
-        def _baseline(y_top: float, h: float, font_size: int) -> float:
-            # y_top is the top boundary of the row. drawString uses baseline.
-            return y_top - h + (h - font_size) / 2 + 3
-
-        def _draw_header(y_top: float) -> float:
-            c.setFont(FONT_BOLD, 11)
-            x = left
-            for header, w in zip(headers, col_widths):
-                c.rect(x, y_top - row_h, w, row_h, stroke=1, fill=0)
-                c.drawCentredString(x + (w / 2), _baseline(y_top, row_h, 11), str(header))
-                x += w
-            return y_top - row_h
-
-        def _draw_row(y_top: float, row: list[str]) -> float:
-            c.setFont(FONT_REGULAR, 11)
-            x = left
-            for cell, w in zip(row, col_widths):
-                c.rect(x, y_top - row_h, w, row_h, stroke=1, fill=0)
-                c.drawCentredString(x + (w / 2), _baseline(y_top, row_h, 11), str(cell))
-                x += w
-            return y_top - row_h
-
-        # Always restore to a known line width; avoid accessing ReportLab internals.
-        c.setLineWidth(grid_line_width)
-
-        # Ensure we have room for at least header + one row; otherwise start a new page.
-        min_needed = row_h * 2
-        y = ensure_space(y, min_needed)
-
-        segment_top = y
-        segment_rows = 0
-        y = _draw_header(y)
-
-        for row in rows:
-            # Need space for the next row (and a small buffer) on the current page.
-            if y - row_h < bottom_margin:
-                # Close current page segment with an outer border matching rendered height.
-                segment_h = row_h * (1 + segment_rows)
-                c.setLineWidth(outer_line_width)
-                c.rect(left, segment_top - segment_h, table_w, segment_h, stroke=1, fill=0)
-                c.setLineWidth(grid_line_width)
-
-                # Next page segment
-                y = new_page(font_size=11)
-                y = ensure_space(y, min_needed)
-                segment_top = y
-                segment_rows = 0
-                y = _draw_header(y)
-
-            y = _draw_row(y, row)
-            segment_rows += 1
-
-        # Close final segment border
-        segment_h = row_h * (1 + segment_rows)
-        c.setLineWidth(outer_line_width)
-        c.rect(left, segment_top - segment_h, table_w, segment_h, stroke=1, fill=0)
-
-        c.setLineWidth(1)
-        c.setFont(FONT_REGULAR, 11)
-        return y - 10
-
-    # ---------- PAGE 1: Title + Graphs first ----------
-    c.setFont(FONT_BOLD, 14)
-    c.drawString(left, height - 50, "Retail Demand Forecasting Report")
-
-    y = height - 80
-    image_w = width - left - right
-    image_h = 240
-    gap = 18
-
-    past_image = report.get("past_image")
-    future_image = report.get("future_image")
-    months = int(report.get("months") or 0)
-
-    if past_image:
-        y = ensure_space(y, image_h + gap + 18)
-        c.setFont(FONT_BOLD, 12)
-        c.drawString(left, y, "Actual vs Predicted Sales (Weekly Averages)")
-        y -= 16
-        c.drawImage(
-            os.path.join(GRAPH_DIR, past_image),
-            left,
-            y - image_h,
-            image_w,
-            image_h,
-            preserveAspectRatio=True,
-            anchor='c',
-        )
-        y -= image_h + gap
-
-    if future_image:
-        y = ensure_space(y, image_h + gap + 18)
-        title = "Future Sales Forecast"
-        if months:
-            title = f"Future Sales Forecast ({months} Month{'s' if months > 1 else ''})"
-        c.setFont(FONT_BOLD, 12)
-        c.drawString(left, y, title)
-        y -= 16
-        c.drawImage(
-            os.path.join(GRAPH_DIR, future_image),
-            left,
-            y - image_h,
-            image_w,
-            image_h,
-            preserveAspectRatio=True,
-            anchor='c',
-        )
-        y -= image_h + gap
-
-    # Start details after graphs (new page so opening the PDF shows graphs first)
-    y = new_page(font_size=11)
-
-    # ---------- BUSINESS INSIGHTS ----------
-    insights = report.get('insights') or {}
-    if insights:
-        y = draw_section_title(y, "Business Insights & Recommendation")
-        y = draw_kv_lines(y, insights)
-        y -= 8
-
-    # ---------- TREND SUMMARY ----------
-    trends = report.get('trends') or {}
-    if trends:
-        y = draw_section_title(y, "Trend Summary")
-        y = draw_kv_lines(y, trends, line_height=15)
-        y -= 8
-
-    # ---------- CATEGORY COST & STOCK TABLE ----------
-    cat_rows = report.get('category_cost_table') or []
-    if cat_rows:
-        # Put the report table on a dedicated page, with a header line above the table (same page).
-        y = new_page(font_size=11)
-        section_title = "Category Cost & Stock Analysis (Forecast Months)"
-        y = draw_centered_title(y, section_title)
-        headers = ["Month", "Product Category", "Units Sold", "Total Cost (₹)"]
-        rows = []
-        for r in cat_rows:
-            m = r.get('month') or ""
-            rows.append([
-                str(m),
-                str(r.get('product_category', '')),
-                str(r.get('total_units_sold', '')),
-                f"₹ {r.get('total_cost', '')}",
-            ])
-        col_widths = [70, width - left - right - (70 + 90 + 120), 90, 120]
-        y = draw_table(y, headers, rows, col_widths=col_widths)
-
-    c.save()
+    _build_pdf_report_file(report, path)
 
     response = send_file(path, as_attachment=True)
 
@@ -1603,6 +1759,56 @@ def download_pdf():
             app.logger.warning("Failed removing generated PDF: %s", path)
 
     return response
+
+
+@app.route('/email/pdf', methods=['POST'])
+def email_pdf():
+    if not session.get('logged_in'):
+        return jsonify({"ok": False, "message": "Please login first."}), 401
+
+    email = None
+    try:
+        if request.is_json:
+            payload = request.get_json(silent=True) or {}
+            email = (payload.get('email') or '').strip()
+        else:
+            email = (request.form.get('email') or '').strip()
+    except Exception:
+        email = None
+
+    if not _is_valid_email_address(email):
+        return jsonify({"ok": False, "message": "Please enter a valid email address."}), 400
+
+    try:
+        report = _load_report_from_session()
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
+
+    report_id = session.get("report_id") or "report"
+    pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
+    filename = f"retail_forecast_report_{report_id}.pdf"
+
+    try:
+        _build_pdf_report_file(report, pdf_path)
+        with open(pdf_path, 'rb') as f:
+            pdf_bytes = f.read()
+
+        subject = "Demand Forecasting Report (PDF)"
+        body = "Attached is your Retail Demand Forecasting PDF report."
+        _send_email_with_pdf_attachment(email, subject, body, pdf_bytes, filename)
+        return jsonify({"ok": True, "message": "PDF sent successfully."})
+    except Exception as e:
+        msg = str(e).lower()
+        if "missing_smtp_config" in msg:
+            return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        app.logger.exception("Failed sending PDF email")
+        return jsonify({"ok": False, "message": "Failed to send email. Please try again later."}), 500
+    finally:
+        try:
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        except OSError:
+            app.logger.warning("Failed removing emailed PDF: %s", pdf_path)
 
 if __name__ == "__main__":
     app.run(debug=True)
