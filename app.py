@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 import smtplib
+import socket
 import ssl
 
 from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request, jsonify
@@ -245,6 +246,7 @@ def _get_smtp_config() -> dict:
     password = (os.getenv("SMTP_PASSWORD") or "").strip()
     use_ssl = _get_env_bool("SMTP_USE_SSL", False)
     use_tls = _get_env_bool("SMTP_USE_TLS", True)
+    timeout_sec = _get_env_int("SMTP_TIMEOUT_SEC", 20)
     return {
         "host": host,
         "port": int(port),
@@ -253,6 +255,7 @@ def _get_smtp_config() -> dict:
         "password": password,
         "use_ssl": bool(use_ssl),
         "use_tls": bool(use_tls),
+        "timeout_sec": int(timeout_sec),
     }
 
 
@@ -282,13 +285,13 @@ def _send_email_with_pdf_attachment(to_email: str, subject: str, body: str, pdf_
     context = ssl.create_default_context()
 
     if cfg["use_ssl"]:
-        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context) as server:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context, timeout=cfg.get("timeout_sec", 20)) as server:
             if username and password:
                 server.login(username, password)
             server.send_message(msg)
         return
 
-    with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
+    with smtplib.SMTP(cfg["host"], cfg["port"], timeout=cfg.get("timeout_sec", 20)) as server:
         server.ehlo()
         if cfg["use_tls"]:
             server.starttls(context=context)
@@ -1801,6 +1804,21 @@ def email_pdf():
         msg = str(e).lower()
         if "missing_smtp_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        if isinstance(e, smtplib.SMTPAuthenticationError):
+            return jsonify({
+                "ok": False,
+                "message": "SMTP authentication failed. Verify SMTP_USERNAME/SMTP_PASSWORD (use an App Password for Gmail).",
+            }), 500
+        if isinstance(e, (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, TimeoutError, socket.timeout)):
+            return jsonify({
+                "ok": False,
+                "message": "Could not connect to the SMTP server from this environment (blocked/timeout).",
+            }), 500
+        if isinstance(e, (socket.gaierror, OSError)):
+            return jsonify({
+                "ok": False,
+                "message": "Network error while contacting the SMTP server. Verify SMTP_HOST/SMTP_PORT and outbound access.",
+            }), 500
         app.logger.exception("Failed sending PDF email")
         return jsonify({"ok": False, "message": "Failed to send email. Please try again later."}), 500
     finally:
