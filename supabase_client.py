@@ -2,7 +2,6 @@ import os
 from urllib.parse import urlparse
 
 from supabase import Client, create_client
-from supabase.lib.client_options import ClientOptions
 
 
 def _read_supabase_config() -> tuple[str, str]:
@@ -36,10 +35,15 @@ def get_supabase(access_token: str | None = None) -> Client:
             "Invalid VITE_SUPABASE_URL. It should look like https://<project-ref>.supabase.co"
         )
 
-    # If you pass a user session access token, Supabase will apply RLS policies
-    # using auth.uid() for table operations (e.g., public.profiles).
-    if access_token:
-        options = ClientOptions(headers={"Authorization": f"Bearer {access_token}"})
-        return create_client(url, key, options=options)
+    sb = create_client(url, key)
 
-    return create_client(url, key)
+    # If you pass a user session access token, apply it to PostgREST so table
+    # operations can use RLS policies (auth.uid()).
+    if access_token:
+        try:
+            sb.postgrest.auth(access_token)
+        except Exception:
+            # Best-effort; callers may still use auth endpoints without PostgREST.
+            pass
+
+    return sb
