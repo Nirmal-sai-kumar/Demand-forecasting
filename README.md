@@ -98,6 +98,8 @@ This app uses **Supabase Auth** for login/registration.
     - `APP_BASE_URL` (your deployed base URL, e.g. `https://your-app.onrender.com`)
     - `FLASK_SECRET_KEY` (recommended for production session security)
 
+On Render, you can set `APP_BASE_URL` explicitly, or rely on Render's built-in `RENDER_EXTERNAL_URL` environment variable (the app will use it automatically if `APP_BASE_URL` is not set).
+
 `APP_BASE_URL` is used to construct safe redirect URLs for Supabase Auth flows (email confirmation / reset password).
 
 In Supabase Dashboard → **Auth** → **URL Configuration**, add these to **Additional Redirect URLs**:
