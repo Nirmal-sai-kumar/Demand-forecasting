@@ -126,6 +126,15 @@ class AppConfig:
 
     @staticmethod
     def from_env() -> "AppConfig":
+        def _first_non_empty_str(*values: str | None) -> str | None:
+            for v in values:
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    return s
+            return None
+
         def _safe_float_env(name: str, default: float) -> float:
             raw = os.getenv(name)
             if raw is None:
@@ -138,12 +147,24 @@ class AppConfig:
             except Exception:
                 return float(default)
 
-        app_base_url = (os.getenv("APP_BASE_URL", "http://127.0.0.1:5000") or "http://127.0.0.1:5000").rstrip("/")
+        # Prefer explicit APP_BASE_URL, but fall back to Render's public service URL
+        # so production deploys don't accidentally embed localhost links in emails.
+        app_base_url = (
+            _first_non_empty_str(
+                os.getenv("APP_BASE_URL"),
+                os.getenv("RENDER_EXTERNAL_URL"),
+                "http://127.0.0.1:5000",
+            )
+            or "http://127.0.0.1:5000"
+        ).rstrip("/")
         # Base URL to embed in emailed links (confirmation + password reset).
         # Set this to your deployed domain in production.
         email_redirect_base_url = (
-            os.getenv("EMAIL_REDIRECT_BASE_URL")
-            or os.getenv("PUBLIC_BASE_URL")
+            _first_non_empty_str(
+                os.getenv("EMAIL_REDIRECT_BASE_URL"),
+                os.getenv("PUBLIC_BASE_URL"),
+                app_base_url,
+            )
             or app_base_url
         ).rstrip("/")
         flask_secret_key = os.getenv("FLASK_SECRET_KEY", "retail_secret_key")
