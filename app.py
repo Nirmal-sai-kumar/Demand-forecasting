@@ -41,7 +41,9 @@ except ImportError:  # pragma: no cover
 # Load from the project directory (same folder as this file) so it works even when
 # the app is started from a different current working directory.
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(dotenv_path=os.path.join(_PROJECT_DIR, ".env"), override=True)
+# IMPORTANT: never let a local .env override hosting provider environment variables.
+# Render/Heroku/etc. set env vars externally; those should win.
+load_dotenv(dotenv_path=os.path.join(_PROJECT_DIR, ".env"), override=False)
 
 # ---------- RUNTIME DIR (set early for Matplotlib) ----------
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", tempfile.gettempdir())
@@ -361,18 +363,35 @@ def _ensure_public_report_files(report_id: str, report: dict) -> tuple[str, str]
 
 
 def _twilio_error_to_user_message(err: Exception) -> str:
-    msg = str(err or "")
+    """Map Twilio exceptions to safe, user-friendly messages.
+
+    Note: Do not include secrets or full Twilio error payloads in user responses.
+    """
+
+    # Prefer structured info when Twilio SDK provides it.
+    twilio_code = getattr(err, "code", None)
+    twilio_status = getattr(err, "status", None)
+    twilio_msg = getattr(err, "msg", None)
+    msg = str(twilio_msg or err or "")
     lower = msg.lower()
 
-    # Common Twilio sandbox failure (user hasn't joined the sandbox via the join code)
-    if "63016" in lower or "sandbox" in lower and "join" in lower:
+    # WhatsApp sandbox join requirement.
+    # Twilio commonly returns code 63016 when the recipient hasn't joined the sandbox.
+    if twilio_code == 63016 or "63016" in lower or ("sandbox" in lower and "join" in lower):
         return "WhatsApp sandbox not joined. Please join the Twilio WhatsApp Sandbox first, then try again."
 
-    if "not a valid phone number" in lower or "is not a valid" in lower:
+    # Invalid destination format.
+    if twilio_code in (21211, 21614) or "not a valid phone number" in lower or "is not a valid" in lower:
         return "Invalid WhatsApp number. Use format like +91XXXXXXXXXX."
 
-    if "authenticate" in lower or "auth" in lower or "401" in lower:
-        return "WhatsApp service authentication failed (server configuration issue)."
+    # Authentication/authorization failures.
+    # Twilio uses 20003 for invalid AccountSid/AuthToken.
+    if twilio_code == 20003 or "authenticate" in lower or str(twilio_status) == "401" or "http 401" in lower:
+        return "WhatsApp service authentication failed. Verify TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN on the server."
+
+    # Media fetch failures (Twilio can't reach your public file URLs).
+    if "media" in lower and ("url" in lower or "fetch" in lower or "retrieve" in lower or "https" in lower):
+        return "WhatsApp send failed because Twilio could not fetch the report files. Ensure PUBLIC_HTTPS_BASE_URL is a public HTTPS domain and /files/... is reachable."
 
     return "Failed to send WhatsApp message. Please try again later."
 
@@ -2076,7 +2095,18 @@ def send_whatsapp():
         session["whatsapp_last_sent_at"] = now
         return jsonify({"ok": True, "message": "Report sent to WhatsApp successfully.", "sids": [sid_pdf, sid_xlsx]})
     except Exception as e:
-        app.logger.exception("Twilio WhatsApp send failed")
+        # Log diagnostic details without leaking secrets.
+        twilio_code = getattr(e, "code", None)
+        twilio_status = getattr(e, "status", None)
+        twilio_msg = getattr(e, "msg", None)
+        safe_text = str(twilio_msg or e or "")
+        app.logger.exception(
+            "Twilio WhatsApp send failed type=%s code=%s status=%s msg=%s",
+            type(e).__name__,
+            twilio_code,
+            twilio_status,
+            (safe_text[:500] if safe_text else ""),
+        )
         msg = str(e).lower()
         if "missing_twilio_config" in msg:
             return jsonify({"ok": False, "message": "WhatsApp service is not configured on the server."}), 500
