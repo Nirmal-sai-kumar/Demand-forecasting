@@ -126,6 +126,47 @@ Emailing the PDF report (optional):
 - `SENDGRID_API_KEY`: SendGrid API key (required to email PDFs)
 - `SENDGRID_FROM`: Verified sender email address in SendGrid (required)
 
+## WhatsApp (Twilio) Report Sending (Optional)
+
+The results page includes a **“Send to WhatsApp”** button that sends the generated **PDF and Excel** report using the **Twilio WhatsApp Sandbox**.
+
+### Required environment variables
+
+```env
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+
+# Sender number (Twilio Sandbox by default)
+TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+
+# MUST be a public HTTPS URL (Twilio must fetch media URLs over HTTPS)
+PUBLIC_HTTPS_BASE_URL=https://<public-https-domain>
+```
+
+### Local development: get a public HTTPS URL
+
+Twilio cannot download files from `http://127.0.0.1:5000`, so you must use a tunnel.
+
+Option A (no install): **localtunnel**
+
+```powershell
+npx --yes localtunnel --port 5000
+```
+
+It prints a URL like `https://xxxx.loca.lt`. Set `PUBLIC_HTTPS_BASE_URL` to that value and restart the Flask app.
+
+Option B: **ngrok**
+
+```powershell
+ngrok http 5000
+```
+
+Set `PUBLIC_HTTPS_BASE_URL` to the `https://...` forwarding URL.
+
+### Sandbox join requirement
+
+The destination WhatsApp number must join your Twilio WhatsApp Sandbox (Twilio Console provides the join code). If not joined, Twilio will reject the send.
+
 ## Troubleshooting
 
 - PowerShell venv activation blocked: run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`

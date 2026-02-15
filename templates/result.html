@@ -167,6 +167,7 @@
             <a href="/download/excel">📥 Download Excel</a>
             <a href="/download/pdf">📄 Download PDF</a>
             <a href="#" id="emailPdfBtn">📧 Email</a>
+            <a href="#" id="whatsappBtn">📱 Send to WhatsApp</a>
             <span id="emailStatus" class="status-text" role="status" aria-live="polite"></span>
         </div>
     </div>
@@ -244,6 +245,68 @@
         } catch (err) {
             setStatus('Failed to send PDF.');
             window.alert('Failed to send PDF. Please try again later.');
+        } finally {
+            setSending(false);
+        }
+    });
+})();
+</script>
+
+<script>
+(function () {
+    const btn = document.getElementById('whatsappBtn');
+    const statusEl = document.getElementById('emailStatus');
+    if (!btn) return;
+
+    const re = /^\+91\d{10}$/;
+
+    function setStatus(text) {
+        if (!statusEl) return;
+        statusEl.textContent = text || '';
+    }
+
+    function setSending(sending) {
+        if (sending) {
+            btn.setAttribute('aria-disabled', 'true');
+            btn.dataset.prevText = btn.textContent;
+            btn.textContent = '📱 Sending...';
+        } else {
+            btn.removeAttribute('aria-disabled');
+            btn.textContent = btn.dataset.prevText || '📱 Send to WhatsApp';
+            delete btn.dataset.prevText;
+        }
+    }
+
+    btn.addEventListener('click', async function (e) {
+        e.preventDefault();
+        if (btn.getAttribute('aria-disabled') === 'true') return;
+
+        const raw = (window.prompt('Enter WhatsApp number (format: +91XXXXXXXXXX):') || '').trim();
+        if (!raw) return;
+
+        if (!re.test(raw)) {
+            const msg = 'Invalid number. Please use format: +91XXXXXXXXXX';
+            setStatus(msg);
+            window.alert(msg);
+            return;
+        }
+
+        setStatus('Sending report to WhatsApp...');
+        setSending(true);
+
+        try {
+            const res = await fetch('/send-whatsapp', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ number: raw })
+            });
+            const data = await res.json().catch(() => null);
+            const msg = (data && data.message) ? data.message : (res.ok ? 'Sent.' : 'Failed to send.');
+            setStatus(msg);
+            window.alert(msg);
+        } catch (err) {
+            setStatus('Failed to send WhatsApp message.');
+            window.alert('Failed to send WhatsApp message. Please try again later.');
         } finally {
             setSending(false);
         }

@@ -105,6 +105,10 @@ class CacheWriteError(RuntimeError):
 class InvalidResetTokens(ValueError):
     """Raised when required password reset tokens are missing or invalid."""
 
+
+class TwilioSendError(RuntimeError):
+    """Raised when WhatsApp sending via Twilio fails."""
+
 @dataclass(frozen=True)
 class AppConfig:
     """Application configuration parsed once at startup from environment variables."""
@@ -116,6 +120,7 @@ class AppConfig:
     cleanup_max_age_hours: float
     supabase_url: str
     supabase_anon_key: str
+    public_https_base_url: str
 
     @staticmethod
     def from_env() -> "AppConfig":
@@ -147,6 +152,16 @@ class AppConfig:
         supabase_url = (os.getenv("SUPABASE_URL") or os.getenv("VITE_SUPABASE_URL") or "").strip()
         supabase_anon_key = (os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_ANON_KEY") or "").strip()
 
+        # Public HTTPS base URL for Twilio MediaUrl fetching.
+        # Examples: https://<your-ngrok>.ngrok-free.app
+        public_https_base_url = (
+            os.getenv("PUBLIC_HTTPS_BASE_URL")
+            or os.getenv("PUBLIC_BASE_URL")
+            or os.getenv("EMAIL_REDIRECT_BASE_URL")
+            or os.getenv("APP_BASE_URL")
+            or ""
+        ).strip().rstrip("/")
+
         return AppConfig(
             app_base_url=app_base_url,
             email_redirect_base_url=email_redirect_base_url,
@@ -155,6 +170,7 @@ class AppConfig:
             cleanup_max_age_hours=float(cleanup_max_age_hours),
             supabase_url=supabase_url,
             supabase_anon_key=supabase_anon_key,
+            public_https_base_url=public_https_base_url,
         )
 
 
@@ -248,6 +264,145 @@ def _get_sendgrid_config() -> dict:
         "api_key": api_key,
         "from_email": from_email,
     }
+
+
+def _get_twilio_config() -> dict:
+    """Return Twilio WhatsApp config from environment.
+
+    Required:
+    - TWILIO_ACCOUNT_SID
+    - TWILIO_AUTH_TOKEN
+
+    Optional:
+    - TWILIO_WHATSAPP_FROM (defaults to Twilio sandbox number)
+    """
+    account_sid = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
+    auth_token = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
+    whatsapp_from = (os.getenv("TWILIO_WHATSAPP_FROM") or "whatsapp:+14155238886").strip()
+
+    if account_sid and not account_sid.startswith("AC"):
+        app.logger.warning("TWILIO_ACCOUNT_SID does not look like an Account SID (expected prefix 'AC').")
+    if whatsapp_from and not whatsapp_from.startswith("whatsapp:+"):
+        app.logger.warning("TWILIO_WHATSAPP_FROM must start with 'whatsapp:+'.")
+
+    return {
+        "account_sid": account_sid,
+        "auth_token": auth_token,
+        "whatsapp_from": whatsapp_from,
+    }
+
+
+_WHATSAPP_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+_WHATSAPP_IN_RE = re.compile(r"^\+91\d{10}$")
+
+
+def _is_valid_whatsapp_number(value: str | None) -> bool:
+    """Validate WhatsApp number input.
+
+    UX requirement calls out +91XXXXXXXXXX, but we accept generic E.164 too.
+    """
+    if not value:
+        return False
+    v = str(value).strip()
+    if not v:
+        return False
+    return _WHATSAPP_IN_RE.match(v) is not None or _WHATSAPP_E164_RE.match(v) is not None
+
+
+def _public_https_base_url_or_none() -> str | None:
+    base = (CONFIG.public_https_base_url or "").strip().rstrip("/")
+    if not base:
+        return None
+    if not base.lower().startswith("https://"):
+        return None
+    return base
+
+
+def _parse_report_id(report_id: str | None) -> str | None:
+    if not report_id:
+        return None
+    v = str(report_id).strip()
+    # report_id is stored from uuid4(), typically in canonical UUID form.
+    # Only allow UUID-like chars to avoid path traversal.
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", v):
+        return None
+    return v
+
+
+def _build_excel_report_file(report: dict, path: str) -> None:
+    """Generate the Excel report at the given path."""
+    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+        pd.DataFrame([report.get('metrics', {})]).to_excel(writer, sheet_name="Metrics", index=False)
+        pd.DataFrame([report.get('insights', {})]).to_excel(writer, sheet_name="Insights", index=False)
+        pd.DataFrame([report.get('trends', {})]).to_excel(writer, sheet_name="Trends", index=False)
+        pd.DataFrame(report.get('future_forecast_table', [])).to_excel(
+            writer, sheet_name="Future_Forecast", index=False
+        )
+        pd.DataFrame(report.get('category_cost_table', [])).to_excel(
+            writer, sheet_name="Monthwise_Category_Cost", index=False
+        )
+
+
+def _ensure_public_report_files(report_id: str, report: dict) -> tuple[str, str]:
+    """Ensure public-facing PDF/XLSX files exist for Twilio MediaUrl fetching."""
+    rid = _parse_report_id(report_id)
+    if not rid:
+        raise RuntimeError("invalid_report_id")
+
+    pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{rid}.pdf")
+    xlsx_path = os.path.join(DOWNLOAD_DIR, f"public_{rid}.xlsx")
+
+    # Generate if missing (best-effort idempotent).
+    if not os.path.exists(pdf_path):
+        _build_pdf_report_file(report, pdf_path)
+    if not os.path.exists(xlsx_path):
+        _build_excel_report_file(report, xlsx_path)
+    return pdf_path, xlsx_path
+
+
+def _twilio_error_to_user_message(err: Exception) -> str:
+    msg = str(err or "")
+    lower = msg.lower()
+
+    # Common Twilio sandbox failure (user hasn't joined the sandbox via the join code)
+    if "63016" in lower or "sandbox" in lower and "join" in lower:
+        return "WhatsApp sandbox not joined. Please join the Twilio WhatsApp Sandbox first, then try again."
+
+    if "not a valid phone number" in lower or "is not a valid" in lower:
+        return "Invalid WhatsApp number. Use format like +91XXXXXXXXXX."
+
+    if "authenticate" in lower or "auth" in lower or "401" in lower:
+        return "WhatsApp service authentication failed (server configuration issue)."
+
+    return "Failed to send WhatsApp message. Please try again later."
+
+
+def _send_whatsapp_media_twilio(to_number_e164: str, media_url: str, body: str) -> str:
+    cfg = _get_twilio_config()
+    if not cfg.get("account_sid") or not cfg.get("auth_token"):
+        raise RuntimeError("missing_twilio_config")
+
+    # Import lazily so UNIT_TESTING doesn't require twilio installed.
+    try:
+        from twilio.rest import Client  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("missing_twilio_sdk") from e
+
+    to = f"whatsapp:{to_number_e164.strip()}"
+    from_ = cfg.get("whatsapp_from")
+    client = Client(cfg["account_sid"], cfg["auth_token"])
+
+    # Twilio fetches media from the URL; must be HTTPS and publicly reachable.
+    msg = client.messages.create(
+        to=to,
+        from_=from_,
+        body=body,
+        media_url=[media_url],
+    )
+    sid = getattr(msg, "sid", None) or ""
+    if not sid:
+        raise TwilioSendError("twilio_no_sid")
+    return sid
 
 
 def _send_email_with_pdf_attachment_sendgrid(
@@ -1722,16 +1877,7 @@ def download_excel():
     report_id = session.get("report_id")
     path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
 
-    with pd.ExcelWriter(path, engine='openpyxl') as writer:
-        pd.DataFrame([report.get('metrics', {})]).to_excel(writer, sheet_name="Metrics", index=False)
-        pd.DataFrame([report.get('insights', {})]).to_excel(writer, sheet_name="Insights", index=False)
-        pd.DataFrame([report.get('trends', {})]).to_excel(writer, sheet_name="Trends", index=False)
-        pd.DataFrame(report.get('future_forecast_table', [])).to_excel(
-            writer, sheet_name="Future_Forecast", index=False
-        )
-        pd.DataFrame(report.get('category_cost_table', [])).to_excel(
-            writer, sheet_name="Monthwise_Category_Cost", index=False
-        )
+    _build_excel_report_file(report, path)
 
     response = send_file(path, as_attachment=True)
 
@@ -1821,6 +1967,122 @@ def email_pdf():
                 os.remove(pdf_path)
         except OSError:
             app.logger.warning("Failed removing emailed PDF: %s", pdf_path)
+
+
+# ---------- PUBLIC FILES (for Twilio MediaUrl) ----------
+@app.route('/files/<path:filename>', methods=['GET'])
+def public_files(filename: str):
+    """Serve generated report files for Twilio MediaUrl fetching.
+
+    Twilio does not have access to user sessions/cookies, so this endpoint is intentionally
+    unauthenticated. Files are keyed by report UUID and stored in a non-user-controlled
+    directory.
+    """
+    name = (filename or "").strip()
+    # Only allow our expected filenames.
+    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})\.(pdf|xlsx)", name)
+    if not m:
+        return ("Not found", 404)
+
+    report_id = m.group(1)
+    ext = m.group(2)
+    report_id = _parse_report_id(report_id)
+    if not report_id:
+        return ("Not found", 404)
+
+    # Generate on demand from the cached report JSON.
+    try:
+        report_path = os.path.join(DOWNLOAD_DIR, f"{report_id}.json")
+        with open(report_path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+    except Exception:
+        return ("Not found", 404)
+
+    try:
+        _ensure_public_report_files(report_id, report)
+    except Exception:
+        app.logger.exception("Failed generating public report files")
+        return ("Not found", 404)
+
+    path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.{ext}")
+    if not os.path.exists(path):
+        return ("Not found", 404)
+
+    # Do not cache long-term; these are ephemeral files.
+    @after_this_request
+    def _no_cache(resp):
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    return send_file(path, as_attachment=False)
+
+
+# ---------- SEND VIA WHATSAPP (Twilio Sandbox) ----------
+@app.route('/send-whatsapp', methods=['POST'])
+def send_whatsapp():
+    if not session.get('logged_in'):
+        return jsonify({"ok": False, "message": "Please login first."}), 401
+
+    # Basic per-session rate limiting to avoid duplicate clicks.
+    now = time.time()
+    last = session.get("whatsapp_last_sent_at")
+    try:
+        if last is not None and (now - float(last)) < 15.0:
+            return jsonify({"ok": False, "message": "Please wait a moment before sending again."}), 429
+    except Exception:
+        pass
+
+    number = None
+    try:
+        if request.is_json:
+            payload = request.get_json(silent=True) or {}
+            number = (payload.get('number') or payload.get('whatsapp') or '').strip()
+        else:
+            number = (request.form.get('number') or '').strip()
+    except Exception:
+        number = None
+
+    if not _is_valid_whatsapp_number(number):
+        return jsonify({"ok": False, "message": "Please enter a valid WhatsApp number (e.g., +91XXXXXXXXXX)."}), 400
+
+    public_base = _public_https_base_url_or_none()
+    if not public_base:
+        return jsonify({
+            "ok": False,
+            "message": "Server is not configured with a public HTTPS base URL for WhatsApp media.",
+        }), 500
+
+    try:
+        report = _load_report_from_session()
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
+
+    report_id = session.get("report_id")
+    report_id = _parse_report_id(report_id)
+    if not report_id:
+        return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
+
+    try:
+        _ensure_public_report_files(report_id, report)
+        pdf_url = f"{public_base}/files/public_{report_id}.pdf"
+        xlsx_url = f"{public_base}/files/public_{report_id}.xlsx"
+
+        # Send as two separate WhatsApp messages to maximize compatibility.
+        sid_pdf = _send_whatsapp_media_twilio(number, pdf_url, "Your Demand Forecasting Report (PDF)")
+        app.logger.info("Twilio WhatsApp PDF sent sid=%s to=%s", sid_pdf, number)
+        sid_xlsx = _send_whatsapp_media_twilio(number, xlsx_url, "Your Demand Forecasting Report (Excel)")
+        app.logger.info("Twilio WhatsApp Excel sent sid=%s to=%s", sid_xlsx, number)
+
+        session["whatsapp_last_sent_at"] = now
+        return jsonify({"ok": True, "message": "Report sent to WhatsApp successfully.", "sids": [sid_pdf, sid_xlsx]})
+    except Exception as e:
+        app.logger.exception("Twilio WhatsApp send failed")
+        msg = str(e).lower()
+        if "missing_twilio_config" in msg:
+            return jsonify({"ok": False, "message": "WhatsApp service is not configured on the server."}), 500
+        if "missing_twilio_sdk" in msg:
+            return jsonify({"ok": False, "message": "WhatsApp service is unavailable on the server."}), 500
+        return jsonify({"ok": False, "message": _twilio_error_to_user_message(e)}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
