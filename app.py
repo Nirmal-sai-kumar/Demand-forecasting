@@ -1266,8 +1266,17 @@ def _get_pdf_font_names() -> tuple[str, str]:
         _PDF_FONT_NAMES = (font_regular, font_bold)
         return _PDF_FONT_NAMES
 
-# ---------- LOGIN ----------
+# ---------- LANDING / LOGIN ----------
 @app.route('/', methods=['GET', 'POST'])
+def landing():
+    # Public homepage (always shown as the default page).
+    # Backward compatibility: if an older login form posts to '/', handle it like '/login'.
+    if request.method == 'POST':
+        return login()
+    return render_template('homepage.html')
+
+
+@app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         # Supabase Auth expects an email for sign-in.
