@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.message import EmailMessage
-import smtplib
-import ssl
+import base64
+import urllib.request
+import urllib.error
 
 from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request, jsonify
 import json
@@ -31,9 +31,17 @@ except ImportError:  # pragma: no cover
     def load_dotenv(*_args, **_kwargs):
         return False
 
+    logging.getLogger(__name__).warning(
+        "python-dotenv is not installed; .env will not be loaded automatically. "
+        "Install it with 'pip install python-dotenv' or set env vars in the OS/hosting platform."
+    )
+
 # Load secrets/config from .env (do not commit .env)
 # Must run before reading env-driven globals (e.g., RUNTIME_DIR).
-load_dotenv(override=True)
+# Load from the project directory (same folder as this file) so it works even when
+# the app is started from a different current working directory.
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(_PROJECT_DIR, ".env"), override=True)
 
 # ---------- RUNTIME DIR (set early for Matplotlib) ----------
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", tempfile.gettempdir())
@@ -225,77 +233,81 @@ def _is_valid_email_address(value: str | None) -> bool:
     return _EMAIL_RE.match(v) is not None
 
 
-def _get_smtp_config() -> dict:
-    """Return SMTP config from environment.
+def _get_sendgrid_config() -> dict:
+    """Return SendGrid API config from environment.
 
     Required:
-    - SMTP_HOST
-    - SMTP_PORT
-    - SMTP_FROM
-    Optional:
-    - SMTP_USERNAME
-    - SMTP_PASSWORD
-    - SMTP_USE_TLS (default true)
-    - SMTP_USE_SSL (default false)
+    - SENDGRID_API_KEY
+    - SENDGRID_FROM
     """
-    host = (os.getenv("SMTP_HOST") or "").strip()
-    port = _get_env_int("SMTP_PORT", 587)
-    from_email = (os.getenv("SMTP_FROM") or "").strip()
-    username = (os.getenv("SMTP_USERNAME") or "").strip()
-    password = (os.getenv("SMTP_PASSWORD") or "").strip()
-    use_ssl = _get_env_bool("SMTP_USE_SSL", False)
-    use_tls = _get_env_bool("SMTP_USE_TLS", True)
+    api_key = (os.getenv("SENDGRID_API_KEY") or "").strip()
+    from_email = (os.getenv("SENDGRID_FROM") or "").strip()
+    if api_key and not api_key.startswith("SG."):
+        app.logger.warning("SENDGRID_API_KEY does not look like a SendGrid API key (expected prefix 'SG.').")
     return {
-        "host": host,
-        "port": int(port),
+        "api_key": api_key,
         "from_email": from_email,
-        "username": username,
-        "password": password,
-        "use_ssl": bool(use_ssl),
-        "use_tls": bool(use_tls),
     }
 
 
-def _send_email_with_pdf_attachment(to_email: str, subject: str, body: str, pdf_bytes: bytes, filename: str) -> None:
-    cfg = _get_smtp_config()
-    if not cfg.get("host") or not cfg.get("from_email") or not cfg.get("port"):
-        raise RuntimeError("missing_smtp_config")
+def _send_email_with_pdf_attachment_sendgrid(
+    to_email: str,
+    subject: str,
+    body: str,
+    pdf_bytes: bytes,
+    filename: str,
+) -> None:
+    cfg = _get_sendgrid_config()
+    if not cfg.get("api_key") or not cfg.get("from_email"):
+        raise RuntimeError("missing_sendgrid_config")
 
-    username = (cfg.get("username") or "").strip()
-    password = (cfg.get("password") or "").strip()
-    if (username and not password) or (password and not username):
-        raise RuntimeError("missing_smtp_config")
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": cfg["from_email"]},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+        "attachments": [
+            {
+                "content": base64.b64encode(pdf_bytes).decode("ascii"),
+                "type": "application/pdf",
+                "filename": filename,
+                "disposition": "attachment",
+            }
+        ],
+    }
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = cfg["from_email"]
-    msg["To"] = to_email
-    msg.set_content(body)
-
-    msg.add_attachment(
-        pdf_bytes,
-        maintype="application",
-        subtype="pdf",
-        filename=filename,
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+        },
     )
 
-    context = ssl.create_default_context()
-
-    if cfg["use_ssl"]:
-        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context) as server:
-            if username and password:
-                server.login(username, password)
-            server.send_message(msg)
-        return
-
-    with smtplib.SMTP(cfg["host"], cfg["port"]) as server:
-        server.ehlo()
-        if cfg["use_tls"]:
-            server.starttls(context=context)
-            server.ehlo()
-        if username and password:
-            server.login(username, password)
-        server.send_message(msg)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = getattr(resp, "status", None)
+            if status not in (200, 202):
+                raise RuntimeError("sendgrid_failed")
+    except urllib.error.HTTPError as e:
+        # SendGrid returns a JSON body with details; log it for debugging but keep user-facing errors generic.
+        try:
+            body_bytes = e.read()
+            body_text = (body_bytes or b"").decode("utf-8", errors="replace")
+        except Exception:
+            body_text = ""
+        app.logger.warning(
+            "SendGrid HTTPError code=%s body=%s",
+            getattr(e, "code", "unknown"),
+            (body_text[:2000] if body_text else ""),
+        )
+        raise RuntimeError("sendgrid_failed") from e
+    except urllib.error.URLError as e:
+        app.logger.warning("SendGrid URLError: %s", str(e))
+        raise RuntimeError("sendgrid_failed") from e
 
 
 def _build_pdf_report_file(report: dict, path: str) -> None:
@@ -1795,11 +1807,11 @@ def email_pdf():
 
         subject = "Demand Forecasting Report (PDF)"
         body = "Attached is your Retail Demand Forecasting PDF report."
-        _send_email_with_pdf_attachment(email, subject, body, pdf_bytes, filename)
+        _send_email_with_pdf_attachment_sendgrid(email, subject, body, pdf_bytes, filename)
         return jsonify({"ok": True, "message": "PDF sent successfully."})
     except Exception as e:
         msg = str(e).lower()
-        if "missing_smtp_config" in msg:
+        if "missing_sendgrid_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
         app.logger.exception("Failed sending PDF email")
         return jsonify({"ok": False, "message": "Failed to send email. Please try again later."}), 500
