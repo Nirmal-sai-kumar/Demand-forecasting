@@ -955,6 +955,31 @@ def _is_transient_signup_error(err: Exception) -> bool:
     )
 
 
+def _is_transient_auth_email_error(err: Exception) -> bool:
+    """Return True for transient/network errors while requesting an auth email.
+
+    Supabase can still send password reset emails even if the client times out.
+    When we hit these errors, we should show a success-like message so users
+    aren't confused when the email arrives.
+    """
+    msg = _sanitize_public_error_message(str(err)).lower()
+    return (
+        "timed out" in msg
+        or "readtimeout" in msg
+        or "timeout" in msg
+        or "connection" in msg
+        or "connection reset" in msg
+        or "connection aborted" in msg
+        or "temporarily unavailable" in msg
+        or "service unavailable" in msg
+        or "bad gateway" in msg
+        or "gateway timeout" in msg
+        or "502" in msg
+        or "503" in msg
+        or "504" in msg
+    )
+
+
 def _safe_predict(m, X):
     """Predict with XGBoost models across versions.
 
@@ -1547,10 +1572,46 @@ def forgot_password():
             )
         except Exception as e:
             app.logger.exception("Supabase reset password email failed")
-            msg_lower = str(e).lower()
+            raw_msg = _sanitize_public_error_message(str(e))
+            msg_lower = raw_msg.lower()
+
+            # Misconfiguration should be shown as a clear failure.
             if "missing supabase config" in msg_lower:
-                return render_template("forgot_password.html", error="Password reset is temporarily unavailable due to a server configuration issue.")
-            return render_template("forgot_password.html", error="Unable to send reset email. Please try again later.")
+                return render_template(
+                    "forgot_password.html",
+                    error="Password reset is temporarily unavailable due to a server configuration issue.",
+                )
+
+            # Rate limiting / abuse protection.
+            if (
+                "rate limit" in msg_lower
+                or "too many requests" in msg_lower
+                or "over_email_send_rate_limit" in msg_lower
+                or "429" in msg_lower
+            ):
+                return render_template(
+                    "forgot_password.html",
+                    error="Too many attempts. Please wait and try again later.",
+                )
+
+            # If the request may have succeeded server-side (timeouts / transient network),
+            # show a success-like message to avoid confusing users who still receive the email.
+            if _is_transient_auth_email_error(e):
+                if not UNIT_TESTING:
+                    app.logger.warning("Reset password request may have timed out (sanitized): %s", raw_msg)
+                return render_template(
+                    "forgot_password.html",
+                    info=(
+                        "If an account exists for that email, a password reset link has been sent. "
+                        "Please check your inbox (and spam) in a minute."
+                    ),
+                )
+
+            # Default: real error.
+            return render_template(
+                "forgot_password.html",
+                error="Failed to send reset email. Please try again later.",
+            )
 
     return render_template("forgot_password.html")
 
