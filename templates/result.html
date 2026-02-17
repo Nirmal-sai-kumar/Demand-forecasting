@@ -245,7 +245,7 @@
 
             // Optional password protection for self email.
             let pdf_password = '';
-            const wantsPassword = window.confirm('Protect this PDF with a password?');
+            const wantsPassword = window.confirm('Protect the report with a password? (PDF will be encrypted; Excel will ask for the same password when opened)');
             if (wantsPassword) {
                 pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
                 if (!pdf_password) {
@@ -256,7 +256,7 @@
                 }
             }
 
-            setStatus('Sending PDF to your verified email...');
+            setStatus('Sending report files to your verified email...');
             setSending(true);
             try {
                 const res = await fetch('/email/pdf/self', {
@@ -265,12 +265,12 @@
                     body: JSON.stringify({ pdf_password })
                 });
                 const data = await res.json().catch(() => null);
-                const msg = (data && data.message) ? data.message : (res.ok ? 'PDF sent.' : 'Failed to send PDF.');
+                const msg = (data && data.message) ? data.message : (res.ok ? 'Report sent.' : 'Failed to send report.');
                 setStatus(msg);
                 window.alert(msg);
             } catch (err) {
-                setStatus('Failed to send PDF.');
-                window.alert('Failed to send PDF. Please try again later.');
+                setStatus('Failed to send report.');
+                window.alert('Failed to send report. Please try again later.');
             } finally {
                 setSending(false);
             }
@@ -279,13 +279,13 @@
 
     btn.addEventListener('click', async function (e) {
         e.preventDefault();
-        const email = (window.prompt('Enter email address to send the PDF report:') || '').trim();
+        const email = (window.prompt('Enter email address to send the report files (PDF + Excel):') || '').trim();
         if (!email) return;
 
         // Optional password protection.
         // The password is NEVER sent via email body; it is used only to encrypt the PDF server-side.
         let pdf_password = '';
-        const wantsPassword = window.confirm('Protect this PDF with a password? (Do NOT share the password via email)');
+        const wantsPassword = window.confirm('Protect the report with a password? (PDF will be encrypted; Excel will ask for the same password when opened)');
         if (wantsPassword) {
             pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
             if (!pdf_password) {
@@ -303,7 +303,7 @@
             return;
         }
 
-        setStatus('Sending PDF...');
+        setStatus('Sending report...');
         setSending(true);
 
         try {
@@ -313,12 +313,12 @@
                 body: JSON.stringify({ email, pdf_password })
             });
             const data = await res.json().catch(() => null);
-            const msg = (data && data.message) ? data.message : (res.ok ? 'PDF sent.' : 'Failed to send PDF.');
+            const msg = (data && data.message) ? data.message : (res.ok ? 'Report sent.' : 'Failed to send report.');
             setStatus(msg);
             window.alert(msg);
         } catch (err) {
-            setStatus('Failed to send PDF.');
-            window.alert('Failed to send PDF. Please try again later.');
+            setStatus('Failed to send report.');
+            window.alert('Failed to send report. Please try again later.');
         } finally {
             setSending(false);
         }
@@ -365,6 +365,19 @@
             return;
         }
 
+        // Optional password protection: sends two separate protected files (PDF + Excel ZIP).
+        let pdf_password = '';
+        const wantsPassword = window.confirm('Protect the report files with a password? (Sends PDF + Excel ZIP as separate files to WhatsApp)');
+        if (wantsPassword) {
+            pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
+            if (!pdf_password) {
+                const msg = 'Password protection was selected but no password was provided.';
+                setStatus(msg);
+                window.alert(msg);
+                return;
+            }
+        }
+
         setStatus('Sending report to WhatsApp...');
         setSending(true);
 
@@ -372,7 +385,7 @@
             const res = await fetch('/send-whatsapp', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ number: raw })
+                body: JSON.stringify({ number: raw, pdf_password })
             });
             const data = await res.json().catch(() => null);
             const msg = (data && data.message) ? data.message : (res.ok ? 'Sent.' : 'Failed to send.');

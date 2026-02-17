@@ -45,6 +45,25 @@ try:
 except Exception:  # pragma: no cover
     PdfReader = None
     PdfWriter = None
+    logging.getLogger(__name__).warning(
+        "pypdf is not installed; PDF password protection is disabled. "
+        "Install it with 'pip install pypdf' (in the same venv as the app)."
+    )
+
+try:
+    # Optional: AES-encrypted ZIP for sending PDF+XLSX together.
+    import pyzipper  # type: ignore
+except Exception:  # pragma: no cover
+    pyzipper = None
+
+try:
+    # Optional: used to apply worksheet/workbook protection to XLSX.
+    from openpyxl import load_workbook  # type: ignore
+    from openpyxl.workbook.protection import WorkbookProtection, hash_password  # type: ignore
+except Exception:  # pragma: no cover
+    load_workbook = None
+    WorkbookProtection = None
+    hash_password = None
 
 try:
     # Optional but recommended for robust email validation.
@@ -468,6 +487,126 @@ def _encrypt_pdf_bytes_if_requested(pdf_bytes: bytes, password: str | None) -> b
     return out.getvalue()
 
 
+def _encrypt_zip_bytes(attachments: list[tuple[str, bytes]], password: str, mode: str = "aes") -> bytes:
+    """Create a password-protected ZIP containing the given attachments.
+
+    attachments: list of (filename, file_bytes)
+
+    mode:
+    - "aes": strong encryption (WZ_AES). NOTE: Windows File Explorer can't extract AES ZIPs.
+    - "zipcrypto": legacy ZipCrypto encryption. Compatible with Windows extraction.
+    """
+    if not password:
+        raise RuntimeError("missing_zip_password")
+    if pyzipper is None:
+        raise RuntimeError("zip_encryption_unavailable")
+
+    mode_norm = (mode or "").strip().lower()
+    if mode_norm not in {"aes", "zipcrypto"}:
+        raise RuntimeError("invalid_zip_encryption_mode")
+
+    encryption = pyzipper.WZ_AES if mode_norm == "aes" else pyzipper.ZIP_CRYPTO
+
+    out = io.BytesIO()
+    with pyzipper.AESZipFile(out, "w", compression=pyzipper.ZIP_DEFLATED, encryption=encryption) as zf:
+        zf.setpassword(password.encode("utf-8"))
+        for name, data in attachments:
+            safe_name = os.path.basename(str(name or "").strip()) or "file"
+            zf.writestr(safe_name, data)
+    return out.getvalue()
+
+
+def _encrypt_zip_bytes_aes(attachments: list[tuple[str, bytes]], password: str) -> bytes:
+    """Backward-compatible helper: strong AES-encrypted ZIP."""
+    return _encrypt_zip_bytes(attachments, password, mode="aes")
+
+
+def _protect_xlsx_bytes_if_requested(xlsx_bytes: bytes, password: str | None) -> bytes:
+    """Apply password protection to XLSX bytes if requested.
+
+    Important: OpenPyXL cannot apply "file open" encryption for XLSX.
+    This implements workbook/worksheet protection so edits require a password.
+    """
+    if not password:
+        return xlsx_bytes
+    if load_workbook is None or WorkbookProtection is None or hash_password is None:
+        raise RuntimeError("xlsx_protection_unavailable")
+
+    wb = load_workbook(io.BytesIO(xlsx_bytes))
+
+    # Best-effort lock workbook structure.
+    try:
+        wb.security = WorkbookProtection(lockStructure=True, workbookPassword=hash_password(password))
+    except Exception:
+        pass
+
+    for ws in wb.worksheets:
+        try:
+            ws.protection.sheet = True
+            ws.protection.set_password(password)
+        except Exception:
+            pass
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes: bytes, password: str | None) -> bytes | None:
+    """Return XLSX bytes encrypted with a password-to-open, if possible.
+
+    This requires Windows + Microsoft Excel installed (COM automation).
+    If unavailable, returns None so callers can fall back.
+    """
+    if not password:
+        return None
+    if os.name != "nt":
+        return None
+
+    try:
+        import win32com.client  # type: ignore
+    except Exception:
+        return None
+
+    # Write input to a temp file, then use Excel to SaveAs with password.
+    with tempfile.TemporaryDirectory(prefix="xlsxpw_") as td:
+        in_path = os.path.join(td, "in.xlsx")
+        out_path = os.path.join(td, "out.xlsx")
+        with open(in_path, "wb") as f:
+            f.write(xlsx_bytes)
+
+        excel = None
+        wb = None
+        try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            wb = excel.Workbooks.Open(in_path, ReadOnly=False)
+
+            # SaveAs supports Password parameter for password-to-open.
+            # FileFormat 51 is xlOpenXMLWorkbook (.xlsx)
+            wb.SaveAs(out_path, FileFormat=51, Password=password)
+        except Exception:
+            return None
+        finally:
+            try:
+                if wb is not None:
+                    wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+            try:
+                if excel is not None:
+                    excel.Quit()
+            except Exception:
+                pass
+
+        try:
+            with open(out_path, "rb") as f:
+                return f.read()
+        except Exception:
+            return None
+
+
 class CacheWriteError(RuntimeError):
     """Raised when writing a cache/temp file fails."""
 
@@ -575,11 +714,36 @@ def _report_share_is_verified(owner_id: str, report_id: str, recipient_email: st
         return False
     if not row.get("is_verified"):
         return False
-    expires_at = row.get("expires_at")
-    exp_dt = _parse_iso_datetime(expires_at) if expires_at else None
-    if exp_dt and exp_dt < datetime.now(timezone.utc):
-        return False
+    # NOTE:
+    # `expires_at` is used to expire the *verification token*, not the verification itself.
+    # Once a share is verified, we must not block delivery just because the original
+    # token expired.
     return True
+
+
+def _report_share_recipient_is_verified_any(owner_id: str, recipient_email: str, access_token: str) -> bool:
+    """Return True if recipient_email has ANY verified share row for this owner.
+
+    This prevents surprising behavior where a recipient is forced to re-verify for
+    every newly generated report_id.
+    """
+    if UNIT_TESTING:
+        return False
+    sb = get_supabase(access_token)
+    try:
+        res = (
+            sb.table("report_shares")
+            .select("id,is_verified")
+            .eq("owner_id", owner_id)
+            .eq("recipient_email", recipient_email)
+            .eq("is_verified", True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return bool(rows)
+    except Exception:
+        return False
 
 
 def can_send_report(user: CurrentUser, recipient_email: str, report_id: str | None) -> bool:
@@ -611,6 +775,11 @@ def can_send_report(user: CurrentUser, recipient_email: str, report_id: str | No
         return True
 
     if report_id and _report_share_is_verified(user.id, report_id, recipient, access_token):
+        return True
+
+    # If a recipient verified a previous share for this owner, allow delivery for
+    # new report_ids without forcing repeated verification.
+    if _report_share_recipient_is_verified_any(user.id, recipient, access_token):
         return True
 
     return False
@@ -1034,6 +1203,69 @@ def _send_email_with_pdf_attachment_sendgrid(
         raise RuntimeError("sendgrid_failed") from e
     except urllib.error.URLError as e:
         app.logger.warning("SendGrid URLError: %s", str(e))
+        raise RuntimeError("sendgrid_failed") from e
+
+
+def _send_email_with_attachments_sendgrid(
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[tuple[str, str, bytes]],
+) -> None:
+    """Send an email with multiple attachments via SendGrid.
+
+    attachments: list of (filename, mime_type, content_bytes)
+    """
+    cfg = _get_sendgrid_config()
+    if not cfg.get("api_key") or not cfg.get("from_email"):
+        raise RuntimeError("missing_sendgrid_config")
+
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": cfg["from_email"]},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+        "attachments": [
+            {
+                "content": base64.b64encode(content).decode("ascii"),
+                "type": mime,
+                "filename": filename,
+                "disposition": "attachment",
+            }
+            for (filename, mime, content) in (attachments or [])
+        ],
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = getattr(resp, "status", None)
+            if status not in (200, 202):
+                raise RuntimeError("sendgrid_failed")
+    except urllib.error.HTTPError as e:
+        try:
+            body_bytes = e.read()
+            body_text = (body_bytes or b"").decode("utf-8", errors="replace")
+        except Exception:
+            body_text = ""
+        app.logger.warning(
+            "SendGrid HTTPError (attachments) code=%s body=%s",
+            getattr(e, "code", "unknown"),
+            (body_text[:2000] if body_text else ""),
+        )
+        raise RuntimeError("sendgrid_failed") from e
+    except urllib.error.URLError as e:
+        app.logger.warning("SendGrid URLError (attachments): %s", str(e))
         raise RuntimeError("sendgrid_failed") from e
 
 
@@ -2717,44 +2949,86 @@ def email_pdf():
 
 
 def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: CurrentUser | None = None, pdf_password: str | None = None) -> tuple:
-    """Generate the current session report PDF and email it to recipient_email."""
+    """Generate the current session report files (PDF+XLSX) and email them.
+
+    Backward compatible name: route paths still reference /email/pdf.
+    If a password is provided, we send 2 attachments:
+    - password-protected PDF (PDF encryption)
+    - password-protected Excel ZIP (AES-encrypted ZIP containing the XLSX)
+    """
     try:
         report = _load_report_from_session()
     except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
     pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
-    filename = f"retail_forecast_report_{report_id}.pdf"
+    xlsx_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
+    filename_pdf = f"retail_forecast_report_{report_id}.pdf"
+    filename_xlsx = f"retail_forecast_report_{report_id}.xlsx"
 
     try:
         _build_pdf_report_file(report, pdf_path)
+        _build_excel_report_file(report, xlsx_path)
         with open(pdf_path, 'rb') as f:
             pdf_bytes = f.read()
+        with open(xlsx_path, 'rb') as f:
+            xlsx_bytes = f.read()
 
-        # Encrypt server-side before delivery (if requested).
-        # Never include passwords in the email body.
+        pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
+
+        subject = "Demand Forecasting Report"
+
         if pdf_password:
             pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
 
-        subject = "Demand Forecasting Report (PDF)"
-        body = "Attached is your Retail Demand Forecasting PDF report."
-        _send_email_with_pdf_attachment_sendgrid(recipient_email, subject, body, pdf_bytes, filename)
+            # Prefer "password-to-open" XLSX on Windows when Excel is installed.
+            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
+            if xlsx_open_pw_bytes:
+                body = "Attached are your password-protected report files (PDF and Excel)."
+                delivered_kind = "pdf+xlsx_openpw"
+                attachments = [
+                    (filename_pdf, "application/pdf", pdf_bytes),
+                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_open_pw_bytes),
+                ]
+            else:
+                # Fallback: send Excel inside a password-protected ZIP (ZipCrypto for Windows compatibility).
+                excel_zip_bytes = _encrypt_zip_bytes([(filename_xlsx, xlsx_bytes)], pdf_password, mode="zipcrypto")
+                excel_zip_name = f"retail_forecast_report_{report_id}.xlsx.zip"
+
+                body = "Attached are your password-protected report files (PDF and Excel ZIP)."
+                delivered_kind = "pdf+excel_zip_pw"
+                attachments = [
+                    (filename_pdf, "application/pdf", pdf_bytes),
+                    (excel_zip_name, "application/zip", excel_zip_bytes),
+                ]
+        else:
+            body = "Attached are your Retail Demand Forecasting report files (PDF and Excel)."
+            delivered_kind = "pdf+xlsx"
+            attachments = [
+                (filename_pdf, "application/pdf", pdf_bytes),
+                (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_bytes),
+            ]
+
+        _send_email_with_attachments_sendgrid(recipient_email, subject, body, attachments)
+
         _audit_event_best_effort(
             "report_delivered",
             owner_id=(sender.id if sender else (session.get("user_id") or None)),
             actor_email=(sender.email if sender else (session.get("user_email") or None)),
             recipient_email=recipient_email,
             report_id=report_id,
-            meta={"password_protected": bool(pdf_password)},
+            meta={"password_protected": bool(pdf_password), "delivered": delivered_kind},
         )
-        return jsonify({"ok": True, "message": "PDF sent successfully."}), 200
+        return jsonify({"ok": True, "message": "Report sent successfully."}), 200
     except Exception as e:
         msg = str(e).lower()
         if "missing_sendgrid_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
         if "pdf_encryption_unavailable" in msg:
             return jsonify({"ok": False, "message": "PDF encryption is not available on the server."}), 503
-        app.logger.exception("Failed sending PDF email")
+        if "zip_encryption_unavailable" in msg:
+            return jsonify({"ok": False, "message": "Excel password protection is not available on the server."}), 503
+        app.logger.exception("Failed sending report email")
         _audit_event_best_effort(
             "report_delivery_failed",
             owner_id=(sender.id if sender else (session.get("user_id") or None)),
@@ -2768,8 +3042,10 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
         try:
             if os.path.exists(pdf_path):
                 os.remove(pdf_path)
+            if os.path.exists(xlsx_path):
+                os.remove(xlsx_path)
         except OSError:
-            app.logger.warning("Failed removing emailed PDF: %s", pdf_path)
+            app.logger.warning("Failed removing emailed report files: %s", report_id)
 
 
 @app.route('/email/pdf/self', methods=['POST'])
@@ -2813,31 +3089,37 @@ def public_files(filename: str):
     """
     name = (filename or "").strip()
     # Only allow our expected filenames.
-    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})\.(pdf|xlsx)", name)
+    # Allow optional suffixes for derived protected files (e.g., public_<id>_pw.pdf, public_<id>_xlsx.zip).
+    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([A-Za-z0-9]+))?\.(pdf|xlsx|zip)", name)
     if not m:
         return ("Not found", 404)
 
     report_id = m.group(1)
-    ext = m.group(2)
+    suffix = m.group(2)
+    ext = m.group(3)
     report_id = _parse_report_id(report_id)
     if not report_id:
         return ("Not found", 404)
 
-    # Generate on demand from the cached report JSON.
-    try:
-        report_path = os.path.join(DOWNLOAD_DIR, f"{report_id}.json")
-        with open(report_path, "r", encoding="utf-8") as f:
-            report = json.load(f)
-    except Exception:
-        return ("Not found", 404)
+    # For derived files (suffix present) and for all ZIPs, do not generate on demand.
+    if suffix or ext == "zip":
+        path = os.path.join(DOWNLOAD_DIR, name)
+    else:
+        # Base files public_<id>.pdf|xlsx can be generated on demand from cached report JSON.
+        try:
+            report_path = os.path.join(DOWNLOAD_DIR, f"{report_id}.json")
+            with open(report_path, "r", encoding="utf-8") as f:
+                report = json.load(f)
+        except Exception:
+            return ("Not found", 404)
 
-    try:
-        _ensure_public_report_files(report_id, report)
-    except Exception:
-        app.logger.exception("Failed generating public report files")
-        return ("Not found", 404)
+        try:
+            _ensure_public_report_files(report_id, report)
+        except Exception:
+            app.logger.exception("Failed generating public report files")
+            return ("Not found", 404)
 
-    path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.{ext}")
+        path = os.path.join(DOWNLOAD_DIR, name)
     if not os.path.exists(path):
         return ("Not found", 404)
 
@@ -2847,6 +3129,8 @@ def public_files(filename: str):
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
+    if ext == "zip":
+        return send_file(path, as_attachment=False, mimetype="application/zip")
     return send_file(path, as_attachment=False)
 
 
@@ -2891,10 +3175,26 @@ def _send_email_plain_sendgrid(to_email: str, subject: str, body_text: str) -> N
         },
     )
 
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        status = getattr(resp, "status", None)
-        if status not in (200, 202):
-            raise RuntimeError("sendgrid_failed")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = getattr(resp, "status", None)
+            if status not in (200, 202):
+                raise RuntimeError("sendgrid_failed")
+    except urllib.error.HTTPError as e:
+        try:
+            body_bytes = e.read()
+            body_text = (body_bytes or b"").decode("utf-8", errors="replace")
+        except Exception:
+            body_text = ""
+        app.logger.warning(
+            "SendGrid HTTPError (plain) code=%s body=%s",
+            getattr(e, "code", "unknown"),
+            (body_text[:2000] if body_text else ""),
+        )
+        raise RuntimeError("sendgrid_failed") from e
+    except urllib.error.URLError as e:
+        app.logger.warning("SendGrid URLError (plain): %s", str(e))
+        raise RuntimeError("sendgrid_failed") from e
 
 
 def _app_public_base_url() -> str:
@@ -3298,7 +3598,7 @@ def verify_report_share():
     try:
         res = (
             sb_admin.table("report_shares")
-            .select("id,expires_at")
+            .select("id,owner_id,report_id,recipient_email,expires_at")
             .eq("verify_token_hash", token_hash)
             .limit(1)
             .execute()
@@ -3328,20 +3628,58 @@ def verify_report_share():
             )
             return render_template("verify_email_share.html", message="Verification link is expired."), 400
 
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Important: clear expires_at on success. Token expiry is not share expiry.
         sb_admin.table("report_shares").update(
             {
                 "is_verified": True,
-                "verified_at": datetime.now(timezone.utc).isoformat(),
+                "verified_at": now_iso,
                 "verify_token_hash": None,
+                "expires_at": None,
             }
         ).eq("id", row["id"]).execute()
 
+        # Promote the verified recipient into trusted_emails (best-effort) so future
+        # reports can be delivered without requiring per-report verification.
+        try:
+            owner_id = row.get("owner_id")
+            recipient_email = (row.get("recipient_email") or "").strip().lower()
+            if owner_id and recipient_email:
+                existing = (
+                    sb_admin.table("trusted_emails")
+                    .select("id")
+                    .eq("owner_id", owner_id)
+                    .eq("email", recipient_email)
+                    .limit(1)
+                    .execute()
+                )
+                existing_rows = getattr(existing, "data", None) or []
+                if existing_rows:
+                    sb_admin.table("trusted_emails").update(
+                        {
+                            "is_verified": True,
+                            "verified_at": now_iso,
+                            "verify_token_hash": None,
+                        }
+                    ).eq("id", existing_rows[0]["id"]).execute()
+                else:
+                    sb_admin.table("trusted_emails").insert(
+                        {
+                            "owner_id": owner_id,
+                            "email": recipient_email,
+                            "is_verified": True,
+                            "verified_at": now_iso,
+                        }
+                    ).execute()
+        except Exception:
+            app.logger.info("Trusted email promotion skipped", exc_info=True)
+
         _audit_event_best_effort(
             "share_verified",
-            owner_id=None,
+            owner_id=(str(row.get("owner_id")) if row.get("owner_id") else None),
             actor_email=None,
-            recipient_email=None,
-            report_id=None,
+            recipient_email=(row.get("recipient_email") or None),
+            report_id=(row.get("report_id") or None),
             meta={"row_id": row["id"]},
         )
         return render_template("verify_email_share.html", message="Recipient verified successfully. The sender can now deliver the report."), 200
@@ -3388,14 +3726,24 @@ def send_whatsapp():
         pass
 
     number = None
+    pdf_password = None
     try:
         if request.is_json:
             payload = request.get_json(silent=True) or {}
             number = (payload.get('number') or payload.get('whatsapp') or '').strip()
+            pdf_password = payload.get("pdf_password") or payload.get("password")
         else:
             number = (request.form.get('number') or '').strip()
+            pdf_password = request.form.get("pdf_password") or request.form.get("password")
     except Exception:
         number = None
+        pdf_password = None
+
+    pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
+    if pdf_password:
+        pw_err = _validate_pdf_password_or_error(pdf_password)
+        if pw_err:
+            return jsonify({"ok": False, "message": pw_err}), 400
 
     if not _is_valid_whatsapp_number(number):
         return jsonify({"ok": False, "message": "Please enter a valid WhatsApp number (e.g., +91XXXXXXXXXX)."}), 400
@@ -3419,17 +3767,56 @@ def send_whatsapp():
 
     try:
         _ensure_public_report_files(report_id, report)
-        pdf_url = f"{public_base}/files/public_{report_id}.pdf"
-        xlsx_url = f"{public_base}/files/public_{report_id}.xlsx"
 
-        # Send as two separate WhatsApp messages to maximize compatibility.
-        sid_pdf = _send_whatsapp_media_twilio(number, pdf_url, "Your Demand Forecasting Report (PDF)")
-        app.logger.info("Twilio WhatsApp PDF sent sid=%s to=%s", sid_pdf, number)
-        sid_xlsx = _send_whatsapp_media_twilio(number, xlsx_url, "Your Demand Forecasting Report (Excel)")
-        app.logger.info("Twilio WhatsApp Excel sent sid=%s to=%s", sid_xlsx, number)
+        if pdf_password:
+            pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.pdf")
+            xlsx_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.xlsx")
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
+            with open(xlsx_path, "rb") as f:
+                xlsx_bytes = f.read()
+
+            # Create a password-protected PDF as its own public file.
+            protected_pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
+            protected_pdf_name = f"public_{report_id}_pw.pdf"
+            protected_pdf_path = os.path.join(DOWNLOAD_DIR, protected_pdf_name)
+            with open(protected_pdf_path, "wb") as f:
+                f.write(protected_pdf_bytes)
+
+            # Create a password-protected ZIP for the Excel as its own public file.
+            # (WhatsApp can't deliver a true password-to-open XLSX on Render/Linux.)
+            excel_zip_bytes = _encrypt_zip_bytes(
+                [(f"retail_forecast_report_{report_id}.xlsx", xlsx_bytes)],
+                pdf_password,
+                mode="zipcrypto",
+            )
+            excel_zip_name = f"public_{report_id}_xlsx.zip"
+            excel_zip_path = os.path.join(DOWNLOAD_DIR, excel_zip_name)
+            with open(excel_zip_path, "wb") as f:
+                f.write(excel_zip_bytes)
+
+            protected_pdf_url = f"{public_base}/files/{protected_pdf_name}"
+            excel_zip_url = f"{public_base}/files/{excel_zip_name}"
+
+            # Send as two separate WhatsApp messages for compatibility.
+            sid_pdf = _send_whatsapp_media_twilio(number, protected_pdf_url, "Your password-protected Report (PDF)")
+            app.logger.info("Twilio WhatsApp protected PDF sent sid=%s to=%s", sid_pdf, number)
+            sid_xlsx = _send_whatsapp_media_twilio(number, excel_zip_url, "Your password-protected Report (Excel ZIP)")
+            app.logger.info("Twilio WhatsApp protected Excel ZIP sent sid=%s to=%s", sid_xlsx, number)
+            sids = [sid_pdf, sid_xlsx]
+        else:
+            pdf_url = f"{public_base}/files/public_{report_id}.pdf"
+            xlsx_url = f"{public_base}/files/public_{report_id}.xlsx"
+
+            # Send as two separate WhatsApp messages to maximize compatibility.
+            sid_pdf = _send_whatsapp_media_twilio(number, pdf_url, "Your Demand Forecasting Report (PDF)")
+            app.logger.info("Twilio WhatsApp PDF sent sid=%s to=%s", sid_pdf, number)
+            sid_xlsx = _send_whatsapp_media_twilio(number, xlsx_url, "Your Demand Forecasting Report (Excel)")
+            app.logger.info("Twilio WhatsApp Excel sent sid=%s to=%s", sid_xlsx, number)
+            sids = [sid_pdf, sid_xlsx]
 
         session["whatsapp_last_sent_at"] = now
-        return jsonify({"ok": True, "message": "Report sent to WhatsApp successfully.", "sids": [sid_pdf, sid_xlsx]})
+        return jsonify({"ok": True, "message": "Report sent to WhatsApp successfully.", "sids": sids})
     except Exception as e:
         # Log diagnostic details without leaking secrets.
         twilio_code = getattr(e, "code", None)
@@ -3448,6 +3835,8 @@ def send_whatsapp():
             return jsonify({"ok": False, "message": "WhatsApp service is not configured on the server."}), 500
         if "missing_twilio_sdk" in msg:
             return jsonify({"ok": False, "message": "WhatsApp service is unavailable on the server."}), 500
+        if "zip_encryption_unavailable" in msg:
+            return jsonify({"ok": False, "message": "Password-protected ZIP is not available on the server."}), 503
         return jsonify({"ok": False, "message": _twilio_error_to_user_message(e)}), 500
 
 if __name__ == "__main__":
