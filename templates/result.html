@@ -212,6 +212,11 @@
         statusEl.textContent = text || '';
     }
 
+    function looksLikeEmail(value) {
+        const s = (value || '').trim();
+        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+    }
+
     function setSending(sending) {
         if (sending) {
             btn.setAttribute('aria-disabled', 'true');
@@ -228,6 +233,13 @@
         e.preventDefault();
         const email = (window.prompt('Enter email address to send the PDF report:') || '').trim();
         if (!email) return;
+
+        if (!looksLikeEmail(email)) {
+            const msg = 'Please enter a valid email address.';
+            setStatus(msg);
+            window.alert(msg);
+            return;
+        }
 
         setStatus('Sending PDF...');
         setSending(true);
