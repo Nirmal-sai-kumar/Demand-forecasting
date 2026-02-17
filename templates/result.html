@@ -125,6 +125,7 @@
     <div><strong>Retail Demand Forecasting</strong> — Results</div>
     <div>
         <a href="/home">Upload New Dataset</a>
+        <a href="/trusted-emails/manage">Trusted Emails</a>
         <a href="/logout">Logout</a>
     </div>
 </div>
@@ -166,6 +167,7 @@
         <div class="download-buttons">
             <a href="/download/excel">📥 Download Excel</a>
             <a href="/download/pdf">📄 Download PDF</a>
+            <a href="#" id="emailSelfBtn">📩 Email to Me</a>
             <a href="#" id="emailPdfBtn">📧 Email</a>
             <a href="#" id="whatsappBtn">📱 Send to WhatsApp</a>
             <span id="emailStatus" class="status-text" role="status" aria-live="polite"></span>
@@ -203,6 +205,7 @@
 
 <script>
 (function () {
+    const selfBtn = document.getElementById('emailSelfBtn');
     const btn = document.getElementById('emailPdfBtn');
     const statusEl = document.getElementById('emailStatus');
     if (!btn) return;
@@ -222,17 +225,76 @@
             btn.setAttribute('aria-disabled', 'true');
             btn.dataset.prevText = btn.textContent;
             btn.textContent = '📧 Sending...';
+            if (selfBtn) {
+                selfBtn.setAttribute('aria-disabled', 'true');
+            }
         } else {
             btn.removeAttribute('aria-disabled');
             btn.textContent = btn.dataset.prevText || '📧 Email';
             delete btn.dataset.prevText;
+            if (selfBtn) {
+                selfBtn.removeAttribute('aria-disabled');
+            }
         }
+    }
+
+    if (selfBtn) {
+        selfBtn.addEventListener('click', async function (e) {
+            e.preventDefault();
+            if (selfBtn.getAttribute('aria-disabled') === 'true') return;
+
+            // Optional password protection for self email.
+            let pdf_password = '';
+            const wantsPassword = window.confirm('Protect this PDF with a password?');
+            if (wantsPassword) {
+                pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
+                if (!pdf_password) {
+                    const msg = 'Password protection was selected but no password was provided.';
+                    setStatus(msg);
+                    window.alert(msg);
+                    return;
+                }
+            }
+
+            setStatus('Sending PDF to your verified email...');
+            setSending(true);
+            try {
+                const res = await fetch('/email/pdf/self', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pdf_password })
+                });
+                const data = await res.json().catch(() => null);
+                const msg = (data && data.message) ? data.message : (res.ok ? 'PDF sent.' : 'Failed to send PDF.');
+                setStatus(msg);
+                window.alert(msg);
+            } catch (err) {
+                setStatus('Failed to send PDF.');
+                window.alert('Failed to send PDF. Please try again later.');
+            } finally {
+                setSending(false);
+            }
+        });
     }
 
     btn.addEventListener('click', async function (e) {
         e.preventDefault();
         const email = (window.prompt('Enter email address to send the PDF report:') || '').trim();
         if (!email) return;
+
+        // Optional password protection.
+        // The password is NEVER sent via email body; it is used only to encrypt the PDF server-side.
+        let pdf_password = '';
+        const wantsPassword = window.confirm('Protect this PDF with a password? (Do NOT share the password via email)');
+        if (wantsPassword) {
+            pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
+            if (!pdf_password) {
+                const msg = 'Password protection was selected but no password was provided.';
+                setStatus(msg);
+                window.alert(msg);
+                return;
+            }
+        }
 
         if (!looksLikeEmail(email)) {
             const msg = 'Please enter a valid email address.';
@@ -248,7 +310,7 @@
             const res = await fetch('/email/pdf', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email })
+                body: JSON.stringify({ email, pdf_password })
             });
             const data = await res.json().catch(() => null);
             const msg = (data && data.message) ? data.message : (res.ok ? 'PDF sent.' : 'Failed to send PDF.');
