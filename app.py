@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import base64
+import io
 import urllib.request
 import urllib.error
 
@@ -26,6 +27,24 @@ UNIT_TESTING = os.getenv("UNIT_TESTING") == "1"
 
 import pandas as pd
 import joblib
+
+try:
+    import redis  # type: ignore
+except Exception:  # pragma: no cover
+    redis = None
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken  # type: ignore
+except Exception:  # pragma: no cover
+    Fernet = None
+    InvalidToken = Exception
+
+try:
+    # Pure-python PDF encryption.
+    from pypdf import PdfReader, PdfWriter  # type: ignore
+except Exception:  # pragma: no cover
+    PdfReader = None
+    PdfWriter = None
 
 try:
     # Optional but recommended for robust email validation.
@@ -113,6 +132,340 @@ ALLOWED_UPLOAD_EXTS = {".csv", ".xlsx", ".xls"}
 DEFAULT_TREND_EPS = 0.01
 DEFAULT_CLEANUP_MAX_AGE_HOURS = 24.0
 MAX_FORECAST_MONTHS = 12
+
+# ---------- PDF PASSWORD PROTECTION + ABUSE PREVENTION ----------
+# These features are deliberately implemented as best-effort guards:
+# - If Redis / crypto dependencies are missing, the app must not crash.
+# - Password-protected sharing is rejected when secure storage is unavailable.
+
+PDF_PASSWORD_MIN_LEN = int(os.getenv("PDF_PASSWORD_MIN_LEN", "8"))
+PDF_PASSWORD_MAX_LEN = int(os.getenv("PDF_PASSWORD_MAX_LEN", "128"))
+PDF_PASSWORD_TTL_SECONDS = int(os.getenv("PDF_PASSWORD_TTL_SECONDS", str(60 * 60)))  # default: 1 hour
+
+BLOCK_DISPOSABLE_EMAILS = os.getenv("BLOCK_DISPOSABLE_EMAILS", "0").strip() in ("1", "true", "True", "yes", "YES")
+DISPOSABLE_DOMAIN_BLOCKLIST = {
+    d.strip().lower()
+    for d in (os.getenv("DISPOSABLE_DOMAIN_BLOCKLIST") or "").split(",")
+    if d.strip()
+}
+# Small default list to support the "optionally block" requirement without extra files.
+_DEFAULT_DISPOSABLE_DOMAINS = {
+    "mailinator.com",
+    "10minutemail.com",
+    "guerrillamail.com",
+    "tempmail.com",
+    "yopmail.com",
+}
+
+PWNED_PASSWORDS_ENFORCE = os.getenv("PWNED_PASSWORDS_ENFORCE", "0").strip() in ("1", "true", "True")
+PWNED_PASSWORDS_TIMEOUT_SECONDS = float(os.getenv("PWNED_PASSWORDS_TIMEOUT_SECONDS", "4"))
+
+REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
+PDF_PASSWORD_FERNET_KEY = (os.getenv("PDF_PASSWORD_FERNET_KEY") or "").strip()
+
+VERIFY_EMAIL_RATE_LIMIT = int(os.getenv("VERIFY_EMAIL_RATE_LIMIT", "5"))  # per window
+VERIFY_EMAIL_RATE_WINDOW_SECONDS = int(os.getenv("VERIFY_EMAIL_RATE_WINDOW_SECONDS", str(60 * 60)))
+
+REPORT_SEND_RATE_LIMIT = int(os.getenv("REPORT_SEND_RATE_LIMIT", "10"))
+REPORT_SEND_RATE_WINDOW_SECONDS = int(os.getenv("REPORT_SEND_RATE_WINDOW_SECONDS", str(15 * 60)))
+
+RECIPIENT_COOLDOWN_SECONDS = int(os.getenv("RECIPIENT_COOLDOWN_SECONDS", str(5 * 60)))
+
+COMMON_PASSWORDS = {
+    "password",
+    "password123",
+    "admin",
+    "qwerty",
+    "letmein",
+    "123456",
+    "12345678",
+    "123456789",
+    "iloveyou",
+    "welcome",
+}
+
+
+def _client_ip() -> str:
+    # Prefer proxy-aware header if present (Render sets X-Forwarded-For).
+    xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return xff or (request.remote_addr or "").strip() or "unknown"
+
+
+def _is_disposable_email_domain(email: str) -> bool:
+    if not email or "@" not in email:
+        return False
+    domain = email.rsplit("@", 1)[-1].strip().lower()
+    if not domain:
+        return False
+    block = set(DISPOSABLE_DOMAIN_BLOCKLIST) | set(_DEFAULT_DISPOSABLE_DOMAINS)
+    return domain in block
+
+
+class _InMemoryTtlStore:
+    """Tiny TTL store used when Redis isn't configured.
+
+    This is a best-effort fallback so we don't crash in environments without Redis.
+    It is per-process (not shared across instances).
+    """
+
+    def __init__(self) -> None:
+        self._data: dict[str, tuple[bytes, float]] = {}
+
+    def set(self, key: str, value: bytes, ttl_seconds: int) -> None:
+        self._data[key] = (value, time.time() + float(ttl_seconds))
+
+    def get(self, key: str) -> bytes | None:
+        item = self._data.get(key)
+        if not item:
+            return None
+        value, exp = item
+        if time.time() >= exp:
+            self._data.pop(key, None)
+            return None
+        return value
+
+    def delete(self, key: str) -> None:
+        self._data.pop(key, None)
+
+
+_MEM_STORE = _InMemoryTtlStore()
+
+
+def _redis_client_or_none():
+    if not REDIS_URL or redis is None:
+        return None
+    try:
+        return redis.Redis.from_url(REDIS_URL, decode_responses=False)
+    except Exception:
+        return None
+
+
+def _fernet_or_none():
+    if not PDF_PASSWORD_FERNET_KEY or Fernet is None:
+        return None
+    try:
+        return Fernet(PDF_PASSWORD_FERNET_KEY.encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _pw_store_backend():
+    r = _redis_client_or_none()
+    return r if r is not None else _MEM_STORE
+
+
+def _share_pw_key(owner_id: str, report_id: str, recipient_email: str) -> str:
+    # Deterministic key, but opaque.
+    material = f"{owner_id}|{report_id}|{recipient_email.lower().strip()}"
+    return "sharepw:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _share_pw_required_key(owner_id: str, report_id: str, recipient_email: str) -> str:
+    material = f"required|{owner_id}|{report_id}|{recipient_email.lower().strip()}"
+    return "sharepwreq:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _store_share_pdf_password(owner_id: str, report_id: str, recipient_email: str, password: str) -> None:
+    """Store a PDF password in short-lived encrypted storage.
+
+    Security reasoning:
+    - We never persist the password in Supabase/Postgres.
+    - We store only an encrypted blob (Fernet) in Redis (or in-memory fallback).
+    - We also store a separate "required" marker (no secrets) so we can prevent
+      accidental unprotected delivery if the secret expires.
+    """
+    f = _fernet_or_none()
+    if f is None:
+        raise RuntimeError("password_protection_not_configured")
+
+    # Requirement: store passwords only in short-lived encrypted storage (Redis with expiry).
+    # In UNIT_TESTING we allow an in-memory fallback so tests can run without external services.
+    if not UNIT_TESTING and not _redis_client_or_none():
+        raise RuntimeError("password_storage_unavailable")
+
+    backend = _pw_store_backend()
+    secret_key = _share_pw_key(owner_id, report_id, recipient_email)
+    required_key = _share_pw_required_key(owner_id, report_id, recipient_email)
+    token = f.encrypt(password.encode("utf-8"))
+
+    if hasattr(backend, "setex"):
+        backend.setex(secret_key, PDF_PASSWORD_TTL_SECONDS, token)
+        backend.setex(required_key, int(timedelta(hours=24).total_seconds()), b"1")
+    else:
+        backend.set(secret_key, token, PDF_PASSWORD_TTL_SECONDS)
+        backend.set(required_key, b"1", int(timedelta(hours=24).total_seconds()))
+
+
+def _get_share_pdf_password(owner_id: str, report_id: str, recipient_email: str) -> str | None:
+    f = _fernet_or_none()
+    if f is None:
+        return None
+    backend = _pw_store_backend()
+    secret_key = _share_pw_key(owner_id, report_id, recipient_email)
+    try:
+        raw = backend.get(secret_key) if not hasattr(backend, "get") else backend.get(secret_key)
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        return f.decrypt(raw).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _share_password_was_requested(owner_id: str, report_id: str, recipient_email: str) -> bool:
+    backend = _pw_store_backend()
+    required_key = _share_pw_required_key(owner_id, report_id, recipient_email)
+    try:
+        raw = backend.get(required_key) if not hasattr(backend, "get") else backend.get(required_key)
+    except Exception:
+        raw = None
+    return bool(raw)
+
+
+def _rate_limit_hit(key: str, limit: int, window_seconds: int) -> bool:
+    """Return True if the request should be blocked (limit exceeded)."""
+    backend = _pw_store_backend()
+    k = "rl:" + key
+
+    # Redis path
+    if hasattr(backend, "incr") and hasattr(backend, "expire"):
+        try:
+            n = int(backend.incr(k))
+            if n == 1:
+                backend.expire(k, int(window_seconds))
+            return n > int(limit)
+        except Exception:
+            # Fail-open to preserve availability.
+            return False
+
+    # In-memory path
+    now = time.time()
+    raw = backend.get(k)
+    if raw is None:
+        backend.set(k, b"1", int(window_seconds))
+        return False
+    try:
+        n = int(raw.decode("utf-8"))
+    except Exception:
+        n = 1
+    n += 1
+    backend.set(k, str(n).encode("utf-8"), int(window_seconds))
+    return n > int(limit)
+
+
+def _cooldown_block(key: str, cooldown_seconds: int) -> bool:
+    """Return True if still in cooldown; otherwise start cooldown and return False."""
+    backend = _pw_store_backend()
+    k = "cd:" + key
+    if hasattr(backend, "set") and hasattr(backend, "setnx"):
+        # Redis set-if-not-exists
+        try:
+            ok = backend.set(k, b"1", nx=True, ex=int(cooldown_seconds))
+            return not bool(ok)
+        except Exception:
+            return False
+
+    if backend.get(k):
+        return True
+    backend.set(k, b"1", int(cooldown_seconds))
+    return False
+
+
+def _is_password_compromised_pwned(password: str) -> bool | None:
+    """Check HaveIBeenPwned Passwords API (k-anonymity).
+
+    Returns:
+    - True: seen in breaches
+    - False: not seen
+    - None: check failed (network/timeout)
+    """
+    if not password:
+        return False
+    sha1 = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix, suffix = sha1[:5], sha1[5:]
+    url = f"https://api.pwnedpasswords.com/range/{prefix}"
+    try:
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "RetailDemandForecasting"})
+        with urllib.request.urlopen(req, timeout=PWNED_PASSWORDS_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        for line in body.splitlines():
+            if ":" not in line:
+                continue
+            sfx, _count = line.split(":", 1)
+            if sfx.strip().upper() == suffix:
+                return True
+        return False
+    except Exception:
+        return None
+
+
+def _validate_pdf_password_or_error(password: str) -> str | None:
+    """Return error message if password is weak/blocked, else None.
+
+    Security reasoning:
+    - We enforce strong requirements to reduce brute-force risk.
+    - We block common passwords and optionally block breached passwords.
+    - We never log the password.
+    """
+    if password is None:
+        return None
+    pw = (password or "").strip()
+    if not pw:
+        return "PDF password cannot be empty."
+    # Hard floor at 8 characters.
+    min_len = max(8, int(PDF_PASSWORD_MIN_LEN))
+    if len(pw) < min_len:
+        return f"PDF password must be at least {min_len} characters."
+    if len(pw) > PDF_PASSWORD_MAX_LEN:
+        return "PDF password is too long."
+    if pw.lower() in COMMON_PASSWORDS:
+        return "PDF password is too common. Choose a stronger password."
+
+    if not re.search(r"[a-z]", pw):
+        return "PDF password must include a lowercase letter."
+    if not re.search(r"[A-Z]", pw):
+        return "PDF password must include an uppercase letter."
+    if not re.search(r"\d", pw):
+        return "PDF password must include a number."
+    if not re.search(r"[^A-Za-z0-9]", pw):
+        return "PDF password must include a symbol."
+
+    pwned = _is_password_compromised_pwned(pw)
+    if pwned is True:
+        return "PDF password appears in known breaches. Choose a different password."
+    if pwned is None and PWNED_PASSWORDS_ENFORCE:
+        return "Unable to verify password safety right now. Please try again."
+
+    return None
+
+
+def _encrypt_pdf_bytes_if_requested(pdf_bytes: bytes, password: str | None) -> bytes:
+    if not password:
+        return pdf_bytes
+    if PdfReader is None or PdfWriter is None:
+        raise RuntimeError("pdf_encryption_unavailable")
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+
+    # Be compatible across pypdf versions.
+    # Goal: ensure the document cannot be opened without the provided password.
+    try:
+        writer.encrypt(user_password=password)
+    except TypeError:
+        try:
+            # Older API.
+            writer.encrypt(password, use_128bit=True)
+        except TypeError:
+            writer.encrypt(password)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 class CacheWriteError(RuntimeError):
@@ -2216,18 +2569,41 @@ def email_pdf():
         return jsonify({"ok": False, "message": "Please login first."}), 401
 
     email = None
+    pdf_password = None
     try:
         if request.is_json:
             payload = request.get_json(silent=True) or {}
             email = (payload.get('email') or '').strip()
+            pdf_password = payload.get("pdf_password") or payload.get("password")
         else:
             email = (request.form.get('email') or '').strip()
+            pdf_password = request.form.get("pdf_password") or request.form.get("password")
     except Exception:
         email = None
+        pdf_password = None
 
     email, email_err = _normalize_and_validate_email_for_sending(email)
     if email_err:
         return jsonify({"ok": False, "message": email_err}), 400
+
+    # Optional abuse prevention: block disposable email domains.
+    if BLOCK_DISPOSABLE_EMAILS and _is_disposable_email_domain(email):
+        _audit_event_best_effort(
+            "recipient_blocked_disposable",
+            owner_id=(session.get("user_id") or None),
+            actor_email=(session.get("user_email") or None),
+            recipient_email=email,
+            report_id=str(session.get("report_id") or "") or None,
+            meta={},
+        )
+        return jsonify({"ok": False, "message": "Disposable email domains are not allowed."}), 400
+
+    # If a password was provided, enforce strong requirements.
+    pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
+    if pdf_password:
+        pw_err = _validate_pdf_password_or_error(pdf_password)
+        if pw_err:
+            return jsonify({"ok": False, "message": pw_err}), 400
 
     # Enforce sender verification before any delivery.
     sender, sender_err = _require_verified_sender()
@@ -2237,6 +2613,32 @@ def email_pdf():
     report_id = _parse_report_id(session.get("report_id"))
     if not report_id:
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
+
+    # Rate limiting: limit report send attempts per sender.
+    rl_sender_key = f"send_report:{sender.id}"
+    if _rate_limit_hit(rl_sender_key, REPORT_SEND_RATE_LIMIT, REPORT_SEND_RATE_WINDOW_SECONDS):
+        _audit_event_best_effort(
+            "rate_limited_send",
+            owner_id=sender.id,
+            actor_email=sender.email,
+            recipient_email=email,
+            report_id=report_id,
+            meta={"scope": "sender"},
+        )
+        return jsonify({"ok": False, "message": "Too many send attempts. Please try again later."}), 429
+
+    # Anti-spam: cooldown per recipient.
+    cd_recipient_key = f"send_to:{sender.id}:{email.lower().strip()}"
+    if _cooldown_block(cd_recipient_key, RECIPIENT_COOLDOWN_SECONDS):
+        _audit_event_best_effort(
+            "cooldown_send",
+            owner_id=sender.id,
+            actor_email=sender.email,
+            recipient_email=email,
+            report_id=report_id,
+            meta={"cooldown_seconds": RECIPIENT_COOLDOWN_SECONDS},
+        )
+        return jsonify({"ok": False, "message": "Please wait a moment before sending to the same recipient again."}), 429
 
     # Authorize delivery. If not allowed, initiate recipient verification (one-time share) and do NOT deliver.
     if not can_send_report(sender, email, report_id):
@@ -2252,22 +2654,69 @@ def email_pdf():
             if not access_token:
                 return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
 
-            _create_or_refresh_report_share_verification(sender.id, report_id, email, access_token)
+            _create_or_refresh_report_share_verification(sender.id, report_id, email, access_token, pdf_password=pdf_password or None)
+            _audit_event_best_effort(
+                "share_verification_sent",
+                owner_id=sender.id,
+                actor_email=sender.email,
+                recipient_email=email,
+                report_id=report_id,
+                meta={"password_protected": bool(pdf_password)},
+            )
             return jsonify({
                 "ok": True,
+                "status": "verification_sent",
                 "message": "Verification email sent to recipient. Ask them to verify, then resend the report.",
             }), 202
         except Exception as e:
             msg = str(e).lower()
             if "missing_sendgrid_config" in msg:
                 return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+            if "rate_limited" in msg:
+                return jsonify({"ok": False, "message": "Too many verification emails. Please try again later."}), 429
+            if "cooldown" in msg:
+                return jsonify({"ok": False, "message": "Please wait before sending another verification email to this recipient."}), 429
+            if "password_protection_not_configured" in msg or "password_storage_unavailable" in msg:
+                # Graceful fallback: still allow the verification flow.
+                # We simply cannot remember/store the password across steps.
+                # The sender must re-enter the password when re-sending after verification.
+                try:
+                    _create_or_refresh_report_share_verification(sender.id, report_id, email, access_token, pdf_password=None)
+                except Exception:
+                    app.logger.exception("Failed initiating recipient verification (fallback)")
+                    return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+                _audit_event_best_effort(
+                    "share_verification_sent_password_not_stored",
+                    owner_id=sender.id,
+                    actor_email=sender.email,
+                    recipient_email=email,
+                    report_id=report_id,
+                    meta={"password_protected_requested": bool(pdf_password)},
+                )
+                return jsonify({
+                    "ok": True,
+                    "status": "verification_sent",
+                    "message": "Verification email sent to recipient. Password cannot be stored on this server, so you must re-enter the password when you resend after verification.",
+                }), 202
             app.logger.exception("Failed initiating recipient verification")
             return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
 
-    return _deliver_report_pdf_via_email(email, report_id)
+    # If the sender previously requested password protection for this share, require encryption.
+    if not pdf_password and _share_password_was_requested(sender.id, report_id, email):
+        stored_pw = _get_share_pdf_password(sender.id, report_id, email)
+        if stored_pw:
+            pdf_password = stored_pw
+        else:
+            return jsonify({
+                "ok": False,
+                "message": "Password for this share expired. Please set a new PDF password and resend.",
+            }), 409
+
+    return _deliver_report_pdf_via_email(email, report_id, sender=sender, pdf_password=pdf_password or None)
 
 
-def _deliver_report_pdf_via_email(recipient_email: str, report_id: str) -> tuple:
+def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: CurrentUser | None = None, pdf_password: str | None = None) -> tuple:
     """Generate the current session report PDF and email it to recipient_email."""
     try:
         report = _load_report_from_session()
@@ -2282,15 +2731,38 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str) -> tuple
         with open(pdf_path, 'rb') as f:
             pdf_bytes = f.read()
 
+        # Encrypt server-side before delivery (if requested).
+        # Never include passwords in the email body.
+        if pdf_password:
+            pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
+
         subject = "Demand Forecasting Report (PDF)"
         body = "Attached is your Retail Demand Forecasting PDF report."
         _send_email_with_pdf_attachment_sendgrid(recipient_email, subject, body, pdf_bytes, filename)
+        _audit_event_best_effort(
+            "report_delivered",
+            owner_id=(sender.id if sender else (session.get("user_id") or None)),
+            actor_email=(sender.email if sender else (session.get("user_email") or None)),
+            recipient_email=recipient_email,
+            report_id=report_id,
+            meta={"password_protected": bool(pdf_password)},
+        )
         return jsonify({"ok": True, "message": "PDF sent successfully."}), 200
     except Exception as e:
         msg = str(e).lower()
         if "missing_sendgrid_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        if "pdf_encryption_unavailable" in msg:
+            return jsonify({"ok": False, "message": "PDF encryption is not available on the server."}), 503
         app.logger.exception("Failed sending PDF email")
+        _audit_event_best_effort(
+            "report_delivery_failed",
+            owner_id=(sender.id if sender else (session.get("user_id") or None)),
+            actor_email=(sender.email if sender else (session.get("user_email") or None)),
+            recipient_email=recipient_email,
+            report_id=report_id,
+            meta={},
+        )
         return jsonify({"ok": False, "message": "Failed to send email. Please try again later."}), 500
     finally:
         try:
@@ -2307,11 +2779,27 @@ def email_pdf_self():
     if sender_err:
         return jsonify(sender_err[0]), sender_err[1]
 
+    pdf_password = None
+    try:
+        if request.is_json:
+            payload = request.get_json(silent=True) or {}
+            pdf_password = payload.get("pdf_password") or payload.get("password")
+        else:
+            pdf_password = request.form.get("pdf_password") or request.form.get("password")
+    except Exception:
+        pdf_password = None
+
+    pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
+    if pdf_password:
+        pw_err = _validate_pdf_password_or_error(pdf_password)
+        if pw_err:
+            return jsonify({"ok": False, "message": pw_err}), 400
+
     report_id = _parse_report_id(session.get("report_id"))
     if not report_id:
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
-    return _deliver_report_pdf_via_email(sender.email, report_id)
+    return _deliver_report_pdf_via_email(sender.email, report_id, sender=sender, pdf_password=pdf_password or None)
 
 
 # ---------- PUBLIC FILES (for Twilio MediaUrl) ----------
@@ -2415,6 +2903,11 @@ def _app_public_base_url() -> str:
 
 
 def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, access_token: str) -> None:
+    # Abuse prevention: limit verification email bursts per owner+email.
+    rl_key = f"verify_trusted:{owner_id}:{email.lower().strip()}"
+    if _rate_limit_hit(rl_key, VERIFY_EMAIL_RATE_LIMIT, VERIFY_EMAIL_RATE_WINDOW_SECONDS):
+        raise RuntimeError("rate_limited")
+
     token = _new_verify_token()
     token_hash = _token_hash(token)
 
@@ -2451,7 +2944,26 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
     _send_email_plain_sendgrid(email, subject, body)
 
 
-def _create_or_refresh_report_share_verification(owner_id: str, report_id: str, recipient_email: str, access_token: str) -> None:
+def _create_or_refresh_report_share_verification(
+    owner_id: str,
+    report_id: str,
+    recipient_email: str,
+    access_token: str,
+    pdf_password: str | None = None,
+) -> None:
+    # Abuse prevention: limit verification email bursts and repeated spam.
+    rl_key = f"verify_share:{owner_id}:{report_id}:{recipient_email.lower().strip()}"
+    if _rate_limit_hit(rl_key, VERIFY_EMAIL_RATE_LIMIT, VERIFY_EMAIL_RATE_WINDOW_SECONDS):
+        raise RuntimeError("rate_limited")
+    cd_key = f"verify_share_cd:{owner_id}:{recipient_email.lower().strip()}"
+    if _cooldown_block(cd_key, RECIPIENT_COOLDOWN_SECONDS):
+        raise RuntimeError("cooldown")
+
+    # If sender requested password protection, store password encrypted in short-lived storage.
+    # Never persist the plaintext in the database.
+    if pdf_password:
+        _store_share_pdf_password(owner_id, report_id, recipient_email, pdf_password)
+
     token = _new_verify_token()
     token_hash = _token_hash(token)
     now_dt = datetime.now(timezone.utc)
@@ -2494,6 +3006,41 @@ def _create_or_refresh_report_share_verification(owner_id: str, report_id: str, 
     _send_email_plain_sendgrid(recipient_email, subject, body)
 
 
+def _audit_event_best_effort(
+    event_type: str,
+    owner_id: str | None,
+    actor_email: str | None,
+    recipient_email: str | None,
+    report_id: str | None,
+    meta: dict | None = None,
+) -> None:
+    """Best-effort audit logging.
+
+    Security reasoning:
+    - Audit logs help investigate abuse and delivery disputes.
+    - Logging must not break user actions; failures are swallowed.
+    - We use Supabase service role on the server (never exposed to clients).
+    """
+    payload = {
+        "event_type": (event_type or "").strip()[:64],
+        "owner_id": owner_id,
+        "actor_email": (actor_email or "").strip().lower()[:254] if actor_email else None,
+        "recipient_email": (recipient_email or "").strip().lower()[:254] if recipient_email else None,
+        "report_id": report_id,
+        "ip": _client_ip(),
+        "user_agent": (request.headers.get("User-Agent") or "")[:512],
+        "meta": meta or {},
+    }
+    try:
+        sb_admin = get_supabase_admin()
+        sb_admin.table("share_audit_events").insert(payload).execute()
+    except Exception:
+        try:
+            app.logger.info("AUDIT %s %s", event_type, json.dumps(payload, default=str)[:2000])
+        except Exception:
+            pass
+
+
 @app.route("/api/trusted-emails", methods=["GET", "POST"])
 def api_trusted_emails():
     user, err = _require_verified_sender()
@@ -2519,13 +3066,34 @@ def api_trusted_emails():
     if email_err:
         return jsonify({"ok": False, "message": email_err}), 400
 
+    if BLOCK_DISPOSABLE_EMAILS and _is_disposable_email_domain(email):
+        _audit_event_best_effort(
+            "trusted_email_blocked_disposable",
+            owner_id=user.id,
+            actor_email=user.email,
+            recipient_email=email,
+            report_id=None,
+            meta={},
+        )
+        return jsonify({"ok": False, "message": "Disposable email domains are not allowed."}), 400
+
     try:
         _create_or_refresh_trusted_email_verification(user.id, email, access_token)
+        _audit_event_best_effort(
+            "trusted_verification_sent",
+            owner_id=user.id,
+            actor_email=user.email,
+            recipient_email=email,
+            report_id=None,
+            meta={},
+        )
         return jsonify({"ok": True, "message": "Verification email sent. Please verify to enable delivery."}), 202
     except Exception as e:
         msg = str(e).lower()
         if "missing_sendgrid_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        if "rate_limited" in msg:
+            return jsonify({"ok": False, "message": "Too many verification emails. Please try again later."}), 429
         app.logger.exception("Failed initiating trusted email verification")
         return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
 
@@ -2542,6 +3110,7 @@ def api_report_shares_create():
 
     payload = request.get_json(silent=True) or {}
     raw_email = payload.get("recipient_email") or payload.get("email")
+    pdf_password = (payload.get("pdf_password") or payload.get("password") or "")
     report_id = _parse_report_id(payload.get("report_id") or session.get("report_id"))
     if not report_id:
         return jsonify({"ok": False, "message": "Report not found. Please generate a report first."}), 400
@@ -2550,16 +3119,65 @@ def api_report_shares_create():
     if email_err:
         return jsonify({"ok": False, "message": email_err}), 400
 
+    if BLOCK_DISPOSABLE_EMAILS and _is_disposable_email_domain(email):
+        _audit_event_best_effort(
+            "share_blocked_disposable",
+            owner_id=user.id,
+            actor_email=user.email,
+            recipient_email=email,
+            report_id=report_id,
+            meta={},
+        )
+        return jsonify({"ok": False, "message": "Disposable email domains are not allowed."}), 400
+
+    pdf_password = (pdf_password or "").strip()
+    if pdf_password:
+        pw_err = _validate_pdf_password_or_error(pdf_password)
+        if pw_err:
+            return jsonify({"ok": False, "message": pw_err}), 400
+
     if email == user.email:
         return jsonify({"ok": False, "message": "Recipient is your own email. Use direct send instead."}), 400
 
     try:
-        _create_or_refresh_report_share_verification(user.id, report_id, email, access_token)
+        _create_or_refresh_report_share_verification(user.id, report_id, email, access_token, pdf_password=pdf_password or None)
+        _audit_event_best_effort(
+            "share_verification_sent",
+            owner_id=user.id,
+            actor_email=user.email,
+            recipient_email=email,
+            report_id=report_id,
+            meta={"password_protected": bool(pdf_password)},
+        )
         return jsonify({"ok": True, "message": "Verification email sent to recipient."}), 202
     except Exception as e:
         msg = str(e).lower()
         if "missing_sendgrid_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        if "rate_limited" in msg:
+            return jsonify({"ok": False, "message": "Too many verification emails. Please try again later."}), 429
+        if "cooldown" in msg:
+            return jsonify({"ok": False, "message": "Please wait before sending another verification email to this recipient."}), 429
+        if "password_protection_not_configured" in msg or "password_storage_unavailable" in msg:
+            # Graceful fallback: still allow verification email, but do not store password.
+            try:
+                _create_or_refresh_report_share_verification(user.id, report_id, email, access_token, pdf_password=None)
+            except Exception:
+                app.logger.exception("Failed initiating report share verification (fallback)")
+                return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+            _audit_event_best_effort(
+                "share_verification_sent_password_not_stored",
+                owner_id=user.id,
+                actor_email=user.email,
+                recipient_email=email,
+                report_id=report_id,
+                meta={"password_protected_requested": bool(pdf_password)},
+            )
+            return jsonify({
+                "ok": True,
+                "message": "Verification email sent. Password cannot be stored on this server; set the PDF password again when resending after verification.",
+            }), 202
         app.logger.exception("Failed initiating report share verification")
         return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
 
@@ -2568,11 +3186,27 @@ def api_report_shares_create():
 def verify_trusted_email():
     token = (request.args.get("token") or "").strip()
     if not token:
+        _audit_event_best_effort(
+            "trusted_verify_invalid",
+            owner_id=None,
+            actor_email=None,
+            recipient_email=None,
+            report_id=None,
+            meta={"reason": "missing_token"},
+        )
         return render_template("verify_email_share.html", message="Invalid verification link."), 400
 
     try:
         sb_admin = get_supabase_admin()
     except Exception:
+        _audit_event_best_effort(
+            "trusted_verify_failed",
+            owner_id=None,
+            actor_email=None,
+            recipient_email=None,
+            report_id=None,
+            meta={"reason": "admin_client_unavailable"},
+        )
         return render_template(
             "verify_email_share.html",
             message="Server is not configured for verification. Please contact support.",
@@ -2589,6 +3223,14 @@ def verify_trusted_email():
         )
         rows = getattr(res, "data", None) or []
         if not rows:
+            _audit_event_best_effort(
+                "trusted_verify_invalid",
+                owner_id=None,
+                actor_email=None,
+                recipient_email=None,
+                report_id=None,
+                meta={"reason": "token_not_found"},
+            )
             return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
 
         row_id = rows[0]["id"]
@@ -2599,9 +3241,26 @@ def verify_trusted_email():
                 "verify_token_hash": None,
             }
         ).eq("id", row_id).execute()
+
+        _audit_event_best_effort(
+            "trusted_verified",
+            owner_id=None,
+            actor_email=None,
+            recipient_email=None,
+            report_id=None,
+            meta={"row_id": row_id},
+        )
         return render_template("verify_email_share.html", message="Email verified successfully. You can now receive reports."), 200
     except Exception:
         app.logger.exception("Trusted email verification failed")
+        _audit_event_best_effort(
+            "trusted_verify_failed",
+            owner_id=None,
+            actor_email=None,
+            recipient_email=None,
+            report_id=None,
+            meta={"reason": "exception"},
+        )
         return render_template("verify_email_share.html", message="Verification failed. Please try again later."), 500
 
 
@@ -2609,11 +3268,27 @@ def verify_trusted_email():
 def verify_report_share():
     token = (request.args.get("token") or "").strip()
     if not token:
+        _audit_event_best_effort(
+            "share_verify_invalid",
+            owner_id=None,
+            actor_email=None,
+            recipient_email=None,
+            report_id=None,
+            meta={"reason": "missing_token"},
+        )
         return render_template("verify_email_share.html", message="Invalid verification link."), 400
 
     try:
         sb_admin = get_supabase_admin()
     except Exception:
+        _audit_event_best_effort(
+            "share_verify_failed",
+            owner_id=None,
+            actor_email=None,
+            recipient_email=None,
+            report_id=None,
+            meta={"reason": "admin_client_unavailable"},
+        )
         return render_template(
             "verify_email_share.html",
             message="Server is not configured for verification. Please contact support.",
@@ -2630,11 +3305,27 @@ def verify_report_share():
         )
         rows = getattr(res, "data", None) or []
         if not rows:
+            _audit_event_best_effort(
+                "share_verify_invalid",
+                owner_id=None,
+                actor_email=None,
+                recipient_email=None,
+                report_id=None,
+                meta={"reason": "token_not_found"},
+            )
             return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
 
         row = rows[0]
         exp_dt = _parse_iso_datetime(row.get("expires_at")) if row.get("expires_at") else None
         if exp_dt and exp_dt < datetime.now(timezone.utc):
+            _audit_event_best_effort(
+                "share_verify_invalid",
+                owner_id=None,
+                actor_email=None,
+                recipient_email=None,
+                report_id=None,
+                meta={"reason": "expired"},
+            )
             return render_template("verify_email_share.html", message="Verification link is expired."), 400
 
         sb_admin.table("report_shares").update(
@@ -2644,10 +3335,41 @@ def verify_report_share():
                 "verify_token_hash": None,
             }
         ).eq("id", row["id"]).execute()
+
+        _audit_event_best_effort(
+            "share_verified",
+            owner_id=None,
+            actor_email=None,
+            recipient_email=None,
+            report_id=None,
+            meta={"row_id": row["id"]},
+        )
         return render_template("verify_email_share.html", message="Recipient verified successfully. The sender can now deliver the report."), 200
     except Exception:
         app.logger.exception("Report share verification failed")
+        _audit_event_best_effort(
+            "share_verify_failed",
+            owner_id=None,
+            actor_email=None,
+            recipient_email=None,
+            report_id=None,
+            meta={"reason": "exception"},
+        )
         return render_template("verify_email_share.html", message="Verification failed. Please try again later."), 500
+
+
+@app.route("/trusted-emails/manage", methods=["GET"])
+def trusted_emails_manage_page():
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+
+    # Require verified sender to view/manage the list.
+    _user, err = _require_verified_sender()
+    if err:
+        # Preserve behavior consistency with API responses.
+        return render_template("verify_email_share.html", message=err[0].get("message") or "Access denied."), err[1]
+
+    return render_template("trusted_emails.html")
 
 
 # ---------- SEND VIA WHATSAPP (Twilio Sandbox) ----------
