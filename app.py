@@ -99,6 +99,13 @@ else:
 
 logging.basicConfig(level=logging.INFO)
 
+# ---------- Secure share defaults ----------
+SHARE_VERIFY_TOKEN_TTL_MINUTES = int(os.getenv("SHARE_VERIFY_TOKEN_TTL_MINUTES", "15"))
+VERIFY_RESEND_COOLDOWN_SECONDS = int(os.getenv("VERIFY_RESEND_COOLDOWN_SECONDS", "60"))
+VERIFY_RESEND_WINDOW_SECONDS = int(os.getenv("VERIFY_RESEND_WINDOW_SECONDS", str(15 * 60)))
+VERIFY_RESEND_MAX_PER_WINDOW = int(os.getenv("VERIFY_RESEND_MAX_PER_WINDOW", "3"))
+MAX_TRUSTED_EMAILS_PER_USER = int(os.getenv("MAX_TRUSTED_EMAILS_PER_USER", "5"))
+
 # ---------- RUNTIME FOLDERS (writable on Render) ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(RUNTIME_DIR, "retail_forecast_uploads")
@@ -199,6 +206,91 @@ def _supabase_table_get_single(sb, table: str, filters: dict) -> dict | None:
     if isinstance(data, dict):
         return data
     return None
+
+
+def _client_ip() -> str:
+    return (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+
+
+def _client_user_agent() -> str:
+    return (request.headers.get("User-Agent") or "").strip()
+
+
+def _audit_event_insert(sb, payload: dict) -> None:
+    if UNIT_TESTING:
+        return
+    try:
+        sb.table("email_share_audit").insert(payload).execute()
+    except Exception:
+        # Audit logs must never break user flows.
+        return
+
+
+def _audit_owner_event(access_token: str, owner_id: str | None, event_type: str, recipient_email: str | None = None,
+                       report_id: str | None = None, meta: dict | None = None) -> None:
+    if UNIT_TESTING:
+        return
+    try:
+        sb = get_supabase(access_token)
+    except Exception:
+        return
+    _audit_event_insert(
+        sb,
+        {
+            "owner_id": owner_id,
+            "report_id": report_id,
+            "recipient_email": (recipient_email or None),
+            "event_type": event_type,
+            "meta": (meta or {}),
+        },
+    )
+
+
+def _audit_admin_event(event_type: str, owner_id: str | None = None, recipient_email: str | None = None,
+                      report_id: str | None = None, meta: dict | None = None) -> None:
+    if UNIT_TESTING:
+        return
+    try:
+        sb_admin = get_supabase_admin()
+    except Exception:
+        return
+    _audit_event_insert(
+        sb_admin,
+        {
+            "owner_id": owner_id,
+            "report_id": report_id,
+            "recipient_email": (recipient_email or None),
+            "event_type": event_type,
+            "meta": (meta or {}),
+        },
+    )
+
+
+def _rate_limit_verify_resend_or_raise(row: dict | None) -> None:
+    """Raise RuntimeError("resend_rate_limited") when resend limits are hit."""
+    if not row:
+        return
+
+    now_dt = datetime.now(timezone.utc)
+
+    sent_at = row.get("verify_sent_at")
+    sent_dt = _parse_iso_datetime(sent_at) if sent_at else None
+    if sent_dt is not None:
+        if (now_dt - sent_dt).total_seconds() < float(VERIFY_RESEND_COOLDOWN_SECONDS):
+            raise RuntimeError("resend_rate_limited")
+
+    win_start = row.get("verify_send_window_start")
+    win_dt = _parse_iso_datetime(win_start) if win_start else None
+    if win_dt is None or (now_dt - win_dt).total_seconds() > float(VERIFY_RESEND_WINDOW_SECONDS):
+        return
+
+    try:
+        count = int(row.get("verify_send_count") or 0)
+    except Exception:
+        count = 0
+
+    if count >= int(VERIFY_RESEND_MAX_PER_WINDOW):
+        raise RuntimeError("resend_rate_limited")
 
 
 def _trusted_email_is_verified(owner_id: str, email: str, access_token: str) -> bool:
@@ -2240,6 +2332,17 @@ def email_pdf():
 
     # Authorize delivery. If not allowed, initiate recipient verification (one-time share) and do NOT deliver.
     if not can_send_report(sender, email, report_id):
+        access_token = (session.get("access_token") or "").strip()
+        if access_token:
+            _audit_owner_event(
+                access_token,
+                sender.id,
+                "report_send_blocked_unverified_recipient",
+                recipient_email=email,
+                report_id=report_id,
+                meta={"ip": _client_ip(), "ua": _client_user_agent()},
+            )
+
         cfg = _get_sendgrid_config()
         if not cfg.get("api_key") or not cfg.get("from_email"):
             return jsonify({
@@ -2248,7 +2351,6 @@ def email_pdf():
             }), 403
 
         try:
-            access_token = (session.get("access_token") or "").strip()
             if not access_token:
                 return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
 
@@ -2259,6 +2361,8 @@ def email_pdf():
             }), 202
         except Exception as e:
             msg = str(e).lower()
+            if "resend_rate_limited" in msg:
+                return jsonify({"ok": False, "message": "Please wait before resending verification."}), 429
             if "missing_sendgrid_config" in msg:
                 return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
             app.logger.exception("Failed initiating recipient verification")
@@ -2278,6 +2382,18 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str) -> tuple
     filename = f"retail_forecast_report_{report_id}.pdf"
 
     try:
+        access_token = (session.get("access_token") or "").strip()
+        owner_id = (session.get("user_id") or "").strip() or None
+        if access_token and owner_id:
+            _audit_owner_event(
+                access_token,
+                owner_id,
+                "report_send_attempt",
+                recipient_email=recipient_email,
+                report_id=report_id,
+                meta={"ip": _client_ip(), "ua": _client_user_agent()},
+            )
+
         _build_pdf_report_file(report, pdf_path)
         with open(pdf_path, 'rb') as f:
             pdf_bytes = f.read()
@@ -2285,12 +2401,30 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str) -> tuple
         subject = "Demand Forecasting Report (PDF)"
         body = "Attached is your Retail Demand Forecasting PDF report."
         _send_email_with_pdf_attachment_sendgrid(recipient_email, subject, body, pdf_bytes, filename)
+        if access_token and owner_id:
+            _audit_owner_event(
+                access_token,
+                owner_id,
+                "report_sent",
+                recipient_email=recipient_email,
+                report_id=report_id,
+                meta={"ip": _client_ip(), "ua": _client_user_agent()},
+            )
         return jsonify({"ok": True, "message": "PDF sent successfully."}), 200
     except Exception as e:
         msg = str(e).lower()
         if "missing_sendgrid_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
         app.logger.exception("Failed sending PDF email")
+        if (session.get("access_token") or "").strip() and (session.get("user_id") or "").strip():
+            _audit_owner_event(
+                (session.get("access_token") or "").strip(),
+                (session.get("user_id") or "").strip(),
+                "report_send_failed",
+                recipient_email=recipient_email,
+                report_id=report_id,
+                meta={"ip": _client_ip(), "ua": _client_user_agent()},
+            )
         return jsonify({"ok": False, "message": "Failed to send email. Please try again later."}), 500
     finally:
         try:
@@ -2420,12 +2554,42 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
 
     sb = get_supabase(access_token)
     now_iso = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    expires_dt = now_dt + timedelta(minutes=max(1, SHARE_VERIFY_TOKEN_TTL_MINUTES))
     row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": email})
+
+    _rate_limit_verify_resend_or_raise(row)
+
+    # Enforce max trusted emails per user for NEW inserts.
+    if not row:
+        res = sb.table("trusted_emails").select("id").eq("owner_id", owner_id).execute()
+        data = getattr(res, "data", None) or []
+        try:
+            total = len(data) if isinstance(data, list) else 0
+        except Exception:
+            total = 0
+        if total >= int(MAX_TRUSTED_EMAILS_PER_USER):
+            raise RuntimeError("trusted_limit_reached")
+
+    # Update resend window counters.
+    win_start = row.get("verify_send_window_start") if row else None
+    win_dt = _parse_iso_datetime(win_start) if win_start else None
+    if win_dt is None or (now_dt - win_dt).total_seconds() > float(VERIFY_RESEND_WINDOW_SECONDS):
+        win_dt = now_dt
+        new_count = 1
+    else:
+        try:
+            new_count = int((row or {}).get("verify_send_count") or 0) + 1
+        except Exception:
+            new_count = 1
     if row:
         sb.table("trusted_emails").update(
             {
                 "verify_token_hash": token_hash,
                 "verify_sent_at": now_iso,
+                "expires_at": expires_dt.isoformat(),
+                "verify_send_window_start": win_dt.isoformat(),
+                "verify_send_count": new_count,
                 "is_verified": False,
                 "verified_at": None,
             }
@@ -2437,9 +2601,20 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
                 "email": email,
                 "verify_token_hash": token_hash,
                 "verify_sent_at": now_iso,
+                "expires_at": expires_dt.isoformat(),
+                "verify_send_window_start": win_dt.isoformat(),
+                "verify_send_count": new_count,
                 "is_verified": False,
             }
         ).execute()
+
+    _audit_owner_event(
+        access_token,
+        owner_id,
+        "trusted_email_verification_sent",
+        recipient_email=email,
+        meta={"ip": _client_ip(), "ua": _client_user_agent()},
+    )
 
     verify_url = f"{_app_public_base_url()}/trusted-email/verify?token={token}"
     subject = "Verify your email for report delivery"
@@ -2456,7 +2631,7 @@ def _create_or_refresh_report_share_verification(owner_id: str, report_id: str, 
     token_hash = _token_hash(token)
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
-    expires_dt = now_dt + timedelta(hours=24)
+    expires_dt = now_dt + timedelta(minutes=max(1, SHARE_VERIFY_TOKEN_TTL_MINUTES))
 
     sb = get_supabase(access_token)
     row = _supabase_table_get_single(
@@ -2465,12 +2640,27 @@ def _create_or_refresh_report_share_verification(owner_id: str, report_id: str, 
         {"owner_id": owner_id, "report_id": report_id, "recipient_email": recipient_email},
     )
 
+    _rate_limit_verify_resend_or_raise(row)
+
+    win_start = row.get("verify_send_window_start") if row else None
+    win_dt = _parse_iso_datetime(win_start) if win_start else None
+    if win_dt is None or (now_dt - win_dt).total_seconds() > float(VERIFY_RESEND_WINDOW_SECONDS):
+        win_dt = now_dt
+        new_count = 1
+    else:
+        try:
+            new_count = int((row or {}).get("verify_send_count") or 0) + 1
+        except Exception:
+            new_count = 1
+
     payload = {
         "verify_token_hash": token_hash,
         "verify_sent_at": now_iso,
         "is_verified": False,
         "verified_at": None,
         "expires_at": expires_dt.isoformat(),
+        "verify_send_window_start": win_dt.isoformat(),
+        "verify_send_count": new_count,
     }
     if row:
         sb.table("report_shares").update(payload).eq("id", row["id"]).execute()
@@ -2492,6 +2682,15 @@ def _create_or_refresh_report_share_verification(owner_id: str, report_id: str, 
         "If you did not expect this, you can ignore this message."
     )
     _send_email_plain_sendgrid(recipient_email, subject, body)
+
+    _audit_owner_event(
+        access_token,
+        owner_id,
+        "report_share_verification_sent",
+        recipient_email=recipient_email,
+        report_id=report_id,
+        meta={"ip": _client_ip(), "ua": _client_user_agent()},
+    )
 
 
 @app.route("/api/trusted-emails", methods=["GET", "POST"])
@@ -2524,10 +2723,56 @@ def api_trusted_emails():
         return jsonify({"ok": True, "message": "Verification email sent. Please verify to enable delivery."}), 202
     except Exception as e:
         msg = str(e).lower()
+        if "trusted_emails_limit_reached" in msg or "trusted_limit_reached" in msg:
+            return jsonify({"ok": False, "message": f"Trusted email limit reached (max {MAX_TRUSTED_EMAILS_PER_USER})."}), 409
+        if "resend_rate_limited" in msg:
+            return jsonify({"ok": False, "message": "Please wait before resending verification."}), 429
         if "missing_sendgrid_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
         app.logger.exception("Failed initiating trusted email verification")
         return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+
+@app.route("/api/trusted-emails", methods=["DELETE"])
+def api_trusted_emails_delete():
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    email = (payload.get("email") or "").strip()
+    row_id = (payload.get("id") or "").strip()
+
+    if not email and not row_id:
+        return jsonify({"ok": False, "message": "Provide 'email' or 'id' to delete."}), 400
+
+    if UNIT_TESTING:
+        return jsonify({"ok": True}), 200
+
+    sb = get_supabase(access_token)
+    q = sb.table("trusted_emails").delete().eq("owner_id", user.id)
+    if row_id:
+        q = q.eq("id", row_id)
+    else:
+        email_norm, email_err = _normalize_and_validate_email_for_sending(email)
+        if email_err:
+            return jsonify({"ok": False, "message": email_err}), 400
+        q = q.eq("email", email_norm)
+    q.execute()
+
+    _audit_owner_event(
+        access_token,
+        user.id,
+        "trusted_email_removed",
+        recipient_email=(email.lower() if email else None),
+        meta={"ip": _client_ip(), "ua": _client_user_agent()},
+    )
+
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/api/report-shares", methods=["POST"])
@@ -2558,10 +2803,49 @@ def api_report_shares_create():
         return jsonify({"ok": True, "message": "Verification email sent to recipient."}), 202
     except Exception as e:
         msg = str(e).lower()
+        if "resend_rate_limited" in msg:
+            return jsonify({"ok": False, "message": "Please wait before resending verification."}), 429
         if "missing_sendgrid_config" in msg:
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
         app.logger.exception("Failed initiating report share verification")
         return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+
+@app.route("/api/report-shares/resend", methods=["POST"])
+def api_report_shares_resend():
+    """Explicit resend endpoint (rate-limited) for a pending one-time share verification."""
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    raw_email = payload.get("recipient_email") or payload.get("email")
+    report_id = _parse_report_id(payload.get("report_id") or session.get("report_id"))
+    if not report_id:
+        return jsonify({"ok": False, "message": "Report not found. Please generate a report first."}), 400
+
+    email, email_err = _normalize_and_validate_email_for_sending(raw_email)
+    if email_err:
+        return jsonify({"ok": False, "message": email_err}), 400
+
+    if email == user.email:
+        return jsonify({"ok": False, "message": "Recipient is your own email. Use direct send instead."}), 400
+
+    try:
+        _create_or_refresh_report_share_verification(user.id, report_id, email, access_token)
+        return jsonify({"ok": True, "message": "Verification email resent to recipient."}), 202
+    except Exception as e:
+        msg = str(e).lower()
+        if "resend_rate_limited" in msg:
+            return jsonify({"ok": False, "message": "Please wait before resending verification."}), 429
+        if "missing_sendgrid_config" in msg:
+            return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        app.logger.exception("Failed resending report share verification")
+        return jsonify({"ok": False, "message": "Failed to resend verification email. Please try again later."}), 500
 
 
 @app.route("/trusted-email/verify", methods=["GET"])
@@ -2582,26 +2866,53 @@ def verify_trusted_email():
     try:
         res = (
             sb_admin.table("trusted_emails")
-            .select("id")
+            .select("id,owner_id,email,expires_at")
             .eq("verify_token_hash", token_hash)
             .limit(1)
             .execute()
         )
         rows = getattr(res, "data", None) or []
         if not rows:
+            _audit_admin_event(
+                "trusted_email_verify_invalid",
+                meta={"ip": _client_ip(), "ua": _client_user_agent()},
+            )
             return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
 
-        row_id = rows[0]["id"]
+        row = rows[0]
+        exp_dt = _parse_iso_datetime(row.get("expires_at")) if row.get("expires_at") else None
+        if exp_dt and exp_dt < datetime.now(timezone.utc):
+            _audit_admin_event(
+                "trusted_email_verify_expired",
+                owner_id=row.get("owner_id"),
+                recipient_email=row.get("email"),
+                meta={"ip": _client_ip(), "ua": _client_user_agent()},
+            )
+            return render_template("verify_email_share.html", message="Verification link is expired."), 400
+
+        row_id = row["id"]
         sb_admin.table("trusted_emails").update(
             {
                 "is_verified": True,
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "verify_token_hash": None,
+                "expires_at": None,
             }
         ).eq("id", row_id).execute()
+
+        _audit_admin_event(
+            "trusted_email_verified",
+            owner_id=row.get("owner_id"),
+            recipient_email=row.get("email"),
+            meta={"ip": _client_ip(), "ua": _client_user_agent()},
+        )
         return render_template("verify_email_share.html", message="Email verified successfully. You can now receive reports."), 200
     except Exception:
         app.logger.exception("Trusted email verification failed")
+        _audit_admin_event(
+            "trusted_email_verify_failed",
+            meta={"ip": _client_ip(), "ua": _client_user_agent()},
+        )
         return render_template("verify_email_share.html", message="Verification failed. Please try again later."), 500
 
 
@@ -2623,18 +2934,29 @@ def verify_report_share():
     try:
         res = (
             sb_admin.table("report_shares")
-            .select("id,expires_at")
+            .select("id,owner_id,report_id,recipient_email,expires_at")
             .eq("verify_token_hash", token_hash)
             .limit(1)
             .execute()
         )
         rows = getattr(res, "data", None) or []
         if not rows:
+            _audit_admin_event(
+                "report_share_verify_invalid",
+                meta={"ip": _client_ip(), "ua": _client_user_agent()},
+            )
             return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
 
         row = rows[0]
         exp_dt = _parse_iso_datetime(row.get("expires_at")) if row.get("expires_at") else None
         if exp_dt and exp_dt < datetime.now(timezone.utc):
+            _audit_admin_event(
+                "report_share_verify_expired",
+                owner_id=row.get("owner_id"),
+                report_id=row.get("report_id"),
+                recipient_email=row.get("recipient_email"),
+                meta={"ip": _client_ip(), "ua": _client_user_agent()},
+            )
             return render_template("verify_email_share.html", message="Verification link is expired."), 400
 
         sb_admin.table("report_shares").update(
@@ -2642,11 +2964,24 @@ def verify_report_share():
                 "is_verified": True,
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "verify_token_hash": None,
+                "expires_at": None,
             }
         ).eq("id", row["id"]).execute()
+
+        _audit_admin_event(
+            "report_share_verified",
+            owner_id=row.get("owner_id"),
+            report_id=row.get("report_id"),
+            recipient_email=row.get("recipient_email"),
+            meta={"ip": _client_ip(), "ua": _client_user_agent()},
+        )
         return render_template("verify_email_share.html", message="Recipient verified successfully. The sender can now deliver the report."), 200
     except Exception:
         app.logger.exception("Report share verification failed")
+        _audit_admin_event(
+            "report_share_verify_failed",
+            meta={"ip": _client_ip(), "ua": _client_user_agent()},
+        )
         return render_template("verify_email_share.html", message="Verification failed. Please try again later."), 500
 
 
