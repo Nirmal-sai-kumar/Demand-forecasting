@@ -11,7 +11,12 @@ def _read_supabase_config() -> tuple[str, str]:
     return url, key
 
 
+def _read_supabase_service_role_key() -> str:
+    return (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+
+
 _SUPABASE_URL, _SUPABASE_KEY = _read_supabase_config()
+_SUPABASE_SERVICE_ROLE_KEY = _read_supabase_service_role_key()
 
 
 def get_supabase(access_token: str | None = None) -> Client:
@@ -47,3 +52,28 @@ def get_supabase(access_token: str | None = None) -> Client:
             pass
 
     return sb
+
+
+def get_supabase_admin() -> Client:
+    """Return a Supabase client authenticated with the service-role key.
+
+    This is required for public verification endpoints (recipient has no auth session),
+    where we need to update rows by verification token hash.
+
+    IMPORTANT: never expose SUPABASE_SERVICE_ROLE_KEY to the browser.
+    """
+    url = _SUPABASE_URL
+    key = _SUPABASE_SERVICE_ROLE_KEY
+
+    if not url or not key:
+        raise RuntimeError(
+            "Missing Supabase admin config. Set SUPABASE_SERVICE_ROLE_KEY in the server environment."
+        )
+
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(
+            "Invalid SUPABASE_URL/VITE_SUPABASE_URL. It should look like https://<project-ref>.supabase.co"
+        )
+
+    return create_client(url, key)

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import base64
 import urllib.request
 import urllib.error
@@ -10,11 +10,13 @@ import logging
 import os
 import re
 import shutil
+import secrets
+import hashlib
 import tempfile
 import threading
 import time
 from urllib.parse import urlparse
-from typing import List, Union
+from typing import List, Union, Optional
 from uuid import uuid4
 
 import numpy as np
@@ -24,6 +26,16 @@ UNIT_TESTING = os.getenv("UNIT_TESTING") == "1"
 
 import pandas as pd
 import joblib
+
+try:
+    # Optional but recommended for robust email validation.
+    # If not installed, we fall back to a simple regex.
+    from email_validator import validate_email as _ev_validate_email, EmailNotValidError
+except ImportError:  # pragma: no cover
+    _ev_validate_email = None
+
+    class EmailNotValidError(Exception):
+        pass
 
 try:
     from dotenv import load_dotenv
@@ -77,10 +89,13 @@ else:
 from werkzeug.utils import secure_filename
 
 if not UNIT_TESTING:
-    from supabase_client import get_supabase
+    from supabase_client import get_supabase, get_supabase_admin
 else:
     def get_supabase(access_token: str | None = None):
         raise RuntimeError("Supabase client is unavailable in UNIT_TESTING mode")
+
+    def get_supabase_admin():
+        raise RuntimeError("Supabase admin client is unavailable in UNIT_TESTING mode")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -110,6 +125,142 @@ class InvalidResetTokens(ValueError):
 
 class TwilioSendError(RuntimeError):
     """Raised when WhatsApp sending via Twilio fails."""
+
+
+@dataclass(frozen=True)
+class CurrentUser:
+    id: str
+    email: str
+    email_verified: bool
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _new_verify_token() -> str:
+    # URL-safe token suitable for query string.
+    return secrets.token_urlsafe(32)
+
+
+def _sender_current_user_from_session() -> CurrentUser | None:
+    if not session.get("logged_in"):
+        return None
+    user_id = (session.get("user_id") or "").strip()
+    email = (session.get("user_email") or "").strip().lower()
+    email_verified = bool(session.get("email_verified"))
+    if not user_id or not email:
+        return None
+    return CurrentUser(id=user_id, email=email, email_verified=email_verified)
+
+
+def _compute_email_verified_from_user_obj(user_obj) -> bool:
+    return bool(_resp_get(user_obj, "email_confirmed_at") or _resp_get(user_obj, "confirmed_at"))
+
+
+def _refresh_sender_verified_state_best_effort() -> None:
+    """Refresh session['email_verified'] based on Supabase user object (best-effort).
+
+    This keeps policy enforcement stable even if the login response didn't include
+    the confirmed fields in a consistent shape.
+    """
+    if UNIT_TESTING:
+        return
+    if not session.get("logged_in"):
+        return
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return
+
+    try:
+        sb_user = get_supabase(access_token)
+        # supabase-py has had different signatures; support both.
+        try:
+            user_resp = sb_user.auth.get_user(access_token)
+        except TypeError:
+            user_resp = sb_user.auth.get_user()
+        user_obj = _resp_get(user_resp, "user") or _resp_get(user_resp, "data") or user_resp
+        if user_obj is None:
+            return
+        session["email_verified"] = _compute_email_verified_from_user_obj(user_obj)
+    except Exception:
+        # Do not block user actions due to refresh failures.
+        return
+
+
+def _supabase_table_get_single(sb, table: str, filters: dict) -> dict | None:
+    q = sb.table(table).select("*")
+    for k, v in filters.items():
+        q = q.eq(k, v)
+    res = q.limit(1).execute()
+    data = getattr(res, "data", None)
+    if isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _trusted_email_is_verified(owner_id: str, email: str, access_token: str) -> bool:
+    if UNIT_TESTING:
+        return False
+    sb = get_supabase(access_token)
+    row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": email})
+    return bool(row and row.get("is_verified"))
+
+
+def _report_share_is_verified(owner_id: str, report_id: str, recipient_email: str, access_token: str) -> bool:
+    if UNIT_TESTING:
+        return False
+    sb = get_supabase(access_token)
+    row = _supabase_table_get_single(
+        sb,
+        "report_shares",
+        {"owner_id": owner_id, "report_id": report_id, "recipient_email": recipient_email},
+    )
+    if not row:
+        return False
+    if not row.get("is_verified"):
+        return False
+    expires_at = row.get("expires_at")
+    exp_dt = _parse_iso_datetime(expires_at) if expires_at else None
+    if exp_dt and exp_dt < datetime.now(timezone.utc):
+        return False
+    return True
+
+
+def can_send_report(user: CurrentUser, recipient_email: str, report_id: str | None) -> bool:
+    """Authorization policy for delivering a report to recipient_email.
+
+    Rules (must satisfy all of these):
+    - Sender authenticated AND email_verified
+    - Recipient email syntax is valid (done before calling this)
+    - Allow if ANY ONE is true:
+        1) recipient == sender verified email
+        2) recipient in sender.trusted_emails AND verified
+        3) recipient verified via one-time share token for this report
+    """
+    if not user or not user.email_verified:
+        return False
+
+    recipient = (recipient_email or "").strip().lower()
+    if not recipient:
+        return False
+
+    if recipient == user.email:
+        return True
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return False
+
+    if _trusted_email_is_verified(user.id, recipient, access_token):
+        return True
+
+    if report_id and _report_share_is_verified(user.id, report_id, recipient, access_token):
+        return True
+
+    return False
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -270,6 +421,34 @@ def _is_valid_email_address(value: str | None) -> bool:
     if not v or len(v) > 254:
         return False
     return _EMAIL_RE.match(v) is not None
+
+
+def _normalize_and_validate_email_for_sending(value: str | None) -> tuple[str | None, str | None]:
+    """Validate and normalize an email address for outbound sending.
+
+    - Uses `email-validator` when available (better parsing/normalization).
+    - Falls back to a conservative regex check if not installed.
+    - Optional deliverability check (DNS) can be enabled via env var:
+        EMAIL_DELIVERABILITY_CHECK=1
+    """
+    if value is None:
+        return None, "Please enter a valid email address."
+    raw = str(value).strip()
+    if not raw:
+        return None, "Please enter a valid email address."
+
+    if _ev_validate_email is None:
+        return (raw, None) if _is_valid_email_address(raw) else (None, "Please enter a valid email address.")
+
+    check_deliverability = _get_env_bool("EMAIL_DELIVERABILITY_CHECK", False)
+    try:
+        res = _ev_validate_email(raw, check_deliverability=bool(check_deliverability))
+        normalized = (getattr(res, "email", None) or raw).strip()
+        if not normalized or len(normalized) > 254:
+            return None, "Please enter a valid email address."
+        return normalized, None
+    except EmailNotValidError:
+        return None, "Please enter a valid email address."
 
 
 def _get_sendgrid_config() -> dict:
@@ -1349,6 +1528,7 @@ def login():
         session['logged_in'] = True
         session['user_id'] = _resp_get(user_obj, "id")
         session['user_email'] = _resp_get(user_obj, "email")
+        session['email_verified'] = _compute_email_verified_from_user_obj(user_obj)
         session['access_token'] = access_token
         session['refresh_token'] = refresh_token
 
@@ -1503,6 +1683,7 @@ def register():
             session['logged_in'] = True
             session['user_id'] = _resp_get(user_obj, "id")
             session['user_email'] = _resp_get(user_obj, "email")
+            session['email_verified'] = _compute_email_verified_from_user_obj(user_obj)
             session['access_token'] = access_token
             session['refresh_token'] = refresh_token
             return redirect(url_for('home'))
@@ -2044,15 +2225,55 @@ def email_pdf():
     except Exception:
         email = None
 
-    if not _is_valid_email_address(email):
-        return jsonify({"ok": False, "message": "Please enter a valid email address."}), 400
+    email, email_err = _normalize_and_validate_email_for_sending(email)
+    if email_err:
+        return jsonify({"ok": False, "message": email_err}), 400
 
+    # Enforce sender verification before any delivery.
+    sender, sender_err = _require_verified_sender()
+    if sender_err:
+        return jsonify(sender_err[0]), sender_err[1]
+
+    report_id = _parse_report_id(session.get("report_id"))
+    if not report_id:
+        return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
+
+    # Authorize delivery. If not allowed, initiate recipient verification (one-time share) and do NOT deliver.
+    if not can_send_report(sender, email, report_id):
+        cfg = _get_sendgrid_config()
+        if not cfg.get("api_key") or not cfg.get("from_email"):
+            return jsonify({
+                "ok": False,
+                "message": "Recipient email is not verified for this report.",
+            }), 403
+
+        try:
+            access_token = (session.get("access_token") or "").strip()
+            if not access_token:
+                return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+            _create_or_refresh_report_share_verification(sender.id, report_id, email, access_token)
+            return jsonify({
+                "ok": True,
+                "message": "Verification email sent to recipient. Ask them to verify, then resend the report.",
+            }), 202
+        except Exception as e:
+            msg = str(e).lower()
+            if "missing_sendgrid_config" in msg:
+                return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+            app.logger.exception("Failed initiating recipient verification")
+            return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+    return _deliver_report_pdf_via_email(email, report_id)
+
+
+def _deliver_report_pdf_via_email(recipient_email: str, report_id: str) -> tuple:
+    """Generate the current session report PDF and email it to recipient_email."""
     try:
         report = _load_report_from_session()
     except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
-    report_id = session.get("report_id") or "report"
     pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
     filename = f"retail_forecast_report_{report_id}.pdf"
 
@@ -2063,8 +2284,8 @@ def email_pdf():
 
         subject = "Demand Forecasting Report (PDF)"
         body = "Attached is your Retail Demand Forecasting PDF report."
-        _send_email_with_pdf_attachment_sendgrid(email, subject, body, pdf_bytes, filename)
-        return jsonify({"ok": True, "message": "PDF sent successfully."})
+        _send_email_with_pdf_attachment_sendgrid(recipient_email, subject, body, pdf_bytes, filename)
+        return jsonify({"ok": True, "message": "PDF sent successfully."}), 200
     except Exception as e:
         msg = str(e).lower()
         if "missing_sendgrid_config" in msg:
@@ -2077,6 +2298,20 @@ def email_pdf():
                 os.remove(pdf_path)
         except OSError:
             app.logger.warning("Failed removing emailed PDF: %s", pdf_path)
+
+
+@app.route('/email/pdf/self', methods=['POST'])
+def email_pdf_self():
+    """Default delivery method: send report only to the sender's verified email."""
+    sender, sender_err = _require_verified_sender()
+    if sender_err:
+        return jsonify(sender_err[0]), sender_err[1]
+
+    report_id = _parse_report_id(session.get("report_id"))
+    if not report_id:
+        return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
+
+    return _deliver_report_pdf_via_email(sender.email, report_id)
 
 
 # ---------- PUBLIC FILES (for Twilio MediaUrl) ----------
@@ -2125,6 +2360,294 @@ def public_files(filename: str):
         return resp
 
     return send_file(path, as_attachment=False)
+
+
+# ---------- SECURE EMAIL SHARING ----------
+
+def _require_verified_sender() -> tuple[CurrentUser | None, tuple[dict, int] | None]:
+    user = _sender_current_user_from_session()
+    if user is None:
+        return None, ({"ok": False, "message": "Please login first."}, 401)
+
+    # Best-effort refresh if we don't have a verified flag yet.
+    if not user.email_verified:
+        _refresh_sender_verified_state_best_effort()
+        user = _sender_current_user_from_session()
+
+    if user is None or not user.email_verified:
+        return None, ({"ok": False, "message": "Please verify your email first."}, 403)
+
+    return user, None
+
+
+def _send_email_plain_sendgrid(to_email: str, subject: str, body_text: str) -> None:
+    cfg = _get_sendgrid_config()
+    if not cfg.get("api_key") or not cfg.get("from_email"):
+        raise RuntimeError("missing_sendgrid_config")
+
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": cfg["from_email"]},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body_text}],
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        status = getattr(resp, "status", None)
+        if status not in (200, 202):
+            raise RuntimeError("sendgrid_failed")
+
+
+def _app_public_base_url() -> str:
+    # Use the configured email redirect base to generate public verification links.
+    return (CONFIG.email_redirect_base_url or CONFIG.app_base_url or "").rstrip("/")
+
+
+def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, access_token: str) -> None:
+    token = _new_verify_token()
+    token_hash = _token_hash(token)
+
+    sb = get_supabase(access_token)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": email})
+    if row:
+        sb.table("trusted_emails").update(
+            {
+                "verify_token_hash": token_hash,
+                "verify_sent_at": now_iso,
+                "is_verified": False,
+                "verified_at": None,
+            }
+        ).eq("id", row["id"]).execute()
+    else:
+        sb.table("trusted_emails").insert(
+            {
+                "owner_id": owner_id,
+                "email": email,
+                "verify_token_hash": token_hash,
+                "verify_sent_at": now_iso,
+                "is_verified": False,
+            }
+        ).execute()
+
+    verify_url = f"{_app_public_base_url()}/trusted-email/verify?token={token}"
+    subject = "Verify your email for report delivery"
+    body = (
+        "You (or someone) added this email to receive reports.\n\n"
+        f"Verify this email by opening: {verify_url}\n\n"
+        "If you did not request this, you can ignore this message."
+    )
+    _send_email_plain_sendgrid(email, subject, body)
+
+
+def _create_or_refresh_report_share_verification(owner_id: str, report_id: str, recipient_email: str, access_token: str) -> None:
+    token = _new_verify_token()
+    token_hash = _token_hash(token)
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    expires_dt = now_dt + timedelta(hours=24)
+
+    sb = get_supabase(access_token)
+    row = _supabase_table_get_single(
+        sb,
+        "report_shares",
+        {"owner_id": owner_id, "report_id": report_id, "recipient_email": recipient_email},
+    )
+
+    payload = {
+        "verify_token_hash": token_hash,
+        "verify_sent_at": now_iso,
+        "is_verified": False,
+        "verified_at": None,
+        "expires_at": expires_dt.isoformat(),
+    }
+    if row:
+        sb.table("report_shares").update(payload).eq("id", row["id"]).execute()
+    else:
+        sb.table("report_shares").insert(
+            {
+                "owner_id": owner_id,
+                "report_id": report_id,
+                "recipient_email": recipient_email,
+                **payload,
+            }
+        ).execute()
+
+    verify_url = f"{_app_public_base_url()}/share/verify?token={token}"
+    subject = "Verify your email to receive a shared report"
+    body = (
+        "A report was shared with this email address.\n\n"
+        f"Verify ownership to allow delivery: {verify_url}\n\n"
+        "If you did not expect this, you can ignore this message."
+    )
+    _send_email_plain_sendgrid(recipient_email, subject, body)
+
+
+@app.route("/api/trusted-emails", methods=["GET", "POST"])
+def api_trusted_emails():
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    if request.method == "GET":
+        if UNIT_TESTING:
+            return jsonify({"ok": True, "items": []})
+        sb = get_supabase(access_token)
+        res = sb.table("trusted_emails").select("id,email,is_verified,created_at,verified_at").eq(
+            "owner_id", user.id
+        ).order("created_at", desc=True).execute()
+        return jsonify({"ok": True, "items": getattr(res, "data", []) or []})
+
+    payload = request.get_json(silent=True) or {}
+    raw_email = payload.get("email")
+    email, email_err = _normalize_and_validate_email_for_sending(raw_email)
+    if email_err:
+        return jsonify({"ok": False, "message": email_err}), 400
+
+    try:
+        _create_or_refresh_trusted_email_verification(user.id, email, access_token)
+        return jsonify({"ok": True, "message": "Verification email sent. Please verify to enable delivery."}), 202
+    except Exception as e:
+        msg = str(e).lower()
+        if "missing_sendgrid_config" in msg:
+            return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        app.logger.exception("Failed initiating trusted email verification")
+        return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+
+@app.route("/api/report-shares", methods=["POST"])
+def api_report_shares_create():
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    raw_email = payload.get("recipient_email") or payload.get("email")
+    report_id = _parse_report_id(payload.get("report_id") or session.get("report_id"))
+    if not report_id:
+        return jsonify({"ok": False, "message": "Report not found. Please generate a report first."}), 400
+
+    email, email_err = _normalize_and_validate_email_for_sending(raw_email)
+    if email_err:
+        return jsonify({"ok": False, "message": email_err}), 400
+
+    if email == user.email:
+        return jsonify({"ok": False, "message": "Recipient is your own email. Use direct send instead."}), 400
+
+    try:
+        _create_or_refresh_report_share_verification(user.id, report_id, email, access_token)
+        return jsonify({"ok": True, "message": "Verification email sent to recipient."}), 202
+    except Exception as e:
+        msg = str(e).lower()
+        if "missing_sendgrid_config" in msg:
+            return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        app.logger.exception("Failed initiating report share verification")
+        return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+
+@app.route("/trusted-email/verify", methods=["GET"])
+def verify_trusted_email():
+    token = (request.args.get("token") or "").strip()
+    if not token:
+        return render_template("verify_email_share.html", message="Invalid verification link."), 400
+
+    try:
+        sb_admin = get_supabase_admin()
+    except Exception:
+        return render_template(
+            "verify_email_share.html",
+            message="Server is not configured for verification. Please contact support.",
+        ), 500
+
+    token_hash = _token_hash(token)
+    try:
+        res = (
+            sb_admin.table("trusted_emails")
+            .select("id")
+            .eq("verify_token_hash", token_hash)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
+
+        row_id = rows[0]["id"]
+        sb_admin.table("trusted_emails").update(
+            {
+                "is_verified": True,
+                "verified_at": datetime.now(timezone.utc).isoformat(),
+                "verify_token_hash": None,
+            }
+        ).eq("id", row_id).execute()
+        return render_template("verify_email_share.html", message="Email verified successfully. You can now receive reports."), 200
+    except Exception:
+        app.logger.exception("Trusted email verification failed")
+        return render_template("verify_email_share.html", message="Verification failed. Please try again later."), 500
+
+
+@app.route("/share/verify", methods=["GET"])
+def verify_report_share():
+    token = (request.args.get("token") or "").strip()
+    if not token:
+        return render_template("verify_email_share.html", message="Invalid verification link."), 400
+
+    try:
+        sb_admin = get_supabase_admin()
+    except Exception:
+        return render_template(
+            "verify_email_share.html",
+            message="Server is not configured for verification. Please contact support.",
+        ), 500
+
+    token_hash = _token_hash(token)
+    try:
+        res = (
+            sb_admin.table("report_shares")
+            .select("id,expires_at")
+            .eq("verify_token_hash", token_hash)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
+
+        row = rows[0]
+        exp_dt = _parse_iso_datetime(row.get("expires_at")) if row.get("expires_at") else None
+        if exp_dt and exp_dt < datetime.now(timezone.utc):
+            return render_template("verify_email_share.html", message="Verification link is expired."), 400
+
+        sb_admin.table("report_shares").update(
+            {
+                "is_verified": True,
+                "verified_at": datetime.now(timezone.utc).isoformat(),
+                "verify_token_hash": None,
+            }
+        ).eq("id", row["id"]).execute()
+        return render_template("verify_email_share.html", message="Recipient verified successfully. The sender can now deliver the report."), 200
+    except Exception:
+        app.logger.exception("Report share verification failed")
+        return render_template("verify_email_share.html", message="Verification failed. Please try again later."), 500
 
 
 # ---------- SEND VIA WHATSAPP (Twilio Sandbox) ----------
