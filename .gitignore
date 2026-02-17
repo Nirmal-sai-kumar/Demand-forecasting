@@ -35,6 +35,19 @@ Thumbs.db
 *.log
 
 # OPTIONAL: ignore generated artifacts (uncomment if you don't want to commit them)
-# model/
-# graphs/
-# downloads/
+
+# Generated runtime artifacts (safe to regenerate)
+downloads/
+graphs/
+
+# Training outputs / local experiments
+train_*.txt
+training_output.log
+
+# Datasets used for local testing (avoid committing user data)
+dataset/*.xlsx
+dataset/*.xls
+dataset/*.csv
+
+# Model artifacts generated locally
+model/*.joblib
