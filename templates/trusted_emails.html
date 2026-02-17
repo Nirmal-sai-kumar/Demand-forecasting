@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Trusted Emails</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #f4f6f8; }
+    .navbar { background: #2c3e50; padding: 15px 25px; color: white; display: flex; justify-content: space-between; align-items: center; }
+    .navbar a { color: white; text-decoration: none; font-weight: bold; margin-left: 15px; }
+    .wrap { max-width: 900px; margin: 30px auto; padding: 0 16px; }
+    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0px 6px 15px rgba(0,0,0,0.1); }
+    h1 { margin-top: 0; color: #2c3e50; }
+    .row { display: flex; gap: 10px; align-items: center; }
+    input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 6px; }
+    button { padding: 10px 14px; border: 0; border-radius: 6px; background: #2c3e50; color: white; font-weight: bold; cursor: pointer; }
+    button:disabled { opacity: 0.7; cursor: not-allowed; }
+    .hint { color: #555; margin-top: 10px; }
+    .status { margin-top: 12px; font-weight: bold; color: #2c3e50; }
+    table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+    th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
+    th { background: #ecf0f1; }
+  </style>
+</head>
+<body>
+  <div class="navbar">
+    <div><strong>Retail Demand Forecasting</strong> — Trusted Emails</div>
+    <div>
+      <a href="/home">Upload</a>
+      <a href="/logout">Logout</a>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="card">
+      <h1>Trusted emails</h1>
+      <div class="row">
+        <input id="email" type="email" placeholder="name@example.com" autocomplete="email" />
+        <button id="add">Send verification</button>
+      </div>
+      <div class="hint">
+        Verified trusted emails can receive reports without the one-time share verification.
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+
+      <table aria-label="Trusted emails">
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>Verified</th>
+            <th>Added</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="3">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    const emailEl = document.getElementById('email');
+    const addBtn = document.getElementById('add');
+    const statusEl = document.getElementById('status');
+    const rowsEl = document.getElementById('rows');
+
+    function setStatus(msg) {
+      statusEl.textContent = msg || '';
+    }
+
+    function render(items) {
+      rowsEl.innerHTML = '';
+      if (!items || !items.length) {
+        rowsEl.innerHTML = '<tr><td colspan="3">No trusted emails yet.</td></tr>';
+        return;
+      }
+      for (const it of items) {
+        const tr = document.createElement('tr');
+        const verified = it.is_verified ? 'Yes' : 'No';
+        const created = it.created_at ? String(it.created_at).replace('T', ' ').replace('Z','') : '';
+        tr.innerHTML = `<td>${it.email || ''}</td><td>${verified}</td><td>${created}</td>`;
+        rowsEl.appendChild(tr);
+      }
+    }
+
+    async function load() {
+      setStatus('');
+      const res = await fetch('/api/trusted-emails', { method: 'GET' });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setStatus((data && data.message) ? data.message : 'Failed to load trusted emails.');
+        rowsEl.innerHTML = '<tr><td colspan="3">Failed to load.</td></tr>';
+        return;
+      }
+      render((data && data.items) ? data.items : []);
+    }
+
+    addBtn.addEventListener('click', async function () {
+      const email = (emailEl.value || '').trim();
+      if (!email) return;
+
+      addBtn.disabled = true;
+      setStatus('Sending verification…');
+      try {
+        const res = await fetch('/api/trusted-emails', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+        const data = await res.json().catch(() => null);
+        const msg = (data && data.message) ? data.message : (res.ok ? 'Sent.' : 'Failed.');
+        setStatus(msg);
+        if (res.ok) {
+          emailEl.value = '';
+          await load();
+        }
+      } finally {
+        addBtn.disabled = false;
+      }
+    });
+
+    load();
+  })();
+  </script>
+</body>
+</html>
