@@ -13,3 +13,6 @@ email-validator
 supabase
 gunicorn
 twilio
+redis
+cryptography
+pypdf
