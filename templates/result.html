@@ -365,9 +365,9 @@
             return;
         }
 
-        // Optional password protection: sends two separate protected files (PDF + Excel ZIP).
+        // Optional password protection: sends two separate protected files (PDF + Excel).
         let pdf_password = '';
-        const wantsPassword = window.confirm('Protect the report files with a password? (Sends PDF + Excel ZIP as separate files to WhatsApp)');
+        const wantsPassword = window.confirm('Protect the report files with a password? (Sends PDF + Excel as separate files to WhatsApp)');
         if (wantsPassword) {
             pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
             if (!pdf_password) {
