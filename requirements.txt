@@ -16,4 +16,4 @@ twilio
 redis
 cryptography
 pypdf
-pyzipper
+pyzipper>=0.3.6
