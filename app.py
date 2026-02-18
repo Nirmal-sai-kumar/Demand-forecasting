@@ -392,6 +392,32 @@ def _cooldown_block(key: str, cooldown_seconds: int) -> bool:
     return False
 
 
+def _cooldown_is_active(key: str) -> bool:
+    """Return True if cooldown is active without mutating state."""
+    backend = _pw_store_backend()
+    k = "cd:" + key
+    try:
+        return bool(backend.get(k))
+    except Exception:
+        return False
+
+
+def _cooldown_start(key: str, cooldown_seconds: int) -> None:
+    """Start cooldown best-effort."""
+    backend = _pw_store_backend()
+    k = "cd:" + key
+    try:
+        if hasattr(backend, "set") and hasattr(backend, "setnx"):
+            backend.set(k, b"1", nx=True, ex=int(cooldown_seconds))
+            return
+    except Exception:
+        return
+    try:
+        backend.set(k, b"1", int(cooldown_seconds))
+    except Exception:
+        return
+
+
 def _is_password_compromised_pwned(password: str) -> bool | None:
     """Check HaveIBeenPwned Passwords API (k-anonymity).
 
@@ -724,20 +750,94 @@ def _supabase_table_get_single(sb, table: str, filters: dict) -> dict | None:
 def _trusted_email_is_verified(owner_id: str, email: str, access_token: str) -> bool:
     if UNIT_TESTING:
         return False
-    sb = get_supabase(access_token)
-    row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": email})
-    return bool(row and row.get("is_verified"))
+    recipient = (email or "").strip().lower()
+    if not recipient:
+        return False
+
+    def _query(sb) -> dict | None:
+        # Prefer exact match, then case-insensitive match (if supported by client).
+        row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": recipient})
+        if row:
+            return row
+        try:
+            res = (
+                sb.table("trusted_emails")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .ilike("email", recipient)
+                .limit(1)
+                .execute()
+            )
+            data = getattr(res, "data", None)
+            if isinstance(data, list) and data:
+                return data[0]
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return None
+        return None
+
+    # First try user-scoped client.
+    try:
+        sb = get_supabase(access_token)
+        row = _query(sb)
+        return bool(row and row.get("is_verified"))
+    except Exception:
+        # If the access token is expired/invalid on Render, fall back to the admin client.
+        # We still filter by owner_id, so this remains scoped.
+        try:
+            sb_admin = get_supabase_admin()
+            row = _query(sb_admin)
+            return bool(row and row.get("is_verified"))
+        except Exception:
+            return False
 
 
 def _report_share_is_verified(owner_id: str, report_id: str, recipient_email: str, access_token: str) -> bool:
     if UNIT_TESTING:
         return False
-    sb = get_supabase(access_token)
-    row = _supabase_table_get_single(
-        sb,
-        "report_shares",
-        {"owner_id": owner_id, "report_id": report_id, "recipient_email": recipient_email},
-    )
+    recipient = (recipient_email or "").strip().lower()
+    if not recipient:
+        return False
+
+    def _query(sb) -> dict | None:
+        row = _supabase_table_get_single(
+            sb,
+            "report_shares",
+            {"owner_id": owner_id, "report_id": report_id, "recipient_email": recipient},
+        )
+        if row:
+            return row
+        # Case-insensitive fallback if supported.
+        try:
+            res = (
+                sb.table("report_shares")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .eq("report_id", report_id)
+                .ilike("recipient_email", recipient)
+                .limit(1)
+                .execute()
+            )
+            data = getattr(res, "data", None)
+            if isinstance(data, list) and data:
+                return data[0]
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return None
+        return None
+
+    try:
+        sb = get_supabase(access_token)
+        row = _query(sb)
+    except Exception:
+        try:
+            sb_admin = get_supabase_admin()
+            row = _query(sb_admin)
+        except Exception:
+            row = None
+
     if not row:
         return False
     if not row.get("is_verified"):
@@ -757,19 +857,57 @@ def _report_share_recipient_is_verified_any(owner_id: str, recipient_email: str,
     """
     if UNIT_TESTING:
         return False
-    sb = get_supabase(access_token)
-    try:
+    recipient = (recipient_email or "").strip().lower()
+    if not recipient:
+        return False
+
+    def _query_any(sb) -> bool:
         res = (
             sb.table("report_shares")
             .select("id,is_verified")
             .eq("owner_id", owner_id)
-            .eq("recipient_email", recipient_email)
             .eq("is_verified", True)
             .limit(1)
-            .execute()
         )
-        rows = getattr(res, "data", None) or []
-        return bool(rows)
+        # Prefer exact; fall back to ilike when available.
+        try:
+            res = res.eq("recipient_email", recipient)
+        except Exception:
+            pass
+        try:
+            res2 = res.execute()
+            rows = getattr(res2, "data", None) or []
+            if rows:
+                return True
+        except Exception:
+            pass
+
+        try:
+            res3 = (
+                sb.table("report_shares")
+                .select("id,is_verified")
+                .eq("owner_id", owner_id)
+                .eq("is_verified", True)
+                .ilike("recipient_email", recipient)
+                .limit(1)
+                .execute()
+            )
+            rows = getattr(res3, "data", None) or []
+            return bool(rows)
+        except Exception:
+            return False
+
+    # First user-scoped, then admin fallback.
+    try:
+        sb = get_supabase(access_token)
+        if _query_any(sb):
+            return True
+    except Exception:
+        pass
+
+    try:
+        sb_admin = get_supabase_admin()
+        return _query_any(sb_admin)
     except Exception:
         return False
 
@@ -2945,15 +3083,7 @@ def email_pdf():
             if "cooldown" in msg:
                 return jsonify({"ok": False, "message": "Please wait before sending another verification email to this recipient."}), 429
             if "password_protection_not_configured" in msg or "password_storage_unavailable" in msg:
-                # Graceful fallback: still allow the verification flow.
-                # We simply cannot remember/store the password across steps.
-                # The sender must re-enter the password when re-sending after verification.
-                try:
-                    _create_or_refresh_report_share_verification(sender.id, report_id, email, access_token, pdf_password=None)
-                except Exception:
-                    app.logger.exception("Failed initiating recipient verification (fallback)")
-                    return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
-
+                # Verification email was sent, but the password could not be stored for later.
                 _audit_event_best_effort(
                     "share_verification_sent_password_not_stored",
                     owner_id=sender.id,
@@ -3292,13 +3422,21 @@ def _create_or_refresh_report_share_verification(
     if _rate_limit_hit(rl_key, VERIFY_EMAIL_RATE_LIMIT, VERIFY_EMAIL_RATE_WINDOW_SECONDS):
         raise RuntimeError("rate_limited")
     cd_key = f"verify_share_cd:{owner_id}:{recipient_email.lower().strip()}"
-    if _cooldown_block(cd_key, RECIPIENT_COOLDOWN_SECONDS):
+    # Important: do NOT start cooldown until after the verification email is actually sent.
+    if _cooldown_is_active(cd_key):
         raise RuntimeError("cooldown")
+
+    recipient_email = (recipient_email or "").strip().lower()
+    password_stored = True
 
     # If sender requested password protection, store password encrypted in short-lived storage.
     # Never persist the plaintext in the database.
     if pdf_password:
-        _store_share_pdf_password(owner_id, report_id, recipient_email, pdf_password)
+        try:
+            _store_share_pdf_password(owner_id, report_id, recipient_email, pdf_password)
+        except Exception:
+            # Do not block verification email if password storage is unavailable.
+            password_stored = False
 
     token = _new_verify_token()
     token_hash = _token_hash(token)
@@ -3340,6 +3478,92 @@ def _create_or_refresh_report_share_verification(
         "If you did not expect this, you can ignore this message."
     )
     _send_email_plain_sendgrid(recipient_email, subject, body)
+
+    # Start cooldown only after the email send succeeds.
+    _cooldown_start(cd_key, RECIPIENT_COOLDOWN_SECONDS)
+
+    if pdf_password and not password_stored:
+        # Preserve previous behavior for callers that want to message the sender.
+        raise RuntimeError("password_storage_unavailable")
+
+
+def _load_report_from_cache(report_id: str) -> dict:
+    rid = _parse_report_id(report_id)
+    if not rid:
+        raise FileNotFoundError("invalid_report_id")
+    report_path = os.path.join(DOWNLOAD_DIR, f"{rid}.json")
+    with open(report_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _deliver_cached_report_via_email(
+    recipient_email: str,
+    report_id: str,
+    owner_id: str | None,
+    pdf_password: str | None = None,
+) -> None:
+    """Deliver report email using cached report JSON (no session required)."""
+    report = _load_report_from_cache(report_id)
+
+    pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
+    xlsx_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
+    filename_pdf = f"retail_forecast_report_{report_id}.pdf"
+    filename_xlsx = f"retail_forecast_report_{report_id}.xlsx"
+
+    try:
+        _build_pdf_report_file(report, pdf_path)
+        _build_excel_report_file(report, xlsx_path)
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+        with open(xlsx_path, "rb") as f:
+            xlsx_bytes = f.read()
+
+        pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
+        subject = "Demand Forecasting Report"
+
+        if pdf_password:
+            pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
+            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
+            if xlsx_open_pw_bytes:
+                body = "Attached are your password-protected report files (PDF and Excel)."
+                delivered_kind = "pdf+xlsx_openpw"
+                attachments = [
+                    (filename_pdf, "application/pdf", pdf_bytes),
+                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_open_pw_bytes),
+                ]
+            else:
+                protected_xlsx_bytes = _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
+                body = "Attached are your password-protected report files (PDF and Excel)."
+                delivered_kind = "pdf+xlsx_editpw"
+                attachments = [
+                    (filename_pdf, "application/pdf", pdf_bytes),
+                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", protected_xlsx_bytes),
+                ]
+        else:
+            body = "Attached are your Retail Demand Forecasting report files (PDF and Excel)."
+            delivered_kind = "pdf+xlsx"
+            attachments = [
+                (filename_pdf, "application/pdf", pdf_bytes),
+                (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_bytes),
+            ]
+
+        _send_email_with_attachments_sendgrid(recipient_email, subject, body, attachments)
+        _audit_event_best_effort(
+            "report_delivered_auto",
+            owner_id=owner_id,
+            actor_email=None,
+            recipient_email=recipient_email,
+            report_id=report_id,
+            meta={"password_protected": bool(pdf_password), "delivered": delivered_kind},
+        )
+    finally:
+        try:
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+            if os.path.exists(xlsx_path):
+                os.remove(xlsx_path)
+        except OSError:
+            pass
 
 
 def _audit_event_best_effort(
@@ -3495,13 +3719,6 @@ def api_report_shares_create():
         if "cooldown" in msg:
             return jsonify({"ok": False, "message": "Please wait before sending another verification email to this recipient."}), 429
         if "password_protection_not_configured" in msg or "password_storage_unavailable" in msg:
-            # Graceful fallback: still allow verification email, but do not store password.
-            try:
-                _create_or_refresh_report_share_verification(user.id, report_id, email, access_token, pdf_password=None)
-            except Exception:
-                app.logger.exception("Failed initiating report share verification (fallback)")
-                return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
-
             _audit_event_best_effort(
                 "share_verification_sent_password_not_stored",
                 owner_id=user.id,
@@ -3718,7 +3935,43 @@ def verify_report_share():
             report_id=(row.get("report_id") or None),
             meta={"row_id": row["id"]},
         )
-        return render_template("verify_email_share.html", message="Recipient verified successfully. The sender can now deliver the report."), 200
+
+        # Auto-deliver the report after verification (best-effort).
+        try:
+            owner_id = str(row.get("owner_id") or "").strip() or None
+            report_id = _parse_report_id(row.get("report_id"))
+            recipient_email = (row.get("recipient_email") or "").strip().lower()
+
+            if owner_id and report_id and recipient_email:
+                # If password protection was requested, only deliver automatically if we still
+                # have the password in short-lived storage.
+                password_required = _share_password_was_requested(owner_id, report_id, recipient_email)
+                stored_pw = _get_share_pdf_password(owner_id, report_id, recipient_email)
+                if password_required and not stored_pw:
+                    return render_template(
+                        "verify_email_share.html",
+                        message="Recipient verified successfully. The report will be delivered by the sender (password is required and must be re-sent).",
+                    ), 200
+
+                _deliver_cached_report_via_email(recipient_email, report_id, owner_id, pdf_password=stored_pw or None)
+                return render_template(
+                    "verify_email_share.html",
+                    message="Recipient verified successfully. The report has been sent to your email.",
+                ), 200
+        except FileNotFoundError:
+            # Report cache may have been cleaned up.
+            return render_template(
+                "verify_email_share.html",
+                message="Recipient verified successfully, but the report is no longer available. Please ask the sender to resend.",
+            ), 200
+        except Exception:
+            app.logger.exception("Auto-delivery after share verification failed")
+            return render_template(
+                "verify_email_share.html",
+                message="Recipient verified successfully, but automatic delivery failed. Please ask the sender to resend.",
+            ), 200
+
+        return render_template("verify_email_share.html", message="Recipient verified successfully."), 200
     except Exception:
         app.logger.exception("Report share verification failed")
         _audit_event_best_effort(
