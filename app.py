@@ -505,7 +505,35 @@ def _encrypt_zip_bytes(attachments: list[tuple[str, bytes]], password: str, mode
     if mode_norm not in {"aes", "zipcrypto"}:
         raise RuntimeError("invalid_zip_encryption_mode")
 
-    encryption = pyzipper.WZ_AES if mode_norm == "aes" else pyzipper.ZIP_CRYPTO
+    def _resolve_pyzipper_encryption(mode_name: str):
+        # pyzipper API differs by version. Some builds expose ZIP_CRYPTO on
+        # `pyzipper`, others only on `pyzipper.zipfile`.
+        if mode_name == "aes":
+            return getattr(pyzipper, "WZ_AES", None)
+
+        # ZipCrypto
+        if hasattr(pyzipper, "ZIP_CRYPTO"):
+            return getattr(pyzipper, "ZIP_CRYPTO")
+        try:
+            import pyzipper.zipfile as _pzf  # type: ignore
+
+            if hasattr(_pzf, "ZIP_CRYPTO"):
+                return getattr(_pzf, "ZIP_CRYPTO")
+        except Exception:
+            pass
+
+        # If ZipCrypto isn't available in this pyzipper build, return None.
+        return None
+
+    encryption = _resolve_pyzipper_encryption(mode_norm)
+    if encryption is None:
+        if mode_norm == "zipcrypto":
+            # Prefer working delivery over hard-failing on servers with older pyzipper.
+            # NOTE: Windows Explorer cannot extract AES-encrypted ZIPs; users may need 7-Zip.
+            app.logger.warning("ZipCrypto encryption not available in pyzipper; falling back to AES ZIP")
+            encryption = _resolve_pyzipper_encryption("aes")
+        if encryption is None:
+            raise RuntimeError("zip_encryption_unavailable")
 
     out = io.BytesIO()
     with pyzipper.AESZipFile(out, "w", compression=pyzipper.ZIP_DEFLATED, encryption=encryption) as zf:
@@ -1036,6 +1064,14 @@ def _is_valid_whatsapp_number(value: str | None) -> bool:
 def _public_https_base_url_or_none() -> str | None:
     base = (CONFIG.public_https_base_url or "").strip().rstrip("/")
     if not base:
+        # On deployed environments (e.g., Render + custom domains), we can often infer the
+        # correct public HTTPS base URL from the incoming request.
+        try:
+            inferred = (getattr(request, "url_root", "") or "").strip().rstrip("/")
+        except Exception:
+            inferred = ""
+        if inferred.lower().startswith("https://"):
+            return inferred
         return None
     if not base.lower().startswith("https://"):
         return None
