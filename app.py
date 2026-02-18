@@ -2990,7 +2990,7 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
     Backward compatible name: route paths still reference /email/pdf.
     If a password is provided, we send 2 attachments:
     - password-protected PDF (PDF encryption)
-    - password-protected Excel ZIP (AES-encrypted ZIP containing the XLSX)
+    - password-protected Excel (password-to-open on Windows+Excel when available; otherwise edit-protected XLSX)
     """
     try:
         report = _load_report_from_session()
@@ -3027,15 +3027,15 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
                     (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_open_pw_bytes),
                 ]
             else:
-                # Fallback: send Excel inside a password-protected ZIP (ZipCrypto for Windows compatibility).
-                excel_zip_bytes = _encrypt_zip_bytes([(filename_xlsx, xlsx_bytes)], pdf_password, mode="zipcrypto")
-                excel_zip_name = f"retail_forecast_report_{report_id}.xlsx.zip"
+                # Fallback: OpenPyXL cannot do password-to-open encryption, but we can still
+                # apply worksheet/workbook protection (edits require password).
+                protected_xlsx_bytes = _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
 
-                body = "Attached are your password-protected report files (PDF and Excel ZIP)."
-                delivered_kind = "pdf+excel_zip_pw"
+                body = "Attached are your password-protected report files (PDF and Excel)."
+                delivered_kind = "pdf+xlsx_editpw"
                 attachments = [
                     (filename_pdf, "application/pdf", pdf_bytes),
-                    (excel_zip_name, "application/zip", excel_zip_bytes),
+                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", protected_xlsx_bytes),
                 ]
         else:
             body = "Attached are your Retail Demand Forecasting report files (PDF and Excel)."
@@ -3062,7 +3062,7 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
         if "pdf_encryption_unavailable" in msg:
             return jsonify({"ok": False, "message": "PDF encryption is not available on the server."}), 503
-        if "zip_encryption_unavailable" in msg:
+        if "zip_encryption_unavailable" in msg or "xlsx_protection_unavailable" in msg:
             return jsonify({"ok": False, "message": "Excel password protection is not available on the server."}), 503
         app.logger.exception("Failed sending report email")
         _audit_event_best_effort(
@@ -3819,26 +3819,24 @@ def send_whatsapp():
             with open(protected_pdf_path, "wb") as f:
                 f.write(protected_pdf_bytes)
 
-            # Create a password-protected ZIP for the Excel as its own public file.
-            # (WhatsApp can't deliver a true password-to-open XLSX on Render/Linux.)
-            excel_zip_bytes = _encrypt_zip_bytes(
-                [(f"retail_forecast_report_{report_id}.xlsx", xlsx_bytes)],
-                pdf_password,
-                mode="zipcrypto",
-            )
-            excel_zip_name = f"public_{report_id}_xlsx.zip"
-            excel_zip_path = os.path.join(DOWNLOAD_DIR, excel_zip_name)
-            with open(excel_zip_path, "wb") as f:
-                f.write(excel_zip_bytes)
+            # Create a password-protected Excel as its own public file.
+            # Prefer password-to-open on Windows+Excel when available, otherwise fall back
+            # to edit-protected XLSX.
+            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
+            protected_xlsx_bytes = xlsx_open_pw_bytes or _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
+            protected_xlsx_name = f"public_{report_id}_pw.xlsx"
+            protected_xlsx_path = os.path.join(DOWNLOAD_DIR, protected_xlsx_name)
+            with open(protected_xlsx_path, "wb") as f:
+                f.write(protected_xlsx_bytes)
 
             protected_pdf_url = f"{public_base}/files/{protected_pdf_name}"
-            excel_zip_url = f"{public_base}/files/{excel_zip_name}"
+            protected_xlsx_url = f"{public_base}/files/{protected_xlsx_name}"
 
             # Send as two separate WhatsApp messages for compatibility.
             sid_pdf = _send_whatsapp_media_twilio(number, protected_pdf_url, "Your password-protected Report (PDF)")
             app.logger.info("Twilio WhatsApp protected PDF sent sid=%s to=%s", sid_pdf, number)
-            sid_xlsx = _send_whatsapp_media_twilio(number, excel_zip_url, "Your password-protected Report (Excel ZIP)")
-            app.logger.info("Twilio WhatsApp protected Excel ZIP sent sid=%s to=%s", sid_xlsx, number)
+            sid_xlsx = _send_whatsapp_media_twilio(number, protected_xlsx_url, "Your password-protected Report (Excel)")
+            app.logger.info("Twilio WhatsApp protected Excel sent sid=%s to=%s", sid_xlsx, number)
             sids = [sid_pdf, sid_xlsx]
         else:
             pdf_url = f"{public_base}/files/public_{report_id}.pdf"
@@ -3871,8 +3869,8 @@ def send_whatsapp():
             return jsonify({"ok": False, "message": "WhatsApp service is not configured on the server."}), 500
         if "missing_twilio_sdk" in msg:
             return jsonify({"ok": False, "message": "WhatsApp service is unavailable on the server."}), 500
-        if "zip_encryption_unavailable" in msg:
-            return jsonify({"ok": False, "message": "Password-protected ZIP is not available on the server."}), 503
+        if "zip_encryption_unavailable" in msg or "xlsx_protection_unavailable" in msg:
+            return jsonify({"ok": False, "message": "Excel password protection is not available on the server."}), 503
         return jsonify({"ok": False, "message": _twilio_error_to_user_message(e)}), 500
 
 if __name__ == "__main__":
