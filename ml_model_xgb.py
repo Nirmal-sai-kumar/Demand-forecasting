@@ -1,6 +1,5 @@
 import os
 
-import joblib
 import matplotlib
 import numpy as np
 import pandas as pd
@@ -21,13 +20,13 @@ This script supports two modes:
 
 1) Multivariate (recommended): uses store/product + price/promo + calendar features
     if the dataset contains the required columns.
-    Output model: model/xgb_model_multifeature.joblib
+    Output model: model/xgb_model_multifeature.json
 
 2) Legacy univariate: uses only lag/rolling features from units_sold.
-    Output model: model/xgb_model.joblib
+    Output model: model/xgb_model.json
 
-Note: The Flask app defaults to model/xgb_model.joblib. To use the multivariate
-model, set MODEL_PATH to the multifeature joblib and update app feature
+Note: The Flask app defaults to model/xgb_model.json. To use the multivariate
+model, set MODEL_PATH to the multifeature json and update app feature
 engineering accordingly.
 """
 
@@ -227,7 +226,14 @@ plt.close()
 # -----------------------------
 os.makedirs("model", exist_ok=True)
 
-model_out = "model/xgb_model_multifeature.joblib" if has_multivariate else "model/xgb_model.joblib"
-joblib.dump(final_model, model_out)
+model_out = "model/xgb_model_multifeature.json" if has_multivariate else "model/xgb_model.json"
+
+# Use native XGBoost serialization to avoid cross-version pickle/joblib warnings.
+# If the trained object is a scikit Pipeline, persist only the XGBoost estimator.
+to_save = final_model
+if hasattr(final_model, "named_steps") and isinstance(getattr(final_model, "named_steps", None), dict):
+    to_save = final_model.named_steps.get("model", final_model)
+
+to_save.save_model(model_out)
 print(f"\nModel saved successfully: {model_out}")
 print("Graph saved successfully: graphs/xgb_graph.png")

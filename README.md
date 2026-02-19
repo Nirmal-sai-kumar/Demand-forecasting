@@ -49,7 +49,7 @@ SENDGRID_FROM=
 
 ### 4) Ensure the model exists (train if needed)
 
-The app loads the model from `model/xgb_model.joblib` by default. If that file is missing, train it:
+The app loads the model from `model/xgb_model.json` by default. If that file is missing, train it:
 
 ```powershell
 python ml_model_xgb.py
@@ -81,11 +81,11 @@ The training script reads `dataset/retail_sales_forecasting.xlsx` and requires a
 
 If the dataset also contains store/product + price/promo columns, the script will train a multivariate pipeline model and save:
 
-- `model/xgb_model_multifeature.joblib`
+- `model/xgb_model_multifeature.json`
 
 Otherwise it trains a legacy univariate model and saves:
 
-- `model/xgb_model.joblib`
+- `model/xgb_model.json`
 
 
 ## Supabase Auth Notes (Login/Register/Forgot Password)
@@ -118,7 +118,7 @@ The app reads configuration from environment variables (and `.env` for local dev
 - `SUPABASE_ANON_KEY` / `VITE_SUPABASE_ANON_KEY`: Supabase anon key
 - `APP_BASE_URL`: Base URL used to construct safe redirect URLs for Supabase email flows
 - `FLASK_SECRET_KEY`: Flask session secret (recommended for production session security)
-- `MODEL_PATH`: Optional override for the model joblib path (defaults to `model/xgb_model.joblib`)
+- `MODEL_PATH`: Optional override for the model path (defaults to `model/xgb_model.json`)
 - `RUNTIME_DIR`: Optional writable temp directory for graphs/downloads (defaults to OS temp)
 - `TREND_EPS`: Optional float threshold for trend labeling (default `0.01`)
 - `CLEANUP_MAX_AGE_HOURS`: Optional float age threshold for runtime cleanup (default `24`)
@@ -193,8 +193,8 @@ Retail_Demand_Forecasting/
 ├── downloads/
 ├── graphs/
 ├── model/
-│   ├── xgb_model.joblib
-│   └── xgb_model_multifeature.joblib
+│   ├── xgb_model.json
+│   └── xgb_model_multifeature.json
 └── templates/
     ├── index.html
     ├── login.html
