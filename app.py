@@ -21,12 +21,13 @@ from typing import List, Union, Optional
 from uuid import uuid4
 
 import numpy as np
+import xgboost as xgb
 
 # Keep app import lightweight during unit tests.
 UNIT_TESTING = os.getenv("UNIT_TESTING") == "1"
 
 import pandas as pd
-import joblib
+
 
 try:
     import redis  # type: ignore
@@ -1636,16 +1637,35 @@ def _build_pdf_report_file(report: dict, path: str) -> None:
     c.save()
 
 # ---------- LOAD MODEL ----------
-MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(BASE_DIR, "model", "xgb_model.joblib"))
+MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(BASE_DIR, "model", "xgb_model.json"))
 if os.getenv("SKIP_MODEL_LOAD") == "1":
     model = None
 else:
     if not os.path.exists(MODEL_PATH):
         raise RuntimeError(
             f"Missing model file: {MODEL_PATH}. "
-            "Commit model/xgb_model.joblib to the deployed branch, or set MODEL_PATH."
+            "Commit model/xgb_model.json to the deployed branch, or set MODEL_PATH."
         )
-    model = joblib.load(MODEL_PATH)
+
+    class _XgbBoosterPredictor:
+        def __init__(self, booster: "xgb.Booster") -> None:
+            self._booster = booster
+
+        def predict(self, X, validate_features: bool = True):
+            # Preserve existing API usage: callers pass a pandas DataFrame.
+            if isinstance(X, xgb.DMatrix):
+                dm = X
+            else:
+                feature_names = list(X.columns) if hasattr(X, "columns") else None
+                dm = xgb.DMatrix(X, feature_names=feature_names)
+            try:
+                return self._booster.predict(dm, validate_features=validate_features)
+            except TypeError:
+                return self._booster.predict(dm)
+
+    booster = xgb.Booster()
+    booster.load_model(MODEL_PATH)
+    model = _XgbBoosterPredictor(booster)
 
 
 # XGBoost can raise "data did not contain feature names" on some deployments
