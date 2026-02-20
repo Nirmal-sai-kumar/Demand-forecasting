@@ -11,20 +11,32 @@
             min-height: 100vh;
         }
 
+        body.theme-dark {
+            background: linear-gradient(to right, #1f4037, #2c3e50);
+        }
+
         .navbar {
             background: #2c3e50;
-            padding: 14px 22px;
+            padding: 15px 25px;
             color: white;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: nowrap;
+        }
+
+        .navbar > div:last-child {
+            display: flex;
+            align-items: center;
+            flex-wrap: nowrap;
         }
 
         .navbar a {
             color: white;
             text-decoration: none;
             font-weight: bold;
-            margin-left: 14px;
+            margin-left: 15px;
+            white-space: nowrap;
         }
 
         .navbar a:hover {
@@ -37,6 +49,132 @@
             text-decoration: none;
         }
 
+        .user-menu {
+            position: relative;
+            display: inline-block;
+            margin-left: 15px;
+        }
+
+        .user-trigger {
+            background: transparent;
+            border: 0;
+            color: white;
+            font-weight: bold;
+            font-family: inherit;
+            font-size: inherit;
+            cursor: pointer;
+            padding: 0;
+            margin: 0;
+            width: auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            line-height: 1;
+            white-space: nowrap;
+        }
+
+        .user-trigger:hover {
+            text-decoration: underline;
+        }
+
+        .user-trigger:focus {
+            outline: 2px solid #ecf0f1;
+            outline-offset: 4px;
+            border-radius: 6px;
+        }
+
+        .user-dropdown {
+            position: absolute;
+            right: 0;
+            top: calc(100% + 10px);
+            min-width: 190px;
+            background: white;
+            border: 1px solid #cfd8dc;
+            border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.18);
+            padding: 8px;
+            display: none;
+            z-index: 1000;
+        }
+
+        .user-dropdown a {
+            margin-left: 0;
+        }
+
+        .user-dropdown[data-open="true"] {
+            display: block;
+        }
+
+        .navbar .user-dropdown .user-item {
+            display: block;
+            padding: 10px 10px;
+            border-radius: 8px;
+            text-decoration: none;
+            color: #2c3e50;
+            font-weight: bold;
+        }
+
+        .navbar .user-dropdown button.user-item {
+            width: 100%;
+            margin-top: 0;
+            background: transparent;
+            border: 0;
+            text-align: left;
+            font-size: inherit;
+            cursor: pointer;
+        }
+
+        .navbar .user-dropdown .user-item:hover {
+            background: #f4f6f8;
+            text-decoration: none;
+        }
+
+        .user-item[aria-disabled="true"] {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+
+        .user-divider {
+            height: 1px;
+            background: #e3e6ea;
+            margin: 6px 4px;
+        }
+
+        .user-settings {
+            padding: 6px 8px 2px;
+            display: none;
+        }
+
+        .user-settings[data-open="true"] {
+            display: block;
+        }
+
+        .theme-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .theme-btn {
+            flex: 1;
+            padding: 9px 10px;
+            border-radius: 8px;
+            border: 1px solid #cfd8dc;
+            background: #ffffff;
+            color: #2c3e50;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 0;
+            width: auto;
+        }
+
+        .theme-btn:hover {
+            background: #f4f6f8;
+        }
+
+        .theme-btn[aria-pressed="true"] {
+            border-color: #2c3e50;
+        }
+
         .container {
             background: white;
             width: min(720px, 92vw);
@@ -47,16 +185,19 @@
             text-align: center;
         }
 
+
         h1 {
             color: #1f4037;
             margin-bottom: 10px;
         }
+
 
         p {
             color: #555;
             font-size: 15px;
             margin-bottom: 30px;
         }
+
 
         .hint {
             text-align: left;
@@ -87,6 +228,7 @@
             border: 1px solid #ccc;
             font-size: 14px;
         }
+
 
         button {
             width: 100%;
@@ -140,19 +282,6 @@
             display: none;
         }
 
-        .logout {
-            margin-top: 18px;
-        }
-
-        .logout a {
-            color: #1f4037;
-            font-weight: bold;
-            text-decoration: none;
-        }
-
-        .logout a:hover {
-            text-decoration: underline;
-        }
 
         .overlay {
             position: fixed;
@@ -206,11 +335,28 @@
 <div class="navbar">
     <div><strong>Retail Demand Forecasting</strong> — Dashboard</div>
     <div>
-        <a href="/home">Home</a>
         <a href="/home">Upload</a>
         <a href="#" aria-disabled="true" title="Generate a forecast to view results">Results</a>
         <a href="/trusted-emails/manage">Trusted Emails</a>
-        <a href="/logout">Logout</a>
+        {% set _email = (session.get('user_email') or 'User') %}
+        {% set _user_label = _email.split('@')[0] %}
+        <span class="user-menu">
+            <button type="button" class="user-trigger" id="userMenuBtn" aria-haspopup="true" aria-expanded="false">
+                👤 {{ _user_label }} ▾
+            </button>
+            <div class="user-dropdown" id="userMenuDropdown" role="menu" aria-label="User menu" data-open="false">
+                <a class="user-item" href="#" role="menuitem" aria-disabled="true">Profile</a>
+                <button type="button" class="user-item" id="userSettingsBtn" role="menuitem" aria-expanded="false">Settings</button>
+                <div class="user-settings" id="userSettingsPanel" data-open="false" aria-label="Theme settings">
+                    <div class="theme-row">
+                        <button type="button" class="theme-btn" id="themeLight" aria-pressed="false">Light mode</button>
+                        <button type="button" class="theme-btn" id="themeDark" aria-pressed="false">Dark mode</button>
+                    </div>
+                </div>
+                <div class="user-divider" role="separator" aria-hidden="true"></div>
+                <a class="user-item" href="/logout" role="menuitem">Logout</a>
+            </div>
+        </span>
     </div>
 </div>
 
@@ -249,10 +395,6 @@
         <a href="/register" style="font-weight:bold; color:#1f4037;">
             Register here
         </a>
-    </div>
-
-    <div class="logout">
-        <a href="/logout">Logout</a>
     </div>
 </div>
 
@@ -395,6 +537,96 @@
         form.dataset.submitted = '1';
         setProcessing(true);
     });
+})();
+</script>
+
+<script>
+(function () {
+    const btn = document.getElementById('userMenuBtn');
+    const menu = document.getElementById('userMenuDropdown');
+    const settingsBtn = document.getElementById('userSettingsBtn');
+    const settingsPanel = document.getElementById('userSettingsPanel');
+    const themeLight = document.getElementById('themeLight');
+    const themeDark = document.getElementById('themeDark');
+    if (!btn || !menu) return;
+
+    function closeMenu() {
+        menu.dataset.open = 'false';
+        btn.setAttribute('aria-expanded', 'false');
+        if (settingsPanel) settingsPanel.dataset.open = 'false';
+        if (settingsBtn) settingsBtn.setAttribute('aria-expanded', 'false');
+    }
+
+    function openMenu() {
+        menu.dataset.open = 'true';
+        btn.setAttribute('aria-expanded', 'true');
+    }
+
+    function toggleMenu() {
+        if (menu.dataset.open === 'true') closeMenu();
+        else openMenu();
+    }
+
+    btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleMenu();
+    });
+
+    function setTheme(theme) {
+        const t = (theme || '').toLowerCase() === 'dark' ? 'dark' : 'light';
+        try { localStorage.setItem('theme', t); } catch (e) {}
+        if (t === 'dark') document.body.classList.add('theme-dark');
+        else document.body.classList.remove('theme-dark');
+        if (themeLight) themeLight.setAttribute('aria-pressed', t === 'light' ? 'true' : 'false');
+        if (themeDark) themeDark.setAttribute('aria-pressed', t === 'dark' ? 'true' : 'false');
+    }
+
+    (function initTheme() {
+        let t = 'light';
+        try { t = localStorage.getItem('theme') || 'light'; } catch (e) {}
+        setTheme(t);
+    })();
+
+    if (settingsBtn && settingsPanel) {
+        settingsBtn.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const open = settingsPanel.dataset.open === 'true';
+            settingsPanel.dataset.open = open ? 'false' : 'true';
+            settingsBtn.setAttribute('aria-expanded', open ? 'false' : 'true');
+        });
+    }
+
+    if (themeLight) {
+        themeLight.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            setTheme('light');
+        });
+    }
+
+    if (themeDark) {
+        themeDark.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            setTheme('dark');
+        });
+    }
+
+    menu.addEventListener('click', function (e) {
+        e.stopPropagation();
+    });
+
+    document.addEventListener('click', function () {
+        closeMenu();
+    });
+
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') closeMenu();
+    });
+
+    closeMenu();
 })();
 </script>
 
