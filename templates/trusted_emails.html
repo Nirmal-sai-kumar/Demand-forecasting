@@ -7,6 +7,8 @@
     body { margin: 0; font-family: Arial, sans-serif; background: #f4f6f8; }
     .navbar { background: #2c3e50; padding: 15px 25px; color: white; display: flex; justify-content: space-between; align-items: center; }
     .navbar a { color: white; text-decoration: none; font-weight: bold; margin-left: 15px; }
+    .navbar a:hover { text-decoration: underline; }
+    .navbar a[aria-disabled="true"] { opacity: 0.7; pointer-events: none; text-decoration: none; }
     .wrap { max-width: 900px; margin: 30px auto; padding: 0 16px; }
     .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0px 6px 15px rgba(0,0,0,0.1); }
     h1 { margin-top: 0; color: #2c3e50; }
@@ -16,16 +18,26 @@
     button:disabled { opacity: 0.7; cursor: not-allowed; }
     .hint { color: #555; margin-top: 10px; }
     .status { margin-top: 12px; font-weight: bold; color: #2c3e50; }
-    table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0; font-size: 13px; }
     th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
     th { background: #ecf0f1; }
+
+    /* Zebra striping for readability */
+    tbody tr:nth-child(even) { background: #fafafa; }
+
+    /* Sticky header requires scroll container */
+    .table-scroll { max-height: 420px; overflow: auto; border: 1px solid #e3e6ea; border-radius: 10px; margin-top: 14px; }
+    thead th { position: sticky; top: 0; z-index: 2; }
   </style>
 </head>
 <body>
   <div class="navbar">
     <div><strong>Retail Demand Forecasting</strong> — Trusted Emails</div>
     <div>
+      <a href="/home">Home</a>
       <a href="/home">Upload</a>
+      <a href="#" aria-disabled="true" title="Generate a forecast to view results">Results</a>
+      <a href="/trusted-emails/manage">Trusted Emails</a>
       <a href="/logout">Logout</a>
     </div>
   </div>
@@ -42,18 +54,20 @@
       </div>
       <div id="status" class="status" role="status" aria-live="polite"></div>
 
-      <table aria-label="Trusted emails">
-        <thead>
-          <tr>
-            <th>Email</th>
-            <th>Verified</th>
-            <th>Added</th>
-          </tr>
-        </thead>
-        <tbody id="rows">
-          <tr><td colspan="3">Loading…</td></tr>
-        </tbody>
-      </table>
+      <div class="table-scroll" aria-label="Trusted emails table (scrollable)">
+        <table aria-label="Trusted emails">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Verified</th>
+              <th>Added</th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr><td colspan="3">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -64,8 +78,19 @@
     const statusEl = document.getElementById('status');
     const rowsEl = document.getElementById('rows');
 
-    function setStatus(msg) {
+    let statusTimer = null;
+    function setStatus(msg, autoClearMs) {
+      if (statusTimer) {
+        clearTimeout(statusTimer);
+        statusTimer = null;
+      }
       statusEl.textContent = msg || '';
+      if (msg && autoClearMs && Number.isFinite(autoClearMs)) {
+        statusTimer = setTimeout(() => {
+          statusEl.textContent = '';
+          statusTimer = null;
+        }, autoClearMs);
+      }
     }
 
     function render(items) {
@@ -108,12 +133,20 @@
           body: JSON.stringify({ email })
         });
         const data = await res.json().catch(() => null);
-        const msg = (data && data.message) ? data.message : (res.ok ? 'Sent.' : 'Failed.');
-        setStatus(msg);
-        if (res.ok) {
-          emailEl.value = '';
-          await load();
+
+        if (!res.ok) {
+          const errMsg = (data && data.message) ? data.message : 'Failed to send verification.';
+          setStatus(errMsg);
+          return;
         }
+
+        const okMsg = `Verification link sent to ${email}. Please check your inbox.`;
+
+        emailEl.value = '';
+        await load();
+        setStatus(okMsg, 6000);
+      } catch (e) {
+        setStatus('Failed to send verification. Please try again.');
       } finally {
         addBtn.disabled = false;
       }
