@@ -136,6 +136,7 @@
     <p>Login to access sales forecasting dashboard</p>
 
     <form method="POST" action="{{ url_for('login') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="text" name="username" placeholder="Email" required>
         <div class="password-wrap">
             <input type="password" id="pwd" name="password" placeholder="Password" required>
