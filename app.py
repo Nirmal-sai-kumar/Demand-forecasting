@@ -2333,8 +2333,57 @@ def login():
             # Don't block login if profile fetch fails, but don't fail silently.
             app.logger.warning("Profile fetch failed for user_id=%s", session.get('user_id'), exc_info=True)
 
+        # Fallback: derive a display name from email if profile username is missing.
+        if not (session.get('username') or '').strip():
+            em = (session.get('user_email') or '').strip()
+            if '@' in em:
+                session['username'] = em.split('@', 1)[0]
+
         return redirect(url_for('home'))
     return render_template("login.html")
+
+
+@app.route("/api/settings/display-name", methods=["POST"])
+def api_settings_display_name():
+    if not session.get('logged_in'):
+        return jsonify({"ok": False, "message": "Please login."}), 401
+
+    access_token = (session.get("access_token") or "").strip()
+    user_id = (session.get("user_id") or "").strip()
+    if not access_token or not user_id:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    raw_name = payload.get("username") or payload.get("display_name") or payload.get("name")
+    name = (raw_name or "").strip()
+
+    if not name:
+        return jsonify({"ok": False, "message": "Please enter a display name."}), 400
+    if len(name) < 2:
+        return jsonify({"ok": False, "message": "Display name is too short."}), 400
+    if len(name) > 32:
+        return jsonify({"ok": False, "message": "Display name is too long (max 32 characters)."}), 400
+    if any(ch in name for ch in ['\n', '\r', '\t']):
+        return jsonify({"ok": False, "message": "Display name contains invalid characters."}), 400
+
+    if UNIT_TESTING:
+        session['username'] = name
+        return jsonify({"ok": True, "username": name}), 200
+
+    try:
+        sb = get_supabase(access_token)
+
+        # Prefer update; if no row exists, attempt insert.
+        res = sb.table("profiles").update({"username": name}).eq("id", user_id).execute()
+        data = getattr(res, "data", None)
+        if isinstance(data, list) and len(data) == 0:
+            sb.table("profiles").insert({"id": user_id, "username": name}).execute()
+
+        session['username'] = name
+        return jsonify({"ok": True, "username": name}), 200
+    except Exception:
+        app.logger.exception("Failed updating display name")
+        return jsonify({"ok": False, "message": "Failed to update display name. Please try again."}), 500
 
 # ---------- REGISTER ----------
 @app.route('/register', methods=['GET', 'POST'])

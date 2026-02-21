@@ -342,8 +342,15 @@
                 <a href="#" aria-disabled="true" class="disabled">Results</a>
             {% endif %}
         <a href="/trusted-emails/manage">Trusted Emails</a>
-        {% set _email = (session.get('user_email') or 'User') %}
-        {% set _user_label = _email.split('@')[0] %}
+        {% set _username = (session.get('username') or '').strip() %}
+        {% set _email = (session.get('user_email') or '').strip() %}
+        {% if _username %}
+            {% set _user_label = _username %}
+        {% elif _email %}
+            {% set _user_label = _email.split('@')[0] %}
+        {% else %}
+            {% set _user_label = 'User' %}
+        {% endif %}
         <span class="user-menu">
             <button type="button" class="user-trigger" id="userMenuBtn" aria-haspopup="true" aria-expanded="false">
                 👤 {{ _user_label }} ▾
