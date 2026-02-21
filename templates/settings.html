@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Settings</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #f4f6f8; }
+    body.theme-dark { background: #2c3e50; }
+
+    .navbar { background: #2c3e50; padding: 15px 25px; color: white; display: flex; justify-content: space-between; align-items: center; flex-wrap: nowrap; }
+    .navbar > div:last-child { display: flex; align-items: center; }
+    .navbar a { color: white; text-decoration: none; font-weight: bold; margin-left: 15px; white-space: nowrap; }
+    .navbar a:hover { text-decoration: underline; }
+    .navbar a[aria-disabled="true"] { opacity: 0.7; pointer-events: none; text-decoration: none; }
+
+    .user-menu { position: relative; display: inline-block; margin-left: 15px; }
+    .user-trigger { background: transparent; border: 0; color: white; font-weight: bold; font-family: inherit; font-size: inherit; cursor: pointer; padding: 0; }
+    .user-trigger:hover { text-decoration: underline; }
+    .user-trigger:focus { outline: 2px solid #ecf0f1; outline-offset: 4px; border-radius: 6px; }
+    .user-dropdown { position: absolute; right: 0; top: calc(100% + 10px); min-width: 190px; background: white; border: 1px solid #cfd8dc; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.18); padding: 8px; display: none; z-index: 1000; }
+    .user-dropdown[data-open="true"] { display: block; }
+    .user-dropdown a { margin-left: 0; }
+    .navbar .user-dropdown .user-item { display: block; padding: 10px 10px; border-radius: 8px; text-decoration: none; color: #2c3e50; font-weight: bold; }
+    .navbar .user-dropdown .user-item:hover { background: #f4f6f8; text-decoration: none; }
+    .navbar .user-dropdown button.user-item { width: 100%; margin-top: 0; background: transparent; border: 0; text-align: left; font-size: inherit; cursor: pointer; }
+    .user-item[aria-disabled="true"] { opacity: 0.6; pointer-events: none; }
+    .user-divider { height: 1px; background: #e3e6ea; margin: 6px 4px; }
+
+    .wrap { max-width: 980px; margin: 30px auto; padding: 0 16px; }
+    .card { background: white; padding: 22px; border-radius: 10px; box-shadow: 0px 6px 15px rgba(0,0,0,0.1); }
+
+    h1 { margin-top: 0; color: #2c3e50; }
+    h2 { margin: 18px 0 10px; color: #2c3e50; font-size: 18px; }
+
+    .muted { color: #555; margin: 6px 0 0; }
+    .divider { height: 1px; background: #e3e6ea; margin: 18px 0; }
+
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .row > * { flex: 1; }
+
+    label { display: block; font-weight: bold; color: #2c3e50; margin-bottom: 6px; }
+
+    input[type="text"], input[type="password"], input[type="file"] {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      box-sizing: border-box;
+    }
+
+    .pw-field { position: relative; }
+    .pw-field input { padding-right: 44px; }
+    .pw-toggle {
+      position: absolute;
+      right: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 32px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border: 0;
+      background: transparent;
+      color: #2c3e50;
+      cursor: pointer;
+      padding: 0;
+      margin: 0;
+      border-radius: 6px;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .pw-toggle:hover { background: #f4f6f8; }
+    .pw-toggle:focus { outline: 2px solid #2c3e50; outline-offset: 2px; }
+
+    button {
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 6px;
+      background: #2c3e50;
+      color: white;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button.secondary { background: #ecf0f1; color: #2c3e50; border: 1px solid #cfd8dc; }
+    button.secondary:hover { background: #e6eaee; }
+
+    button:disabled { opacity: 0.7; cursor: not-allowed; }
+
+    .status { margin-top: 12px; font-weight: bold; color: #2c3e50; }
+    .status.error { color: #a40000; }
+
+    .theme-row { display: flex; gap: 10px; max-width: 420px; }
+    .theme-btn { flex: 1; border: 1px solid #cfd8dc; background: #ffffff; color: #2c3e50; }
+    .theme-btn[aria-pressed="true"] { border-color: #2c3e50; }
+
+    .otp-panel { display: none; margin-top: 10px; }
+    .otp-panel[data-open="true"] { display: block; }
+
+    .note { background: #f4f6f8; border-left: 4px solid #2c3e50; padding: 10px 12px; border-radius: 8px; color: #333; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="navbar">
+    <div><strong>Retail Demand Forecasting</strong> — Settings</div>
+    <div>
+      <a href="/home">Upload</a>
+      <a href="#" aria-disabled="true" title="Generate a forecast to view results">Results</a>
+      <a href="/trusted-emails/manage">Trusted Emails</a>
+      {% set _email = (session.get('user_email') or 'User') %}
+      {% set _user_label = _email.split('@')[0] %}
+      <span class="user-menu">
+        <button type="button" class="user-trigger" id="userMenuBtn" aria-haspopup="true" aria-expanded="false">
+          👤 {{ _user_label }} ▾
+        </button>
+        <div class="user-dropdown" id="userMenuDropdown" role="menu" aria-label="User menu" data-open="false">
+          <a class="user-item" href="/settings" role="menuitem">Settings</a>
+          <div class="user-divider" role="separator" aria-hidden="true"></div>
+          <a class="user-item" href="/logout" role="menuitem">Logout</a>
+        </div>
+      </span>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="card">
+      <h1>Settings</h1>
+      <p class="muted">Manage theme and security settings.</p>
+
+      <div class="divider"></div>
+
+      <h2>Theme</h2>
+      <div class="theme-row" role="group" aria-label="Theme">
+        <button type="button" class="theme-btn secondary" id="themeLight" aria-pressed="false">Light mode</button>
+        <button type="button" class="theme-btn secondary" id="themeDark" aria-pressed="false">Dark mode</button>
+      </div>
+
+      <div class="divider"></div>
+
+      <h2>Security</h2>
+      {% if not (session.get('email_verified')) %}
+        <div class="note">Verify your email to change your password.</div>
+      {% endif %}
+
+      <div class="row" style="margin-top: 12px;">
+        <div>
+          <label for="oldPassword">Old password</label>
+          <div class="pw-field">
+            <input id="oldPassword" type="password" autocomplete="current-password" {% if not (session.get('email_verified')) %}disabled{% endif %} />
+            <button type="button" class="pw-toggle" data-toggle-for="oldPassword" aria-label="Show password" title="Show password" {% if not (session.get('email_verified')) %}disabled{% endif %}>🙈</button>
+          </div>
+        </div>
+        <div></div>
+      </div>
+
+      <div class="row" style="margin-top: 12px;">
+        <div>
+          <label for="newPassword">New password</label>
+          <div class="pw-field">
+            <input id="newPassword" type="password" autocomplete="new-password" {% if not (session.get('email_verified')) %}disabled{% endif %} />
+            <button type="button" class="pw-toggle" data-toggle-for="newPassword" aria-label="Show password" title="Show password" {% if not (session.get('email_verified')) %}disabled{% endif %}>🙈</button>
+          </div>
+        </div>
+        <div>
+          <label for="confirmPassword">Confirm new password</label>
+          <div class="pw-field">
+            <input id="confirmPassword" type="password" autocomplete="new-password" {% if not (session.get('email_verified')) %}disabled{% endif %} />
+            <button type="button" class="pw-toggle" data-toggle-for="confirmPassword" aria-label="Show password" title="Show password" {% if not (session.get('email_verified')) %}disabled{% endif %}>🙈</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 12px;">
+        <div style="flex: 0 0 auto;">
+          <button id="sendOtpBtn" type="button" {% if not (session.get('email_verified')) %}disabled{% endif %}>Send OTP</button>
+        </div>
+        <div style="flex: 1;"></div>
+      </div>
+
+      <div class="otp-panel" id="otpPanel" data-open="false">
+        <div class="row" style="margin-top: 12px;">
+          <div>
+            <label for="otpCode">OTP code</label>
+            <input id="otpCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" {% if not (session.get('email_verified')) %}disabled{% endif %} />
+          </div>
+          <div style="flex: 0 0 auto; align-self: end;">
+            <button id="confirmPwBtn" type="button" {% if not (session.get('email_verified')) %}disabled{% endif %}>Confirm & update</button>
+          </div>
+        </div>
+        <p class="muted" style="margin: 8px 0 0;">We sent an OTP to your email. Enter it to confirm the password change.</p>
+      </div>
+
+      <div id="pwStatus" class="status" role="status" aria-live="polite"></div>
+
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    // Dropdown menu
+    const btn = document.getElementById('userMenuBtn');
+    const menu = document.getElementById('userMenuDropdown');
+    if (!btn || !menu) return;
+
+    function closeMenu() {
+      menu.dataset.open = 'false';
+      btn.setAttribute('aria-expanded', 'false');
+    }
+
+    function openMenu() {
+      menu.dataset.open = 'true';
+      btn.setAttribute('aria-expanded', 'true');
+    }
+
+    function toggleMenu() {
+      if (menu.dataset.open === 'true') closeMenu();
+      else openMenu();
+    }
+
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleMenu();
+    });
+
+    menu.addEventListener('click', function (e) {
+      e.stopPropagation();
+    });
+
+    document.addEventListener('click', function () {
+      closeMenu();
+    });
+
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeMenu();
+    });
+
+    closeMenu();
+  })();
+  </script>
+
+  <script>
+  (function () {
+    // Theme controls
+    const themeLight = document.getElementById('themeLight');
+    const themeDark = document.getElementById('themeDark');
+
+    function setTheme(theme) {
+      const t = (theme || '').toLowerCase() === 'dark' ? 'dark' : 'light';
+      try { localStorage.setItem('theme', t); } catch (e) {}
+      if (t === 'dark') document.body.classList.add('theme-dark');
+      else document.body.classList.remove('theme-dark');
+      if (themeLight) themeLight.setAttribute('aria-pressed', t === 'light' ? 'true' : 'false');
+      if (themeDark) themeDark.setAttribute('aria-pressed', t === 'dark' ? 'true' : 'false');
+    }
+
+    (function initTheme() {
+      let t = 'light';
+      try { t = localStorage.getItem('theme') || 'light'; } catch (e) {}
+      setTheme(t);
+    })();
+
+    if (themeLight) themeLight.addEventListener('click', function () { setTheme('light'); });
+    if (themeDark) themeDark.addEventListener('click', function () { setTheme('dark'); });
+  })();
+  </script>
+
+  <script>
+  (function () {
+    // Password visibility toggles
+    function setToggleState(btn, input) {
+      if (!btn || !input) return;
+      const isPw = input.type === 'password';
+      btn.setAttribute('aria-label', isPw ? 'Show password' : 'Hide password');
+      btn.setAttribute('title', isPw ? 'Show password' : 'Hide password');
+      btn.textContent = isPw ? '🙈' : '👀';
+    }
+
+    const toggles = Array.from(document.querySelectorAll('button.pw-toggle[data-toggle-for]'));
+    for (const btn of toggles) {
+      const id = btn.getAttribute('data-toggle-for');
+      const input = id ? document.getElementById(id) : null;
+      if (!input) continue;
+      setToggleState(btn, input);
+      btn.addEventListener('click', function () {
+        if (btn.disabled) return;
+        input.type = (input.type === 'password') ? 'text' : 'password';
+        setToggleState(btn, input);
+        try { input.focus(); } catch (e) {}
+      });
+    }
+
+    // Password + OTP
+    const oldEl = document.getElementById('oldPassword');
+    const newEl = document.getElementById('newPassword');
+    const confirmEl = document.getElementById('confirmPassword');
+    const otpEl = document.getElementById('otpCode');
+    const otpPanel = document.getElementById('otpPanel');
+    const sendBtn = document.getElementById('sendOtpBtn');
+    const confirmBtn = document.getElementById('confirmPwBtn');
+    const statusEl = document.getElementById('pwStatus');
+
+    function setStatus(msg, isError) {
+      if (!statusEl) return;
+      statusEl.textContent = msg || '';
+      statusEl.classList.toggle('error', !!isError);
+    }
+
+    function getVals() {
+      return {
+        old_password: (oldEl && oldEl.value) ? oldEl.value : '',
+        new_password: (newEl && newEl.value) ? newEl.value : '',
+        confirm_password: (confirmEl && confirmEl.value) ? confirmEl.value : '',
+      };
+    }
+
+    async function postJson(url, body) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+      });
+      const data = await res.json().catch(() => null);
+      return { res, data };
+    }
+
+    if (sendBtn) {
+      sendBtn.addEventListener('click', async function () {
+        setStatus('', false);
+        const v = getVals();
+        if (!v.old_password || !v.new_password || !v.confirm_password) {
+          setStatus('Please fill old password, new password and confirmation.', true);
+          return;
+        }
+        if (v.new_password !== v.confirm_password) {
+          setStatus('New password and confirmation do not match.', true);
+          return;
+        }
+
+        sendBtn.disabled = true;
+        setStatus('Sending OTP…', false);
+        try {
+          const { res, data } = await postJson('/api/settings/password/init', v);
+          if (!res.ok) {
+            setStatus((data && data.message) ? data.message : 'Failed to send OTP.', true);
+            return;
+          }
+          if (otpPanel) otpPanel.dataset.open = 'true';
+          setStatus((data && data.message) ? data.message : 'OTP sent to your email.', false);
+        } catch (e) {
+          setStatus('Failed to send OTP. Please try again.', true);
+        } finally {
+          sendBtn.disabled = false;
+        }
+      });
+    }
+
+    if (confirmBtn) {
+      confirmBtn.addEventListener('click', async function () {
+        setStatus('', false);
+        const v = getVals();
+        const otp = (otpEl && otpEl.value) ? otpEl.value.trim() : '';
+        if (!otp) {
+          setStatus('Please enter the OTP code.', true);
+          return;
+        }
+        if (!v.new_password || v.new_password !== v.confirm_password) {
+          setStatus('Please ensure new password and confirmation match.', true);
+          return;
+        }
+
+        confirmBtn.disabled = true;
+        setStatus('Updating password…', false);
+        try {
+          const { res, data } = await postJson('/api/settings/password/confirm', {
+            otp,
+            new_password: v.new_password,
+            confirm_password: v.confirm_password,
+          });
+          if (!res.ok) {
+            setStatus((data && data.message) ? data.message : 'Failed to update password.', true);
+            return;
+          }
+          setStatus((data && data.message) ? data.message : 'Password updated. Please login again.', false);
+          if (data && data.redirect_to) {
+            window.location.href = data.redirect_to;
+          }
+        } catch (e) {
+          setStatus('Failed to update password. Please try again.', true);
+        } finally {
+          confirmBtn.disabled = false;
+        }
+      });
+    }
+  })();
+  </script>
+
+</body>
+</html>

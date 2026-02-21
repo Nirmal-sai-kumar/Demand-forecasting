@@ -377,14 +377,7 @@
                 👤 {{ _user_label }} ▾
             </button>
             <div class="user-dropdown" id="userMenuDropdown" role="menu" aria-label="User menu" data-open="false">
-                <a class="user-item" href="#" role="menuitem" aria-disabled="true">Profile</a>
-                <button type="button" class="user-item" id="userSettingsBtn" role="menuitem" aria-expanded="false">Settings</button>
-                <div class="user-settings" id="userSettingsPanel" data-open="false" aria-label="Theme settings">
-                    <div class="theme-row">
-                        <button type="button" class="theme-btn" id="themeLight" aria-pressed="false">Light mode</button>
-                        <button type="button" class="theme-btn" id="themeDark" aria-pressed="false">Dark mode</button>
-                    </div>
-                </div>
+                <a class="user-item" href="/settings" role="menuitem">Settings</a>
                 <div class="user-divider" role="separator" aria-hidden="true"></div>
                 <a class="user-item" href="/logout" role="menuitem">Logout</a>
             </div>

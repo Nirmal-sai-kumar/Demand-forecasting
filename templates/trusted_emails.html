@@ -38,6 +38,13 @@
     input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 6px; }
     button { padding: 10px 14px; border: 0; border-radius: 6px; background: #2c3e50; color: white; font-weight: bold; cursor: pointer; }
     button:disabled { opacity: 0.7; cursor: not-allowed; }
+    button.del {
+      background: #e74c3c;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-weight: bold;
+    }
+    button.del:hover { background: #c0392b; }
     .hint { color: #555; margin-top: 10px; }
     .status { margin-top: 12px; font-weight: bold; color: #2c3e50; }
     table { width: 100%; border-collapse: collapse; margin-top: 0; font-size: 13px; }
@@ -66,14 +73,7 @@
           👤 {{ _user_label }} ▾
         </button>
         <div class="user-dropdown" id="userMenuDropdown" role="menu" aria-label="User menu" data-open="false">
-          <a class="user-item" href="#" role="menuitem" aria-disabled="true">Profile</a>
-          <button type="button" class="user-item" id="userSettingsBtn" role="menuitem" aria-expanded="false">Settings</button>
-          <div class="user-settings" id="userSettingsPanel" data-open="false" aria-label="Theme settings">
-            <div class="theme-row">
-              <button type="button" class="theme-btn" id="themeLight" aria-pressed="false">Light mode</button>
-              <button type="button" class="theme-btn" id="themeDark" aria-pressed="false">Dark mode</button>
-            </div>
-          </div>
+          <a class="user-item" href="/settings" role="menuitem">Settings</a>
           <div class="user-divider" role="separator" aria-hidden="true"></div>
           <a class="user-item" href="/logout" role="menuitem">Logout</a>
         </div>
@@ -100,10 +100,11 @@
               <th>Email</th>
               <th>Verified</th>
               <th>Added</th>
+              <th style="width: 90px;">Action</th>
             </tr>
           </thead>
           <tbody id="rows">
-            <tr><td colspan="3">Loading…</td></tr>
+            <tr><td colspan="4">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -132,17 +133,54 @@
       }
     }
 
+    async function deleteTrustedEmail(id, email) {
+      const tid = String(id || '').trim();
+      if (!tid) return;
+      const label = (email || '').trim() || 'this email';
+      const ok = confirm(`Delete ${label} from trusted emails?`);
+      if (!ok) return;
+
+      setStatus('Deleting…');
+      try {
+        const res = await fetch(`/api/trusted-emails/${encodeURIComponent(tid)}`, { method: 'DELETE' });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          setStatus((data && data.message) ? data.message : 'Failed to delete.');
+          return;
+        }
+        await load();
+        setStatus('Deleted.', 3000);
+      } catch (e) {
+        setStatus('Failed to delete. Please try again.');
+      }
+    }
+
     function render(items) {
       rowsEl.innerHTML = '';
       if (!items || !items.length) {
-        rowsEl.innerHTML = '<tr><td colspan="3">No trusted emails yet.</td></tr>';
+        rowsEl.innerHTML = '<tr><td colspan="4">No trusted emails yet.</td></tr>';
         return;
       }
       for (const it of items) {
         const tr = document.createElement('tr');
         const verified = it.is_verified ? 'Yes' : 'No';
         const created = it.created_at ? String(it.created_at).replace('T', ' ').replace('Z','') : '';
-        tr.innerHTML = `<td>${it.email || ''}</td><td>${verified}</td><td>${created}</td>`;
+        const safeEmail = it.email || '';
+        const canDelete = !!it.id;
+        tr.innerHTML = `
+          <td>${safeEmail}</td>
+          <td>${verified}</td>
+          <td>${created}</td>
+          <td style="text-align: center;">
+            <button type="button" class="del" ${canDelete ? '' : 'disabled'} title="Delete" aria-label="Delete">Delete</button>
+          </td>
+        `;
+        const btn = tr.querySelector('button.del');
+        if (btn && canDelete) {
+          btn.addEventListener('click', function () {
+            deleteTrustedEmail(it.id, it.email);
+          });
+        }
         rowsEl.appendChild(tr);
       }
     }
@@ -153,7 +191,7 @@
       const data = await res.json().catch(() => null);
       if (!res.ok) {
         setStatus((data && data.message) ? data.message : 'Failed to load trusted emails.');
-        rowsEl.innerHTML = '<tr><td colspan="3">Failed to load.</td></tr>';
+        rowsEl.innerHTML = '<tr><td colspan="4">Failed to load.</td></tr>';
         return;
       }
       render((data && data.items) ? data.items : []);
