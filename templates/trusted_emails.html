@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
   <title>Trusted Emails</title>
   <style>
     body { margin: 0; font-family: Arial, sans-serif; background: #f4f6f8; }
@@ -129,6 +130,11 @@
     const statusEl = document.getElementById('status');
     const rowsEl = document.getElementById('rows');
 
+    function getCsrfToken() {
+      const meta = document.querySelector('meta[name="csrf-token"]');
+      return meta ? (meta.getAttribute('content') || '') : '';
+    }
+
     let statusTimer = null;
     function setStatus(msg, autoClearMs) {
       if (statusTimer) {
@@ -153,7 +159,10 @@
 
       setStatus('Deleting…');
       try {
-        const res = await fetch(`/api/trusted-emails/${encodeURIComponent(tid)}`, { method: 'DELETE' });
+        const res = await fetch(`/api/trusted-emails/${encodeURIComponent(tid)}`, {
+          method: 'DELETE',
+          headers: { 'X-CSRF-Token': getCsrfToken() }
+        });
         const data = await res.json().catch(() => null);
         if (!res.ok) {
           setStatus((data && data.message) ? data.message : 'Failed to delete.');
@@ -167,31 +176,51 @@
     }
 
     function render(items) {
-      rowsEl.innerHTML = '';
+      while (rowsEl.firstChild) rowsEl.removeChild(rowsEl.firstChild);
       if (!items || !items.length) {
-        rowsEl.innerHTML = '<tr><td colspan="4">No trusted emails yet.</td></tr>';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 4;
+        td.textContent = 'No trusted emails yet.';
+        tr.appendChild(td);
+        rowsEl.appendChild(tr);
         return;
       }
       for (const it of items) {
         const tr = document.createElement('tr');
-        const verified = it.is_verified ? 'Yes' : 'No';
-        const created = it.created_at ? String(it.created_at).replace('T', ' ').replace('Z','') : '';
-        const safeEmail = it.email || '';
-        const canDelete = !!it.id;
-        tr.innerHTML = `
-          <td>${safeEmail}</td>
-          <td>${verified}</td>
-          <td>${created}</td>
-          <td style="text-align: center;">
-            <button type="button" class="del" ${canDelete ? '' : 'disabled'} title="Delete" aria-label="Delete">Delete</button>
-          </td>
-        `;
-        const btn = tr.querySelector('button.del');
-        if (btn && canDelete) {
+        const verified = it && it.is_verified ? 'Yes' : 'No';
+        const created = (it && it.created_at) ? String(it.created_at).replace('T', ' ').replace('Z','') : '';
+        const safeEmail = (it && it.email) ? String(it.email) : '';
+        const canDelete = !!(it && it.id);
+
+        const tdEmail = document.createElement('td');
+        tdEmail.textContent = safeEmail;
+        const tdVerified = document.createElement('td');
+        tdVerified.textContent = verified;
+        const tdCreated = document.createElement('td');
+        tdCreated.textContent = created;
+        const tdAction = document.createElement('td');
+        tdAction.style.textAlign = 'center';
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'del';
+        btn.title = 'Delete';
+        btn.setAttribute('aria-label', 'Delete');
+        btn.textContent = 'Delete';
+        if (!canDelete) {
+          btn.disabled = true;
+        } else {
           btn.addEventListener('click', function () {
             deleteTrustedEmail(it.id, it.email);
           });
         }
+        tdAction.appendChild(btn);
+
+        tr.appendChild(tdEmail);
+        tr.appendChild(tdVerified);
+        tr.appendChild(tdCreated);
+        tr.appendChild(tdAction);
         rowsEl.appendChild(tr);
       }
     }
@@ -202,7 +231,13 @@
       const data = await res.json().catch(() => null);
       if (!res.ok) {
         setStatus((data && data.message) ? data.message : 'Failed to load trusted emails.');
-        rowsEl.innerHTML = '<tr><td colspan="4">Failed to load.</td></tr>';
+        while (rowsEl.firstChild) rowsEl.removeChild(rowsEl.firstChild);
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 4;
+        td.textContent = 'Failed to load.';
+        tr.appendChild(td);
+        rowsEl.appendChild(tr);
         return;
       }
       render((data && data.items) ? data.items : []);
@@ -217,7 +252,7 @@
       try {
         const res = await fetch('/api/trusted-emails', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
           body: JSON.stringify({ email })
         });
         const data = await res.json().catch(() => null);
