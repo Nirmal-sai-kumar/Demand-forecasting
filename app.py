@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 from typing import List, Union, Optional
 from uuid import uuid4
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 import numpy as np
 import xgboost as xgb
 
@@ -137,6 +139,30 @@ else:
         raise RuntimeError("Supabase admin client is unavailable in UNIT_TESTING mode")
 
 logging.basicConfig(level=logging.INFO)
+
+
+def _is_production_env() -> bool:
+    """Return True when running in a deployed/public environment.
+
+    Render sets RENDER/RENDER_EXTERNAL_URL. For other hosts, use APP_ENV or FLASK_ENV.
+    """
+    env = (os.getenv("APP_ENV") or os.getenv("FLASK_ENV") or "").strip().lower()
+    if env in ("prod", "production"):
+        return True
+    if os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"):
+        return True
+    return False
+
+
+def _debug_enabled() -> bool:
+    """Enable debug locally, disable automatically in production."""
+    if _is_production_env():
+        return False
+    v = (os.getenv("FLASK_DEBUG") or "").strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    # Default: ON for local/dev environments.
+    return True
 
 # ---------- RUNTIME FOLDERS (writable on Render) ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -981,6 +1007,17 @@ class AppConfig:
                     return s
             return None
 
+        def _getenv_str(name: str) -> str:
+            """Read env var as a trimmed string.
+
+            On Windows, some editors save `.env` as UTF-8 with BOM which can cause
+            python-dotenv to load the key name with a leading BOM (\ufeff).
+            """
+            v = os.getenv(name)
+            if v is None:
+                v = os.getenv("\ufeff" + name)
+            return (v or "").strip()
+
         def _safe_float_env(name: str, default: float) -> float:
             raw = os.getenv(name)
             if raw is None:
@@ -1013,7 +1050,16 @@ class AppConfig:
             )
             or app_base_url
         ).rstrip("/")
-        flask_secret_key = os.getenv("FLASK_SECRET_KEY", "retail_secret_key")
+        flask_secret_key = _getenv_str("FLASK_SECRET_KEY")
+        if not flask_secret_key and not UNIT_TESTING:
+            raise RuntimeError(
+                "FLASK_SECRET_KEY is required. Set it as an environment variable (and do not commit it)."
+            )
+        # Enforce strong secrets for public deployments.
+        if flask_secret_key and len(flask_secret_key) < 32 and not UNIT_TESTING:
+            raise RuntimeError(
+                "FLASK_SECRET_KEY is too short. Use a long random value (>= 32 characters)."
+            )
         trend_eps = _safe_float_env("TREND_EPS", DEFAULT_TREND_EPS)
         cleanup_max_age_hours = _safe_float_env("CLEANUP_MAX_AGE_HOURS", DEFAULT_CLEANUP_MAX_AGE_HOURS)
 
@@ -1050,14 +1096,146 @@ app = Flask(__name__)
 app.static_folder = GRAPH_DIR
 app.secret_key = CONFIG.flask_secret_key
 
+# When behind a reverse proxy (Render), respect X-Forwarded-* for HTTPS detection.
+if _is_production_env():
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
 # Session cookie defaults (helps login sessions behave consistently)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    # Only mark session cookies as secure in production/HTTPS deployments.
+    SESSION_COOKIE_SECURE=_is_production_env(),
 )
 
 # Base URL for auth redirects
 APP_BASE_URL = CONFIG.app_base_url
+
+
+# ---------------- CSRF protection ----------------
+_CSRF_SESSION_KEY = "csrf_token"
+_CSRF_HEADER = "X-CSRF-Token"
+
+
+def _get_or_create_csrf_token() -> str:
+    token = session.get(_CSRF_SESSION_KEY)
+    if isinstance(token, str) and len(token) >= 32:
+        return token
+    token = secrets.token_urlsafe(32)
+    session[_CSRF_SESSION_KEY] = token
+    return token
+
+
+def _read_csrf_token_from_request() -> str | None:
+    # Header for fetch/XHR
+    header = (request.headers.get(_CSRF_HEADER) or request.headers.get("X-CSRFToken") or "").strip()
+    if header:
+        return header
+
+    # JSON body
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+        try:
+            v = payload.get("csrf_token") or payload.get("csrf")
+        except Exception:
+            v = None
+        if v is not None:
+            s = str(v).strip()
+            if s:
+                return s
+
+    # Form field
+    v = (request.form.get("csrf_token") or request.form.get("csrf") or "").strip()
+    return v or None
+
+
+def _csrf_failure_response():
+    msg = "Security check failed. Refresh the page and try again."
+    # Prefer JSON for APIs/fetch
+    wants_json = request.is_json or request.path.startswith("/api/") or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+    if wants_json:
+        return jsonify({"ok": False, "message": msg}), 400
+
+    # Render best-effort for common form endpoints.
+    if request.endpoint == "login":
+        return render_template("login.html", error=msg), 400
+    if request.endpoint == "register":
+        policy = _password_policy_payload()
+        return render_template(
+            "register.html",
+            error=msg,
+            password_policy=policy,
+            register_nonce=_issue_form_nonce("register_nonce"),
+        ), 400
+    if request.endpoint == "forgot_password":
+        return render_template("forgot_password.html", error=msg), 400
+    if request.endpoint == "upload":
+        return render_template("index.html", error=msg), 400
+
+    return (msg, 400)
+
+
+@app.before_request
+def _csrf_protect_unsafe_methods():
+    if UNIT_TESTING:
+        return None
+    if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
+        return None
+    if request.endpoint == "static":
+        return None
+
+    expected = session.get(_CSRF_SESSION_KEY)
+    supplied = _read_csrf_token_from_request()
+    if not expected or not supplied or not secrets.compare_digest(str(expected), str(supplied)):
+        return _csrf_failure_response()
+
+    return None
+
+
+@app.context_processor
+def _inject_csrf_token():
+    # Ensures templates can always render a token.
+    return {"csrf_token": _get_or_create_csrf_token()}
+
+
+def _request_is_https() -> bool:
+    if request.is_secure:
+        return True
+    xf_proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    return xf_proto == "https"
+
+
+@app.after_request
+def _set_security_headers(resp):
+    # Basic hardening headers
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), interest-cohort=()",
+    )
+
+    # Conservative CSP that still allows inline scripts used in templates.
+    # If you later move scripts to static files, you can remove 'unsafe-inline'.
+    csp = (
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'; "
+        "img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; "
+        "connect-src 'self' https://*.supabase.co"
+    )
+    resp.headers.setdefault("Content-Security-Policy", csp)
+
+    # HSTS only when actually on HTTPS
+    if _request_is_https():
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=15552000; includeSubDomains")
+
+    return resp
 
 
 def _get_env_float(name: str, default: float) -> float:
@@ -4518,4 +4696,5 @@ def send_whatsapp():
         return jsonify({"ok": False, "message": _twilio_error_to_user_message(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Debug ON locally by default; OFF automatically in production.
+    app.run(debug=_debug_enabled())
