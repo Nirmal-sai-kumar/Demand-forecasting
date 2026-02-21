@@ -8,6 +8,7 @@
     <h2>Upload Your Sales Dataset</h2>
 
     <form action="/upload" method="POST" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="file" name="file" required>
         <br><br>
         <button type="submit">Upload & Predict</button>
