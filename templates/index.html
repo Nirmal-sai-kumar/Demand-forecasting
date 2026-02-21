@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Retail Demand Forecasting</title>
+    <title>Retail Demand Forecasting — Upload</title>
 
     <style>
         body {
@@ -333,10 +333,14 @@
 <body>
 
 <div class="navbar">
-    <div><strong>Retail Demand Forecasting</strong> — Dashboard</div>
+    <div><strong>Retail Demand Forecasting</strong> — Upload</div>
     <div>
         <a href="/home">Upload</a>
-        <a href="#" aria-disabled="true" title="Generate a forecast to view results">Results</a>
+            {% if session.get('report_id') %}
+                <a href="{{ url_for('result_page') }}">Results</a>
+            {% else %}
+                <a href="#" aria-disabled="true" class="disabled">Results</a>
+            {% endif %}
         <a href="/trusted-emails/manage">Trusted Emails</a>
         {% set _email = (session.get('user_email') or 'User') %}
         {% set _user_label = _email.split('@')[0] %}
