@@ -2,6 +2,7 @@
 <html>
 <head>
     <title>Forecast Results</title>
+    <meta name="csrf-token" content="{{ csrf_token }}" />
 
     <style>
         body {
@@ -499,6 +500,11 @@
     const statusEl = document.getElementById('emailStatus');
     if (!btn) return;
 
+    
+        function getCsrfToken() {
+            const meta = document.querySelector('meta[name="csrf-token"]');
+            return meta ? (meta.getAttribute('content') || '') : '';
+        }
     function setStatus(text) {
         if (!statusEl) return;
         statusEl.textContent = text || '';
@@ -550,7 +556,7 @@
             try {
                 const res = await fetch('/email/pdf/self', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
                     body: JSON.stringify({ pdf_password })
                 });
                 const data = await res.json().catch(() => null);
@@ -598,7 +604,7 @@
         try {
             const res = await fetch('/email/pdf', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
                 body: JSON.stringify({ email, pdf_password })
             });
             const data = await res.json().catch(() => null);
@@ -846,7 +852,7 @@
         try {
             const res = await fetch('/send-whatsapp', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
                 body: JSON.stringify({ number: raw, pdf_password })
             });
             const data = await res.json().catch(() => null);
