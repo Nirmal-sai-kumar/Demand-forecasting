@@ -191,6 +191,12 @@ REPORT_SEND_RATE_WINDOW_SECONDS = int(os.getenv("REPORT_SEND_RATE_WINDOW_SECONDS
 
 RECIPIENT_COOLDOWN_SECONDS = int(os.getenv("RECIPIENT_COOLDOWN_SECONDS", str(5 * 60)))
 
+# ---------- SETTINGS: PASSWORD CHANGE OTP + AVATAR UPLOAD ----------
+PW_CHANGE_OTP_TTL_SECONDS = int(os.getenv("PW_CHANGE_OTP_TTL_SECONDS", str(10 * 60)))
+PW_CHANGE_OTP_COOLDOWN_SECONDS = int(os.getenv("PW_CHANGE_OTP_COOLDOWN_SECONDS", str(60)))
+PW_CHANGE_OTP_MAX_ATTEMPTS = int(os.getenv("PW_CHANGE_OTP_MAX_ATTEMPTS", str(5)))
+PW_CHANGE_MIN_PASSWORD_LEN = int(os.getenv("PW_CHANGE_MIN_PASSWORD_LEN", str(8)))
+
 COMMON_PASSWORDS = {
     "password",
     "password123",
@@ -2620,6 +2626,18 @@ def home():
         return redirect(url_for('login'))
     return render_template("index.html")
 
+
+# ---------- SETTINGS ----------
+@app.route('/settings', methods=['GET'])
+def settings_page():
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+
+    # Keep the session flag reasonably fresh.
+    _refresh_sender_verified_state_best_effort()
+
+    return render_template("settings.html")
+
 # ---------- LOGOUT ----------
 @app.route('/logout')
 def logout():
@@ -3338,6 +3356,113 @@ def _require_verified_sender() -> tuple[CurrentUser | None, tuple[dict, int] | N
     return user, None
 
 
+def _validate_account_password_or_error(password: str) -> str | None:
+    pw = (password or "").strip()
+    if not pw:
+        return "Password cannot be empty."
+    if len(pw) < max(8, int(PW_CHANGE_MIN_PASSWORD_LEN)):
+        return f"Password must be at least {max(8, int(PW_CHANGE_MIN_PASSWORD_LEN))} characters."
+    if len(pw) > 128:
+        return "Password is too long."
+    if pw.lower() in COMMON_PASSWORDS:
+        return "Password is too common. Choose a stronger password."
+    return None
+
+
+def _pw_change_otp_key(user_id: str) -> str:
+    return "pwotp:" + hashlib.sha256((user_id or "").encode("utf-8")).hexdigest()
+
+
+def _pw_change_otp_cooldown_key(user_id: str) -> str:
+    return f"pwotp_cd:{(user_id or '').strip()}"
+
+
+def _pw_change_store_otp_record(user_id: str, otp_hash: str) -> None:
+    backend = _pw_store_backend()
+    key = _pw_change_otp_key(user_id)
+    record = {
+        "otp_hash": otp_hash,
+        "attempts": 0,
+        "created_at": int(time.time()),
+    }
+    raw = json.dumps(record).encode("utf-8")
+    if hasattr(backend, "setex"):
+        backend.setex(key, int(PW_CHANGE_OTP_TTL_SECONDS), raw)
+    else:
+        backend.set(key, raw, int(PW_CHANGE_OTP_TTL_SECONDS))
+
+
+def _pw_change_get_otp_record(user_id: str) -> dict | None:
+    backend = _pw_store_backend()
+    key = _pw_change_otp_key(user_id)
+    try:
+        raw = backend.get(key)
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+def _pw_change_set_otp_record(user_id: str, record: dict) -> None:
+    backend = _pw_store_backend()
+    key = _pw_change_otp_key(user_id)
+    raw = json.dumps(record).encode("utf-8")
+    if hasattr(backend, "setex"):
+        backend.setex(key, int(PW_CHANGE_OTP_TTL_SECONDS), raw)
+    else:
+        backend.set(key, raw, int(PW_CHANGE_OTP_TTL_SECONDS))
+
+
+def _pw_change_delete_otp_record(user_id: str) -> None:
+    backend = _pw_store_backend()
+    key = _pw_change_otp_key(user_id)
+    try:
+        backend.delete(key)
+    except Exception:
+        return
+
+
+def _otp_hash(value: str) -> str:
+    v = (value or "").strip()
+    # Add server secret so hashes aren't reusable across environments.
+    material = f"{CONFIG.flask_secret_key}|{v}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _supabase_auth_update_password(access_token: str, new_password: str) -> None:
+    """Update password via Supabase Auth (requires a valid access token)."""
+    if not CONFIG.supabase_url:
+        raise RuntimeError("supabase_not_configured")
+    url = (CONFIG.supabase_url or "").rstrip("/") + "/auth/v1/user"
+    data = json.dumps({"password": new_password}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "apikey": (CONFIG.supabase_anon_key or ""),
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = getattr(resp, "status", None)
+            if status not in (200, 204):
+                raise RuntimeError("supabase_password_update_failed")
+    except Exception as e:
+        raise RuntimeError("supabase_password_update_failed") from e
+
+
+
+
 def _send_email_plain_sendgrid(to_email: str, subject: str, body_text: str) -> None:
     cfg = _get_sendgrid_config()
     if not cfg.get("api_key") or not cfg.get("from_email"):
@@ -3621,6 +3746,137 @@ def _audit_event_best_effort(
             pass
 
 
+@app.route("/api/settings/password/init", methods=["POST"])
+def api_settings_password_init():
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    old_password = (payload.get("old_password") or payload.get("oldPassword") or "").strip()
+    new_password = (payload.get("new_password") or payload.get("newPassword") or "").strip()
+    confirm_password = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
+
+    if not old_password:
+        return jsonify({"ok": False, "message": "Old password is required."}), 400
+    if not new_password or not confirm_password:
+        return jsonify({"ok": False, "message": "New password and confirmation are required."}), 400
+    if new_password != confirm_password:
+        return jsonify({"ok": False, "message": "New password and confirmation do not match."}), 400
+
+    pw_err = _validate_account_password_or_error(new_password)
+    if pw_err:
+        return jsonify({"ok": False, "message": pw_err}), 400
+
+    cd_key = _pw_change_otp_cooldown_key(user.id)
+    if _cooldown_is_active(cd_key):
+        return jsonify({"ok": False, "message": "Please wait before requesting another OTP."}), 429
+
+    # Verify old password by attempting login.
+    if not UNIT_TESTING:
+        try:
+            sb = get_supabase()
+            try:
+                sb.auth.sign_in_with_password({"email": user.email, "password": old_password})
+            except TypeError:
+                sb.auth.sign_in_with_password(email=user.email, password=old_password)
+        except Exception as e:
+            msg = str(e).lower()
+            if "missing supabase config" in msg or "supabase" in msg and "missing" in msg:
+                return jsonify({"ok": False, "message": "Server is not configured for password changes."}), 500
+            return jsonify({"ok": False, "message": "Old password is incorrect."}), 400
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+    try:
+        _pw_change_store_otp_record(user.id, _otp_hash(otp))
+    except Exception:
+        return jsonify({"ok": False, "message": "Failed to start OTP flow. Please try again."}), 500
+
+    try:
+        subject = "OTP to confirm password change"
+        body = (
+            "You requested a password change.\n\n"
+            f"Your OTP code is: {otp}\n\n"
+            f"This code expires in {max(1, int(PW_CHANGE_OTP_TTL_SECONDS // 60))} minutes.\n"
+            "If you did not request this, you can ignore this email."
+        )
+        _send_email_plain_sendgrid(user.email, subject, body)
+        _cooldown_start(cd_key, int(PW_CHANGE_OTP_COOLDOWN_SECONDS))
+        return jsonify({"ok": True, "message": "OTP sent to your email."}), 200
+    except Exception as e:
+        _pw_change_delete_otp_record(user.id)
+        msg = str(e).lower()
+        if "missing_sendgrid_config" in msg:
+            return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        return jsonify({"ok": False, "message": "Failed to send OTP. Please try again later."}), 500
+
+
+@app.route("/api/settings/password/confirm", methods=["POST"])
+def api_settings_password_confirm():
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    otp = (payload.get("otp") or payload.get("code") or "").strip()
+    new_password = (payload.get("new_password") or payload.get("newPassword") or "").strip()
+    confirm_password = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
+
+    if not otp:
+        return jsonify({"ok": False, "message": "OTP is required."}), 400
+    if not new_password or not confirm_password:
+        return jsonify({"ok": False, "message": "New password and confirmation are required."}), 400
+    if new_password != confirm_password:
+        return jsonify({"ok": False, "message": "New password and confirmation do not match."}), 400
+
+    pw_err = _validate_account_password_or_error(new_password)
+    if pw_err:
+        return jsonify({"ok": False, "message": pw_err}), 400
+
+    record = _pw_change_get_otp_record(user.id)
+    if not record:
+        return jsonify({"ok": False, "message": "OTP is invalid or expired. Please request a new OTP."}), 400
+
+    attempts = 0
+    try:
+        attempts = int(record.get("attempts") or 0)
+    except Exception:
+        attempts = 0
+
+    if attempts >= int(PW_CHANGE_OTP_MAX_ATTEMPTS):
+        _pw_change_delete_otp_record(user.id)
+        return jsonify({"ok": False, "message": "Too many invalid attempts. Please request a new OTP."}), 400
+
+    expected = (record.get("otp_hash") or "").strip()
+    if not expected or not secrets.compare_digest(expected, _otp_hash(otp)):
+        record["attempts"] = attempts + 1
+        try:
+            _pw_change_set_otp_record(user.id, record)
+        except Exception:
+            pass
+        if (attempts + 1) >= int(PW_CHANGE_OTP_MAX_ATTEMPTS):
+            _pw_change_delete_otp_record(user.id)
+            return jsonify({"ok": False, "message": "Too many invalid attempts. Please request a new OTP."}), 400
+        return jsonify({"ok": False, "message": "OTP is incorrect."}), 400
+
+    try:
+        _supabase_auth_update_password(access_token, new_password)
+    except Exception:
+        return jsonify({"ok": False, "message": "Failed to update password. Please try again later."}), 500
+
+    _pw_change_delete_otp_record(user.id)
+    session.clear()
+    return jsonify({"ok": True, "message": "Password updated. Please login again.", "redirect_to": "/login"}), 200
+
+
 @app.route("/api/trusted-emails", methods=["GET", "POST"])
 def api_trusted_emails():
     user, err = _require_verified_sender()
@@ -3676,6 +3932,35 @@ def api_trusted_emails():
             return jsonify({"ok": False, "message": "Too many verification emails. Please try again later."}), 429
         app.logger.exception("Failed initiating trusted email verification")
         return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+
+@app.route("/api/trusted-emails/<trusted_id>", methods=["DELETE"])
+def api_trusted_emails_delete(trusted_id: str):
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    tid = (trusted_id or "").strip()
+    if not tid:
+        return jsonify({"ok": False, "message": "Invalid trusted email id."}), 400
+
+    if UNIT_TESTING:
+        return jsonify({"ok": True}), 200
+
+    try:
+        sb = get_supabase(access_token)
+        res = sb.table("trusted_emails").delete().eq("id", tid).eq("owner_id", user.id).execute()
+        deleted = getattr(res, "data", None)
+        if isinstance(deleted, list) and len(deleted) == 0:
+            return jsonify({"ok": False, "message": "Item not found."}), 404
+        return jsonify({"ok": True}), 200
+    except Exception:
+        app.logger.exception("Failed deleting trusted email")
+        return jsonify({"ok": False, "message": "Failed to delete trusted email."}), 500
 
 
 @app.route("/api/report-shares", methods=["POST"])
