@@ -32,8 +32,8 @@ Create a `.env` file in the project root:
 # Local base URL used to construct safe Supabase redirect URLs
 APP_BASE_URL=http://127.0.0.1:5000
 
-# Recommended for session security
-FLASK_SECRET_KEY=change-me
+# Required for session + CSRF security (generate a long random value)
+FLASK_SECRET_KEY=<generate-a-long-random-secret>
 
 # Required for login/register flows
 SUPABASE_URL=https://<your-project-ref>.supabase.co
@@ -46,6 +46,28 @@ SENDGRID_FROM=
 ```
 
 `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` are also accepted as aliases.
+
+#### Generate a strong `FLASK_SECRET_KEY`
+
+Generate a long random secret (recommended) and paste it into `.env`:
+
+Windows PowerShell:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(64))"
+```
+
+macOS/Linux:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(64))"
+```
+
+Notes:
+
+- Keep it secret. Do not commit `.env` to GitHub.
+- If you change `FLASK_SECRET_KEY` later, existing user sessions will be invalidated (users get logged out).
+- Windows gotcha: some editors save `.env` as **UTF-8 with BOM**, which can break environment variable names. If your app says the key is missing even though it’s in `.env`, re-save `.env` as **UTF-8 (no BOM)** in VS Code (Encoding → “Save with Encoding…” → UTF-8).
 
 ### 4) Ensure the model exists (train if needed)
 
@@ -117,11 +139,20 @@ The app reads configuration from environment variables (and `.env` for local dev
 - `SUPABASE_URL` / `VITE_SUPABASE_URL`: Supabase project URL
 - `SUPABASE_ANON_KEY` / `VITE_SUPABASE_ANON_KEY`: Supabase anon key
 - `APP_BASE_URL`: Base URL used to construct safe redirect URLs for Supabase email flows
-- `FLASK_SECRET_KEY`: Flask session secret (recommended for production session security)
+- `FLASK_SECRET_KEY`: Flask session secret (required). Use a long random value and set it as an environment variable in production.
 - `MODEL_PATH`: Optional override for the model path (defaults to `model/xgb_model.json`)
 - `RUNTIME_DIR`: Optional writable temp directory for graphs/downloads (defaults to OS temp)
 - `TREND_EPS`: Optional float threshold for trend labeling (default `0.01`)
 - `CLEANUP_MAX_AGE_HOURS`: Optional float age threshold for runtime cleanup (default `24`)
+
+### Render deployment: where to set secrets
+
+On Render, set environment variables in your service:
+
+- Render dashboard → your service → **Environment** → **Add Environment Variable**
+- Add `FLASK_SECRET_KEY` (and your Supabase/email/Twilio variables as needed)
+
+Do not rely on a local `.env` file for production deployments.
 
 Emailing the PDF report (optional):
 
