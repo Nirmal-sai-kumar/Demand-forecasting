@@ -2627,6 +2627,43 @@ def home():
     return render_template("index.html")
 
 
+@app.route('/result', methods=['GET'])
+def result_page():
+    """Render the most recent forecast result stored in the user's session.
+
+    Previously, results were only shown immediately after /upload POST.
+    This route allows navigating back to Results from other pages.
+    """
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+
+    try:
+        report = _load_report_from_session()
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
+
+    metrics = report.get("metrics") or {}
+    insights = report.get("insights") or {}
+    trends = report.get("trends") or {}
+
+    return render_template(
+        "result.html",
+        past_image=report.get("past_image"),
+        future_image=report.get("future_image"),
+        months=int(report.get("months") or 0),
+        mae=metrics.get("MAE"),
+        rmse=metrics.get("RMSE"),
+        r2=metrics.get("R2"),
+        avg_demand=insights.get("Average Demand"),
+        recommendation=insights.get("Recommendation"),
+        past_actual_trend=trends.get("Past Actual Trend"),
+        past_pred_trend=trends.get("Past Predicted Trend"),
+        future_trend=trends.get("Future Forecast Trend"),
+        future_forecast_table=report.get("future_forecast_table") or [],
+        category_cost_table=report.get("category_cost_table") or [],
+    )
+
+
 # ---------- SETTINGS ----------
 @app.route('/settings', methods=['GET'])
 def settings_page():
