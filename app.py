@@ -2440,6 +2440,9 @@ def landing():
     # Backward compatibility: if an older login form posts to '/', handle it like '/login'.
     if request.method == 'POST':
         return login()
+    # If already authenticated, send user straight to the dashboard.
+    if session.get('logged_in'):
+        return redirect(url_for('home'))
     return render_template('homepage.html')
 
 
@@ -2851,6 +2854,7 @@ def reset_password():
 def home():
     if not session.get('logged_in'):
         return redirect(url_for('login'))
+    # Authenticated dashboard (upload page)
     return render_template("index.html")
 
 
