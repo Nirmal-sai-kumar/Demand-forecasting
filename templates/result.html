@@ -378,8 +378,10 @@
         <a href="/home">Upload</a>
             {% if session.get('report_id') %}
                 <a href="{{ url_for('result_page') }}">Results</a>
+                <a href="{{ url_for('dashboards_page') }}">Dashboards</a>
             {% else %}
                 <a href="#" aria-disabled="true" class="disabled">Results</a>
+                <a href="#" aria-disabled="true" class="disabled">Dashboards</a>
             {% endif %}
         <a href="/trusted-emails/manage">Trusted Emails</a>
         {% set _username = (session.get('username') or '').strip() %}
@@ -473,7 +475,7 @@
                         <td>{{ row.month }}</td>
                         <td>{{ row.product_category }}</td>
                         <td>{{ row.total_units_sold }}</td>
-                        <td>₹ {{ row.total_cost }}</td>
+                        <td>₹ {{ row.total_cost | format_millions }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
