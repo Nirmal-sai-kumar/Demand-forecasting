@@ -113,6 +113,7 @@ if not UNIT_TESTING:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    import matplotlib.ticker as mticker
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
@@ -1096,6 +1097,35 @@ CONFIG = AppConfig.from_env()
 app = Flask(__name__)
 app.static_folder = GRAPH_DIR
 app.secret_key = CONFIG.flask_secret_key
+
+
+def _format_rupees_millions(value: object) -> str:
+    """Format a numeric rupee amount using compact Millions (M).
+
+    Examples:
+    - 184921171 -> 184.9M
+    - 950000 -> 950,000
+    """
+    try:
+        numeric = float(value)
+    except Exception:
+        return str(value)
+
+    sign = "-" if numeric < 0 else ""
+    numeric = abs(numeric)
+
+    if numeric >= 1_000_000:
+        return f"{sign}{numeric / 1_000_000:.1f}M"
+    # For dashboard/report numbers, showing fractional millions is easier to scan.
+    # Avoid displaying tiny values as 0.00M.
+    if numeric >= 100_000:
+        return f"{sign}{numeric / 1_000_000:.2f}M"
+    return f"{sign}{numeric:,.0f}"
+
+
+@app.template_filter("format_millions")
+def _jinja_format_millions(value: object) -> str:
+    return _format_rupees_millions(value)
 
 # When behind a reverse proxy (Render), respect X-Forwarded-* for HTTPS detection.
 if _is_production_env():
@@ -2189,7 +2219,366 @@ def _load_report_from_session() -> dict:
 
     report_path = os.path.join(DOWNLOAD_DIR, f"{report_id}.json")
     with open(report_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        report = json.load(f)
+
+    # Defense-in-depth: if an owner_id is present in the report, ensure it matches
+    # the currently logged-in user.
+    expected_owner_id = (session.get("user_id") or "").strip()
+    report_owner_id = str(report.get("owner_id") or "").strip()
+    if report_owner_id and expected_owner_id and report_owner_id != expected_owner_id:
+        raise PermissionError("report_owner_mismatch")
+    return report
+
+
+def _dashboard_aggregate_from_report(report: dict) -> dict:
+    """Build dashboard aggregates + insight values from the report JSON."""
+    cat_rows = report.get("category_cost_table") or []
+    if not isinstance(cat_rows, list):
+        cat_rows = []
+
+    df_cat = pd.DataFrame(cat_rows)
+    if df_cat.empty:
+        return {
+            "category_sales": [],
+            "category_cost": [],
+            "trend": {"months": [], "series": {}},
+            "insights": {},
+        }
+
+    for col in ("month", "product_category", "total_units_sold", "total_cost"):
+        if col not in df_cat.columns:
+            return {
+                "category_sales": [],
+                "category_cost": [],
+                "trend": {"months": [], "series": {}},
+                "insights": {},
+            }
+
+    df_cat["month"] = pd.to_numeric(df_cat["month"], errors="coerce")
+    df_cat["total_units_sold"] = pd.to_numeric(df_cat["total_units_sold"], errors="coerce")
+    df_cat["total_cost"] = pd.to_numeric(df_cat["total_cost"], errors="coerce")
+    df_cat["product_category"] = df_cat["product_category"].astype(str)
+    df_cat = df_cat.dropna(subset=["month", "product_category", "total_units_sold", "total_cost"])
+    if df_cat.empty:
+        return {
+            "category_sales": [],
+            "category_cost": [],
+            "trend": {"months": [], "series": {}},
+            "insights": {},
+        }
+
+    units_by_cat = (
+        df_cat.groupby("product_category")["total_units_sold"].sum().sort_values(ascending=False)
+    )
+    cost_by_cat = (
+        df_cat.groupby("product_category")["total_cost"].sum().sort_values(ascending=False)
+    )
+
+    # Trend (use the selected forecast months)
+    max_month = int(df_cat["month"].max())
+    forecast_months = int(report.get("months") or 0)
+    if forecast_months < 1:
+        forecast_months = max_month
+    months = list(range(1, min(forecast_months, max_month) + 1))
+    trend_df = df_cat[df_cat["month"].isin(months)].copy()
+    pivot = (
+        trend_df.pivot_table(
+            index="month",
+            columns="product_category",
+            values="total_units_sold",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        .sort_index()
+    )
+
+    # Keep all categories (no artificial limit).
+
+    # Insights
+    insights: dict = {}
+    if not units_by_cat.empty:
+        # Growth based on month1 vs last available month.
+        last_month = int(df_cat["month"].max())
+        first = df_cat[df_cat["month"] == 1].groupby("product_category")["total_units_sold"].sum()
+        last = df_cat[df_cat["month"] == last_month].groupby("product_category")["total_units_sold"].sum()
+        growth_scores = {}
+        for cat in units_by_cat.index.tolist():
+            f = float(first.get(cat, 0.0))
+            l = float(last.get(cat, 0.0))
+            denom = f if f > 0 else 1.0
+            growth_scores[cat] = (l - f) / denom
+        growth_cat = max(growth_scores, key=growth_scores.get) if growth_scores else None
+        if growth_cat is not None:
+            insights["highest_growth_category"] = str(growth_cat)
+            # UX request: show percent without a leading '-' (absolute value).
+            insights["highest_growth_pct"] = round(abs(float(growth_scores[growth_cat])) * 100.0, 1)
+
+    if not cost_by_cat.empty:
+        insights["highest_cost_category"] = str(cost_by_cat.index[0])
+        insights["highest_cost_value"] = int(round(float(cost_by_cat.iloc[0])))
+
+    # Risk: category with highest forecast volatility (coefficient of variation).
+    if not pivot.empty:
+        risk_scores = {}
+        for cat in pivot.columns.tolist():
+            vals = pivot[cat].astype(float).values
+            mean = float(np.mean(vals)) if vals.size else 0.0
+            std = float(np.std(vals)) if vals.size else 0.0
+            risk_scores[cat] = (std / mean) if mean > 0 else std
+        risk_cat = max(risk_scores, key=risk_scores.get) if risk_scores else None
+        if risk_cat is not None:
+            insights["forecast_risk_category"] = str(risk_cat)
+            insights["forecast_risk_score"] = round(float(risk_scores[risk_cat]), 3)
+
+    category_sales = [
+        {"category": str(cat), "units": int(round(float(val)))}
+        for cat, val in units_by_cat.items()
+    ]
+    category_cost = [
+        {"category": str(cat), "cost": int(round(float(val)))}
+        for cat, val in cost_by_cat.items()
+    ]
+
+    trend_series = {str(cat): pivot[cat].astype(int).tolist() for cat in pivot.columns.tolist()}
+
+    return {
+        "category_sales": category_sales,
+        "category_cost": category_cost,
+        "trend": {"months": months, "series": trend_series},
+        "insights": insights,
+    }
+
+
+def _ensure_dashboard_charts(report_id: str, dashboard: dict) -> dict:
+    """Generate dashboard chart PNGs into GRAPH_DIR if missing."""
+    rid = _parse_report_id(report_id)
+    if not rid:
+        raise RuntimeError("invalid_report_id")
+
+    out = {}
+
+    def _path(name: str) -> str:
+        return os.path.join(GRAPH_DIR, name)
+
+    # Chart 1: Category-wise Sales (units)
+    cat_sales_img = f"dash_cat_sales_{rid}.png"
+    if not os.path.exists(_path(cat_sales_img)):
+        rows = dashboard.get("category_sales") or []
+        df = pd.DataFrame(rows)
+        if not df.empty and {"category", "units"}.issubset(df.columns):
+            df = df.sort_values("units", ascending=False).head(12)
+            plt.figure(figsize=(10.5, 4.5))
+            plt.bar(df["category"].astype(str), df["units"].astype(float))
+            plt.title("Category-wise Sales (Forecast Units)")
+            plt.xlabel("Category")
+            plt.ylabel("Units")
+            plt.xticks(rotation=25, ha="right")
+            plt.tight_layout()
+            plt.savefig(_path(cat_sales_img))
+            plt.close()
+    out["cat_sales_image"] = cat_sales_img
+
+    # Chart 2: Category Cost Distribution
+    cat_cost_img = f"dash_cat_cost_{rid}.png"
+    if not os.path.exists(_path(cat_cost_img)):
+        rows = dashboard.get("category_cost") or []
+        df = pd.DataFrame(rows)
+        if not df.empty and {"category", "cost"}.issubset(df.columns):
+            df = df.sort_values("cost", ascending=False)
+            if len(df) > 8:
+                top = df.head(7).copy()
+                other_cost = float(df.iloc[7:]["cost"].sum())
+                top = pd.concat([top, pd.DataFrame([{ "category": "Other", "cost": other_cost }])], ignore_index=True)
+                df = top
+            plt.figure(figsize=(8.5, 4.8))
+            plt.pie(
+                df["cost"].astype(float).values,
+                labels=df["category"].astype(str).values,
+                autopct="%1.1f%%",
+                startangle=140,
+            )
+            plt.title("Category Cost Distribution (Forecast)")
+            plt.tight_layout()
+            plt.savefig(_path(cat_cost_img))
+            plt.close()
+    out["cat_cost_image"] = cat_cost_img
+
+    # Chart 2b: Category Cost (Horizontal Bar)
+    cat_cost_barh_img = f"dash_cat_cost_barh_{rid}.png"
+    if not os.path.exists(_path(cat_cost_barh_img)):
+        rows = dashboard.get("category_cost") or []
+        df = pd.DataFrame(rows)
+        if not df.empty and {"category", "cost"}.issubset(df.columns):
+            df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
+            df["category"] = df["category"].astype(str)
+            df = df.dropna(subset=["cost", "category"])
+            if not df.empty:
+                df = df.sort_values("cost", ascending=False).head(12)
+                # Plot bottom-to-top so the largest category appears on top.
+                df = df.iloc[::-1]
+                plt.figure(figsize=(10.5, 5.2))
+                plt.barh(df["category"], df["cost"].astype(float))
+                plt.title("Category Cost (Horizontal Bar)")
+                ax = plt.gca()
+                # Matplotlib often displays a scientific-notation offset (e.g., '1e7')
+                # for large values; show explicit ₹ millions instead.
+                ax.xaxis.set_major_formatter(
+                    mticker.FuncFormatter(lambda x, pos: f"₹{(x / 1e6):.1f}M")
+                )
+                plt.xlabel("Cost (₹ M)")
+                plt.ylabel("Category")
+                plt.tight_layout()
+                plt.savefig(_path(cat_cost_barh_img))
+                plt.close()
+    out["cat_cost_barh_image"] = cat_cost_barh_img
+
+    # Chart 4: Forecast Trend by Category (forecast months)
+    trend_img = f"dash_trend_{rid}.png"
+    if not os.path.exists(_path(trend_img)):
+        trend = dashboard.get("trend") or {}
+        months = trend.get("months") or []
+        series = trend.get("series") or {}
+        if months and isinstance(series, dict) and series:
+            plt.figure(figsize=(11, 5))
+            for cat, vals in series.items():
+                if not isinstance(vals, list) or len(vals) != len(months):
+                    continue
+                plt.plot(months, vals, marker="o", linewidth=2, label=str(cat))
+            n = len(months)
+            plt.title(f"Forecast Trend by Category (Next {n} Month{'s' if n != 1 else ''})")
+            plt.xlabel("Month")
+            plt.ylabel("Units")
+            plt.xticks(months)
+            plt.grid(True)
+            plt.legend(loc="best", fontsize=8)
+            plt.tight_layout()
+            plt.savefig(_path(trend_img))
+            plt.close()
+    out["trend_image"] = trend_img
+    return out
+
+
+def _dashboard_payload_from_session() -> tuple[str, dict, dict]:
+    """Return (report_id, report, dashboard) for the current logged-in session."""
+    report = _load_report_from_session()
+    report_id = session.get("report_id")
+    if not report_id:
+        raise RuntimeError("no_report")
+    dashboard = _dashboard_aggregate_from_report(report)
+    imgs = _ensure_dashboard_charts(str(report_id), dashboard)
+    dashboard.update(imgs)
+    return str(report_id), report, dashboard
+
+
+def _build_dashboard_pdf_file(report_id: str, report: dict, dashboard: dict, path: str) -> None:
+    """Generate a PDF containing dashboard insights + charts.
+
+    Layout requirements:
+    - Title centered
+    - Remove the "Generated:" timestamp line
+    - Page 1: Top Insights + Category-wise Sales + Category Cost Distribution
+    - Page 2: Category Cost (Horizontal Bar) + Forecast Trend by Category
+    - Titles left aligned, charts centered
+    """
+
+    c = canvas.Canvas(path, pagesize=A4)
+    width, height = A4
+
+    left = 50
+    right = 50
+    top = height - 55
+    bottom = 60
+
+    FONT_REGULAR, FONT_BOLD = _get_pdf_font_names()
+
+    def _page_header() -> float:
+        c.setFont(FONT_BOLD, 16)
+        c.drawCentredString(width / 2, top, "Retail Demand Forecasting Report")
+        c.setFont(FONT_REGULAR, 11)
+        return top - 34
+
+    image_w = width - left - right
+    image_h = 235
+    gap = 18
+
+    def _draw_chart(y: float, img_name: str, title: str) -> float:
+        y -= 10
+        c.setFont(FONT_BOLD, 12)
+        c.drawString(left, y, title)
+        y -= 16
+        img_path = os.path.join(GRAPH_DIR, str(img_name or ""))
+        if img_name and os.path.exists(img_path):
+            if y - image_h < bottom:
+                c.showPage()
+                y = _page_header()
+            c.drawImage(
+                img_path,
+                left,
+                y - image_h,
+                image_w,
+                image_h,
+                preserveAspectRatio=True,
+                anchor="c",
+            )
+            return y - image_h - gap
+
+        c.setFont(FONT_REGULAR, 10)
+        c.drawString(left, y, "(chart unavailable)")
+        return y - 18
+
+    # ---------- PAGE 1 ----------
+    y = _page_header()
+
+    insights = dashboard.get("insights") or {}
+    c.setFont(FONT_BOLD, 12)
+    c.drawString(left, y, "Top Insights")
+    y -= 18
+    c.setFont(FONT_REGULAR, 11)
+
+    growth_cat = insights.get("highest_growth_category")
+    growth_pct = insights.get("highest_growth_pct")
+    cost_cat = insights.get("highest_cost_category")
+    cost_val = insights.get("highest_cost_value")
+    risk_cat = insights.get("forecast_risk_category")
+    risk_score = insights.get("forecast_risk_score")
+
+    try:
+        growth_pct_abs = abs(float(growth_pct)) if growth_pct is not None else None
+    except Exception:
+        growth_pct_abs = growth_pct
+
+    lines = [
+        (
+            f"Highest growth category: {growth_cat} {growth_pct_abs}%"
+            if (growth_cat is not None and growth_pct_abs is not None)
+            else "Highest growth category: N/A"
+        ),
+        (
+            f"Highest cost category: {cost_cat} (₹ {_format_rupees_millions(cost_val)})"
+            if (cost_cat is not None and cost_val is not None)
+            else "Highest cost category: N/A"
+        ),
+        (
+            f"Forecast risk category: {risk_cat} (score {risk_score})"
+            if (risk_cat is not None and risk_score is not None)
+            else "Forecast risk category: N/A"
+        ),
+    ]
+
+    for line in lines:
+        c.drawString(left, y, str(line))
+        y -= 14
+
+    y = _draw_chart(y, dashboard.get("cat_sales_image") or "", "Category-wise Sales")
+    y = _draw_chart(y, dashboard.get("cat_cost_image") or "", "Category Cost Distribution")
+
+    # ---------- PAGE 2 ----------
+    c.showPage()
+    y = _page_header()
+    y = _draw_chart(y, dashboard.get("cat_cost_barh_image") or "", "Category Cost (Horizontal Bar)")
+    y = _draw_chart(y, dashboard.get("trend_image") or "", "Forecast Trend by Category")
+
+    c.save()
 
 
 def _cleanup_runtime_dirs(max_age_hours: float | None = None) -> None:
@@ -2221,40 +2610,46 @@ def _cleanup_runtime_dirs(max_age_hours: float | None = None) -> None:
 def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float | None = None) -> str:
     """Return a human-friendly trend label based on the fitted slope."""
     if eps is None:
-        eps = CONFIG.trend_eps
-    values = np.asarray(series, dtype=float)
+        eps = DEFAULT_TREND_EPS
+
+    try:
+        values = np.asarray(series, dtype=float)
+    except Exception:
+        return "Insufficient Data"
+
     values = values[np.isfinite(values)]
     if values.size < 2:
         return "Insufficient Data"
 
     x = np.arange(values.size, dtype=float)
-    slope = np.polyfit(x, values, 1)[0]
-    eps = float(eps)
-    if slope > eps:
-        return "Upward"
-    if slope < -eps:
-        return "Downward"
-    return "Flat"
+    try:
+        slope = float(np.polyfit(x, values, 1)[0])
+    except Exception:
+        return "Insufficient Data"
+
+    if slope > float(eps):
+        return "Increasing"
+    if slope < -float(eps):
+        return "Decreasing"
+    return "Stable"
 
 
-# ------------------------------
-# PDF Font caching / idempotent registration
-# ------------------------------
-
-_PDF_FONT_LOCK = threading.Lock()
+# ---------- PDF FONT HELPERS (Rupee symbol support) ----------
 _PDF_FONT_NAMES: tuple[str, str] | None = None
+_PDF_FONT_LOCK = threading.Lock()
 
-_FONT_CACHE_LOCKS_GUARD = threading.Lock()
 _FONT_CACHE_LOCKS: dict[str, threading.Lock] = {}
+_FONT_CACHE_LOCKS_LOCK = threading.Lock()
 
 
 def _get_path_lock(path: str) -> threading.Lock:
     """Return a stable per-path lock for in-process concurrency control."""
-    with _FONT_CACHE_LOCKS_GUARD:
-        lock = _FONT_CACHE_LOCKS.get(path)
+    key = os.path.abspath(str(path or ""))
+    with _FONT_CACHE_LOCKS_LOCK:
+        lock = _FONT_CACHE_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
-            _FONT_CACHE_LOCKS[path] = lock
+            _FONT_CACHE_LOCKS[key] = lock
         return lock
 
 
@@ -2970,6 +3365,58 @@ def result_page():
     )
 
 
+# ---------- DASHBOARDS ----------
+@app.route("/dashboards", methods=["GET"])
+def dashboards_page():
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+
+    try:
+        report_id, report, dashboard = _dashboard_payload_from_session()
+    except PermissionError:
+        return render_template("index.html", error="Unauthorized report access."), 403
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
+
+    return render_template(
+        "dashboards.html",
+        insights=dashboard.get("insights") or {},
+        cat_sales_image=dashboard.get("cat_sales_image"),
+        cat_cost_image=dashboard.get("cat_cost_image"),
+        cat_cost_barh_image=dashboard.get("cat_cost_barh_image"),
+        trend_image=dashboard.get("trend_image"),
+        forecast_months=int(report.get("months") or 0),
+        has_category_data=bool(dashboard.get("category_sales")) and bool(dashboard.get("category_cost")),
+    )
+
+
+@app.route("/dashboards/pdf", methods=["GET"])
+def download_dashboards_pdf():
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+
+    try:
+        report_id, report, dashboard = _dashboard_payload_from_session()
+    except PermissionError:
+        return render_template("index.html", error="Unauthorized report access."), 403
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
+
+    path = os.path.join(DOWNLOAD_DIR, f"retail_dashboards_{report_id}.pdf")
+    _build_dashboard_pdf_file(report_id, report, dashboard, path)
+
+    response = send_file(path, as_attachment=True)
+
+    @response.call_on_close
+    def _remove_generated_dash_pdf() -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            app.logger.warning("Failed removing generated dashboard PDF: %s", path)
+
+    return response
+
+
 # ---------- SETTINGS ----------
 @app.route('/settings', methods=['GET'])
 def settings_page():
@@ -3254,6 +3701,7 @@ def upload():
 
         # ---------- STORE FOR DOWNLOAD (avoid huge cookies) ----------
         report = {
+            "owner_id": (session.get("user_id") or "").strip(),
             "months": months,
             "metrics": {'MAE': mae, 'RMSE': rmse, 'R2': r2},
             "insights": {'Average Demand': avg_demand, 'Recommendation': recommendation},

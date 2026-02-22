@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Retail Demand Forecasting — Dashboards</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: linear-gradient(to right, #1f4037, #99f2c8);
+      min-height: 100vh;
+    }
+
+    body.theme-dark {
+      background: linear-gradient(to right, #1f4037, #2c3e50);
+    }
+
+    .navbar {
+      background: #2c3e50;
+      padding: 15px 25px;
+      color: white;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: nowrap;
+    }
+
+    .navbar > div:last-child {
+      display: flex;
+      align-items: center;
+      flex-wrap: nowrap;
+    }
+
+    .navbar a {
+      color: white;
+      text-decoration: none;
+      font-weight: bold;
+      margin-left: 15px;
+      white-space: nowrap;
+    }
+
+    .navbar a:hover {
+      text-decoration: underline;
+    }
+
+    .navbar a[aria-disabled="true"] {
+      opacity: 0.7;
+      pointer-events: none;
+      text-decoration: none;
+    }
+
+    .user-menu {
+      position: relative;
+      display: inline-block;
+      margin-left: 15px;
+    }
+
+    .user-trigger {
+      background: transparent;
+      border: 0;
+      color: white;
+      font-weight: bold;
+      font-family: inherit;
+      font-size: inherit;
+      cursor: pointer;
+      padding: 0;
+      margin: 0;
+      width: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .user-trigger:hover { text-decoration: underline; }
+
+    .user-trigger:focus {
+      outline: 2px solid #ecf0f1;
+      outline-offset: 4px;
+      border-radius: 6px;
+    }
+
+    .user-dropdown {
+      position: absolute;
+      right: 0;
+      top: calc(100% + 10px);
+      min-width: 190px;
+      background: white;
+      border: 1px solid #cfd8dc;
+      border-radius: 10px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.18);
+      padding: 8px;
+      display: none;
+      z-index: 1000;
+    }
+
+    .user-dropdown[data-open="true"] { display: block; }
+
+    .navbar .user-dropdown .user-item {
+      display: block;
+      padding: 10px 10px;
+      border-radius: 8px;
+      text-decoration: none;
+      color: #2c3e50;
+      font-weight: bold;
+      margin-left: 0;
+    }
+
+    .navbar .user-dropdown .user-item:hover {
+      background: #f4f6f8;
+      text-decoration: none;
+    }
+
+    .user-divider {
+      height: 1px;
+      background: #e3e6ea;
+      margin: 6px 4px;
+    }
+
+    .wrap {
+      width: min(1120px, 94vw);
+      margin: 24px auto 40px;
+    }
+
+    .header-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0;
+      color: #1f4037;
+    }
+
+    .sub {
+      margin: 6px 0 0;
+      color: #2c3e50;
+      font-weight: bold;
+      font-size: 13px;
+      opacity: 0.95;
+    }
+
+    .btn {
+      background: #2c3e50;
+      color: white;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-weight: bold;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+      margin-top: 4px;
+    }
+
+    .btn:hover { opacity: 0.95; }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+      margin-bottom: 18px;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    @media (max-width: 920px) {
+      .grid-3 { grid-template-columns: 1fr; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .header-row { flex-direction: column; align-items: stretch; }
+      .btn { justify-content: center; }
+    }
+
+    .card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0px 8px 25px rgba(0,0,0,0.25);
+      padding: 16px 18px;
+    }
+
+    .card h2 {
+      margin: 0 0 10px;
+      color: #2c3e50;
+      font-size: 18px;
+    }
+
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .card-head h2 {
+      margin: 0;
+    }
+
+    .fs-btn {
+      background: #ecf0f1;
+      border: 1px solid #cfd8dc;
+      color: #2c3e50;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-weight: bold;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .fs-btn:hover {
+      background: #e6eaee;
+    }
+
+    .metric {
+      margin: 8px 0 0;
+      color: #2c3e50;
+      font-weight: bold;
+      font-size: 22px;
+    }
+
+    .desc {
+      margin: 6px 0 0;
+      color: #555;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .chart img {
+      width: 100%;
+      max-height: 380px;
+      object-fit: contain;
+      border-radius: 10px;
+      border: 1px solid #e3e6ea;
+      background: #fff;
+    }
+
+    .note {
+      margin-top: 12px;
+      background: #f4f6f8;
+      border-left: 4px solid #2c3e50;
+      padding: 10px 12px;
+      border-radius: 8px;
+      color: #333;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .fs-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+      padding: 18px;
+    }
+
+    .fs-overlay[data-open="true"] {
+      display: flex;
+    }
+
+    .fs-dialog {
+      width: min(1200px, 96vw);
+      height: min(820px, 92vh);
+      background: white;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .fs-bar {
+      background: #2c3e50;
+      color: white;
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .fs-title {
+      font-weight: bold;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .fs-close {
+      background: transparent;
+      border: 0;
+      color: white;
+      font-size: 18px;
+      cursor: pointer;
+      padding: 6px 10px;
+      border-radius: 10px;
+      font-weight: bold;
+    }
+
+    .fs-close:hover {
+      background: rgba(255,255,255,0.14);
+    }
+
+    .fs-img-wrap {
+      flex: 1;
+      display: grid;
+      place-items: center;
+      padding: 12px;
+      background: #f4f6f8;
+    }
+
+    .fs-img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      border-radius: 10px;
+      background: white;
+      border: 1px solid #e3e6ea;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="navbar">
+    <div><strong>Retail Demand Forecasting</strong> — Dashboards</div>
+    <div>
+      <a href="/home">Upload</a>
+      {% if session.get('report_id') %}
+        <a href="{{ url_for('result_page') }}">Results</a>
+        <a href="{{ url_for('dashboards_page') }}">Dashboards</a>
+      {% else %}
+        <a href="#" aria-disabled="true" class="disabled">Results</a>
+        <a href="#" aria-disabled="true" class="disabled">Dashboards</a>
+      {% endif %}
+      <a href="/trusted-emails/manage">Trusted Emails</a>
+
+      {% set _username = (session.get('username') or '').strip() %}
+      {% set _email = (session.get('user_email') or '').strip() %}
+      {% if _username %}
+        {% set _user_label = _username %}
+      {% elif _email %}
+        {% set _user_label = _email.split('@')[0] %}
+      {% else %}
+        {% set _user_label = 'User' %}
+      {% endif %}
+
+      <span class="user-menu">
+        <button type="button" class="user-trigger" id="userMenuBtn" aria-haspopup="true" aria-expanded="false">
+          👤 {{ _user_label }} ▾
+        </button>
+        <div class="user-dropdown" id="userMenuDropdown" role="menu" aria-label="User menu" data-open="false">
+          <a class="user-item" href="/settings" role="menuitem">Settings</a>
+          <div class="user-divider" role="separator" aria-hidden="true"></div>
+          <a class="user-item" href="/logout" role="menuitem">Logout</a>
+        </div>
+      </span>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="header-row" style="justify-content: flex-end;">
+      <a class="btn" href="{{ url_for('download_dashboards_pdf') }}">⬇ Download PDF</a>
+    </div>
+
+    <div class="grid-3">
+      <div class="card">
+        <h2>Highest Growth Category</h2>
+        <div class="metric">{{ insights.get('highest_growth_category', 'N/A') }}</div>
+        {% if insights.get('highest_growth_pct') is not none %}
+          <div class="desc">Growth from Month 1 → last forecast month: <strong>{{ insights.get('highest_growth_pct') }}%</strong></div>
+        {% else %}
+          <div class="desc">Growth could not be computed from your category forecast.</div>
+        {% endif %}
+      </div>
+
+      <div class="card">
+        <h2>Highest Cost Category</h2>
+        <div class="metric">{{ insights.get('highest_cost_category', 'N/A') }}</div>
+        {% if insights.get('highest_cost_value') is not none %}
+          <div class="desc">Total forecast cost: <strong>₹ {{ insights.get('highest_cost_value') | format_millions }}</strong></div>
+        {% else %}
+          <div class="desc">Cost could not be computed from your forecast.</div>
+        {% endif %}
+      </div>
+
+      <div class="card">
+        <h2>Forecast Risk Category</h2>
+        <div class="metric">{{ insights.get('forecast_risk_category', 'N/A') }}</div>
+        {% if insights.get('forecast_risk_score') is not none %}
+          <div class="desc">Risk score (volatility): <strong>{{ insights.get('forecast_risk_score') }}</strong></div>
+        {% else %}
+          <div class="desc">Risk could not be computed from your forecast trend.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if not has_category_data %}
+      <div class="card">
+        <h2>Dashboard data unavailable</h2>
+        <div class="note">
+          Upload a dataset that includes <strong>product_category</strong> and <strong>price</strong> columns to enable
+          category-wise dashboards.
+        </div>
+      </div>
+    {% endif %}
+
+    <div class="grid-2">
+      <div class="card chart">
+        <div class="card-head">
+          <h2>Category-wise Sales</h2>
+          <button type="button" class="fs-btn" data-fs-title="Category-wise Sales" data-fs-src="{{ url_for('static', filename=cat_sales_image) }}">Full screen</button>
+        </div>
+        <img src="{{ url_for('static', filename=cat_sales_image) }}" alt="Category-wise Sales" />
+      </div>
+
+      <div class="card chart">
+        <div class="card-head">
+          <h2>Category Cost Distribution</h2>
+          <button type="button" class="fs-btn" data-fs-title="Category Cost Distribution" data-fs-src="{{ url_for('static', filename=cat_cost_image) }}">Full screen</button>
+        </div>
+        <img src="{{ url_for('static', filename=cat_cost_image) }}" alt="Category Cost Distribution" />
+      </div>
+
+      <div class="card chart">
+        <div class="card-head">
+          <h2>Category Cost (Horizontal Bar)</h2>
+          <button type="button" class="fs-btn" data-fs-title="Category Cost (Horizontal Bar)" data-fs-src="{{ url_for('static', filename=cat_cost_barh_image) }}">Full screen</button>
+        </div>
+        <img src="{{ url_for('static', filename=cat_cost_barh_image) }}" alt="Category Cost (Horizontal Bar)" />
+      </div>
+
+      <div class="card chart">
+        <div class="card-head">
+          <h2>Forecast Trend by Category ({{ forecast_months }} month{{ 's' if forecast_months != 1 else '' }})</h2>
+          <button type="button" class="fs-btn" data-fs-title="Forecast Trend by Category" data-fs-src="{{ url_for('static', filename=trend_image) }}">Full screen</button>
+        </div>
+        <img src="{{ url_for('static', filename=trend_image) }}" alt="Forecast Trend by Category" />
+      </div>
+    </div>
+  </div>
+
+  <div class="fs-overlay" id="fsOverlay" data-open="false" aria-hidden="true">
+    <div class="fs-dialog" role="dialog" aria-modal="true" aria-label="Full screen chart">
+      <div class="fs-bar">
+        <div class="fs-title" id="fsTitle"></div>
+        <button type="button" class="fs-close" id="fsClose" aria-label="Close">✕</button>
+      </div>
+      <div class="fs-img-wrap">
+        <img class="fs-img" id="fsImg" alt="" />
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Theme init (match other pages via localStorage)
+    (function () {
+      function setTheme(theme) {
+        const t = (theme || '').toLowerCase() === 'dark' ? 'dark' : 'light';
+        try { localStorage.setItem('theme', t); } catch (e) {}
+        if (t === 'dark') document.body.classList.add('theme-dark');
+        else document.body.classList.remove('theme-dark');
+      }
+
+      (function initTheme() {
+        let t = 'light';
+        try { t = localStorage.getItem('theme') || 'light'; } catch (e) {}
+        setTheme(t);
+      })();
+
+      window.addEventListener('storage', function (e) {
+        if (e && e.key === 'theme') {
+          setTheme(e.newValue || 'light');
+        }
+      });
+    })();
+
+    // User dropdown toggle (consistent with other pages)
+    (function () {
+      const btn = document.getElementById('userMenuBtn');
+      const dropdown = document.getElementById('userMenuDropdown');
+      if (!btn || !dropdown) return;
+
+      function closeMenu() {
+        dropdown.dataset.open = 'false';
+        btn.setAttribute('aria-expanded', 'false');
+      }
+
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        const open = dropdown.dataset.open === 'true';
+        dropdown.dataset.open = open ? 'false' : 'true';
+        btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+      });
+
+      document.addEventListener('click', function (e) {
+        if (btn.contains(e.target) || dropdown.contains(e.target)) return;
+        closeMenu();
+      });
+
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') closeMenu();
+      });
+    })();
+  </script>
+
+  <script>
+    // Full screen viewer for charts
+    (function () {
+      const overlay = document.getElementById('fsOverlay');
+      const img = document.getElementById('fsImg');
+      const title = document.getElementById('fsTitle');
+      const closeBtn = document.getElementById('fsClose');
+      const triggers = Array.from(document.querySelectorAll('button.fs-btn[data-fs-src]'));
+      if (!overlay || !img || !title || !triggers.length) return;
+
+      function openFs(src, label) {
+        title.textContent = String(label || '');
+        img.src = String(src || '');
+        img.alt = String(label || '');
+        overlay.dataset.open = 'true';
+        overlay.setAttribute('aria-hidden', 'false');
+      }
+
+      function closeFs() {
+        overlay.dataset.open = 'false';
+        overlay.setAttribute('aria-hidden', 'true');
+        img.removeAttribute('src');
+        img.alt = '';
+        title.textContent = '';
+      }
+
+      for (const b of triggers) {
+        b.addEventListener('click', function () {
+          const src = b.getAttribute('data-fs-src') || '';
+          const label = b.getAttribute('data-fs-title') || '';
+          if (!src) return;
+          openFs(src, label);
+        });
+      }
+
+      if (closeBtn) closeBtn.addEventListener('click', function () { closeFs(); });
+
+      overlay.addEventListener('click', function (e) {
+        // Close only when clicking the backdrop.
+        if (e.target === overlay) closeFs();
+      });
+
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && overlay.dataset.open === 'true') {
+          closeFs();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
