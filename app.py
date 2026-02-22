@@ -4,8 +4,9 @@ import base64
 import io
 import urllib.request
 import urllib.error
+from xml.sax.saxutils import escape as _xml_escape
 
-from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request, jsonify
+from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request, jsonify, Response
 import json
 import logging
 import os
@@ -2434,6 +2435,80 @@ def _get_pdf_font_names() -> tuple[str, str]:
         return _PDF_FONT_NAMES
 
 # ---------- LANDING / LOGIN ----------
+
+
+def _public_site_base_url() -> str:
+    """Best-effort public base URL for robots/sitemap.
+
+    Prefer a public HTTPS base when configured or inferable, otherwise fall back
+    to the current request's url_root (which may be http:// for local dev).
+    """
+    base = _public_https_base_url_or_none() or _app_public_base_url() or ""
+    if not base:
+        try:
+            base = getattr(request, "url_root", "") or ""
+        except Exception:
+            base = ""
+    return base.strip().rstrip("/")
+
+
+@app.route("/robots.txt", methods=["GET"])
+def robots_txt():
+    base = _public_site_base_url()
+    sitemap_url = f"{base}/sitemap.xml" if base else "/sitemap.xml"
+
+    content = "\n".join(
+        [
+            "User-agent: *",
+            "Allow: /",
+            "Disallow: /home",
+            "Disallow: /upload",
+            "Disallow: /result",
+            "Disallow: /settings",
+            "Disallow: /logout",
+            "Disallow: /download/",
+            "Disallow: /email/",
+            "Disallow: /files/",
+            "Disallow: /api/",
+            "Disallow: /auth/",
+            "Disallow: /trusted-email/",
+            "Disallow: /share/",
+            f"Sitemap: {sitemap_url}",
+            "",
+        ]
+    )
+    resp = Response(content, mimetype="text/plain")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/sitemap.xml", methods=["GET"])
+def sitemap_xml():
+    base = _public_site_base_url()
+    if not base:
+        base = "/"
+
+    homepage = (base + "/") if base != "/" else "/"
+    lastmod = datetime.now(timezone.utc).date().isoformat()
+    homepage_escaped = _xml_escape(homepage)
+
+    xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+        "  <url>\n"
+        f"    <loc>{homepage_escaped}</loc>\n"
+        f"    <lastmod>{lastmod}</lastmod>\n"
+        "    <changefreq>weekly</changefreq>\n"
+        "    <priority>1.0</priority>\n"
+        "  </url>\n"
+        "</urlset>\n"
+    )
+
+    resp = Response(xml, mimetype="application/xml")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
 @app.route('/', methods=['GET', 'POST'])
 def landing():
     # Public homepage (always shown as the default page).
