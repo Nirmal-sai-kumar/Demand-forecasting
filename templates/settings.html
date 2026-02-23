@@ -99,6 +99,29 @@
     .otp-panel[data-open="true"] { display: block; }
 
     .note { background: #f4f6f8; border-left: 4px solid #2c3e50; padding: 10px 12px; border-radius: 8px; color: #333; margin-top: 10px; }
+
+    .pw-reqs {
+      display: none;
+      text-align: left;
+      font-size: 12px;
+      color: #666;
+      margin: 8px 0 0;
+      padding-left: 18px;
+      max-width: 640px;
+    }
+
+    .pw-reqs li { margin: 4px 0; }
+    .req-met { color: green; font-weight: bold; }
+    .req-miss { color: #a40000; font-weight: bold; }
+
+    .pw-match {
+      display: none;
+      margin: 8px 0 0;
+      font-size: 13px;
+      font-weight: bold;
+    }
+    .pw-match.ok { color: green; }
+    .pw-match.bad { color: #a40000; }
   </style>
 </head>
 <body>
@@ -186,18 +209,34 @@
         <div>
           <label for="newPassword">New password</label>
           <div class="pw-field">
-            <input id="newPassword" type="password" autocomplete="new-password" {% if not (session.get('email_verified')) %}disabled{% endif %} />
+            <input id="newPassword" type="password" minlength="8" autocomplete="new-password" {% if not (session.get('email_verified')) %}disabled{% endif %} />
             <button type="button" class="pw-toggle" data-toggle-for="newPassword" aria-label="Show password" title="Show password" {% if not (session.get('email_verified')) %}disabled{% endif %}>🙈</button>
           </div>
         </div>
         <div>
           <label for="confirmPassword">Confirm new password</label>
           <div class="pw-field">
-            <input id="confirmPassword" type="password" autocomplete="new-password" {% if not (session.get('email_verified')) %}disabled{% endif %} />
+            <input id="confirmPassword" type="password" minlength="8" autocomplete="new-password" {% if not (session.get('email_verified')) %}disabled{% endif %} />
             <button type="button" class="pw-toggle" data-toggle-for="confirmPassword" aria-label="Show password" title="Show password" {% if not (session.get('email_verified')) %}disabled{% endif %}>🙈</button>
           </div>
         </div>
       </div>
+
+      <p id="pwMatch" class="pw-match" aria-live="polite"></p>
+      <p id="pwSame" class="pw-match" aria-live="polite"></p>
+
+      <ul id="pwReqs" class="pw-reqs" aria-live="polite">
+        {% set labels = (password_policy.get('labels', {}) if password_policy else {}) %}
+        {% set lbl_len = labels.get('len', 'At least 8 characters') %}
+        {% set lbl_upper = labels.get('upper', 'One capital letter (A-Z)') %}
+        {% set lbl_digit = labels.get('digit', 'One number (0-9)') %}
+        {% set lbl_special = labels.get('special', 'One special character (e.g., !@#$)') %}
+
+        <li id="reqLen" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_len }}">✗ {{ lbl_len }}</li>
+        <li id="reqUpper" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_upper }}">✗ {{ lbl_upper }}</li>
+        <li id="reqNum" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_digit }}">✗ {{ lbl_digit }}</li>
+        <li id="reqSpec" class="req-miss" role="checkbox" aria-checked="false" data-label="{{ lbl_special }}">✗ {{ lbl_special }}</li>
+      </ul>
 
       <div class="row" style="margin-top: 12px;">
         <div style="flex: 0 0 auto;">
@@ -223,6 +262,10 @@
 
     </div>
   </div>
+
+  <script>
+    window.PASSWORD_POLICY = {{ password_policy|default({})|tojson }};
+  </script>
 
   <script>
   (function () {
@@ -392,6 +435,12 @@
     const sendBtn = document.getElementById('sendOtpBtn');
     const confirmBtn = document.getElementById('confirmPwBtn');
     const statusEl = document.getElementById('pwStatus');
+    const reqBox = document.getElementById('pwReqs');
+    const matchEl = document.getElementById('pwMatch');
+    const sameEl = document.getElementById('pwSame');
+
+    const sendBtnBaseDisabled = !!(sendBtn && sendBtn.disabled);
+    const confirmBtnBaseDisabled = !!(confirmBtn && confirmBtn.disabled);
 
     function setStatus(msg, isError) {
       if (!statusEl) return;
@@ -412,6 +461,137 @@
       };
     }
 
+    function passwordStrengthError(pw) {
+      if (!pw) return 'Please enter a new password.';
+
+      const policy = window.PASSWORD_POLICY || {};
+      const minLen = Number(policy.min_len || 8);
+      const upperRe = new RegExp(policy.upper_pattern || '[A-Z]');
+      const digitRe = new RegExp(policy.digit_pattern || '\\d');
+      const specialRe = new RegExp(policy.special_pattern || '[^A-Za-z0-9]');
+
+      const missing = [];
+      if (pw.length < minLen) missing.push('at least 8 characters');
+      if (!upperRe.test(pw)) missing.push('one capital letter (A-Z)');
+      if (!digitRe.test(pw)) missing.push('one number (0-9)');
+      if (!specialRe.test(pw)) missing.push('one special character (e.g., !@#$)');
+
+      if (missing.length === 0) return null;
+      if (missing.length === 1 && missing[0] === 'at least 8 characters') {
+        return 'Password is weak: must be at least 8 characters.';
+      }
+      return 'Password is weak. Missing: ' + missing.join(', ') + '.';
+    }
+
+    function setReq(el, ok) {
+      if (!el) return;
+      el.className = ok ? 'req-met' : 'req-miss';
+      el.setAttribute('aria-checked', ok ? 'true' : 'false');
+      const label = el.getAttribute('data-label') || '';
+      el.textContent = (ok ? '✓ ' : '✗ ') + label;
+    }
+
+    function updateChecklist(pw) {
+      if (!reqBox) return;
+      const policy = window.PASSWORD_POLICY || {};
+      const minLen = Number(policy.min_len || 8);
+      const upperRe = new RegExp(policy.upper_pattern || '[A-Z]');
+      const digitRe = new RegExp(policy.digit_pattern || '\\d');
+      const specialRe = new RegExp(policy.special_pattern || '[^A-Za-z0-9]');
+
+      if (pw && pw.length > 0) {
+        reqBox.style.display = 'block';
+      }
+
+      setReq(document.getElementById('reqLen'), (pw || '').length >= minLen);
+      setReq(document.getElementById('reqUpper'), upperRe.test(pw || ''));
+      setReq(document.getElementById('reqNum'), digitRe.test(pw || ''));
+      setReq(document.getElementById('reqSpec'), specialRe.test(pw || ''));
+    }
+
+    function clearMatch() {
+      if (!matchEl) return;
+      matchEl.textContent = '';
+      matchEl.classList.remove('ok', 'bad');
+      matchEl.style.display = 'none';
+    }
+
+    function showMatch(isMatch) {
+      if (!matchEl) return;
+      matchEl.textContent = isMatch ? '✓ Passwords match.' : '✗ Passwords do not match.';
+      matchEl.classList.toggle('ok', Boolean(isMatch));
+      matchEl.classList.toggle('bad', !isMatch);
+      matchEl.style.display = 'block';
+    }
+
+    function clearSame() {
+      if (!sameEl) return;
+      sameEl.textContent = '';
+      sameEl.classList.remove('ok', 'bad');
+      sameEl.style.display = 'none';
+    }
+
+    function showSame() {
+      if (!sameEl) return;
+      sameEl.textContent = '✗ Old and new passwords are same.';
+      sameEl.classList.remove('ok');
+      sameEl.classList.add('bad');
+      sameEl.style.display = 'block';
+    }
+
+    function isBusy(btn) {
+      return !!(btn && btn.dataset && btn.dataset.busy === '1');
+    }
+
+    function liveUpdate() {
+      if (!newEl || !confirmEl) return;
+      const v = getVals();
+      const oldPw = (v.old_password || '').trim();
+      const pw = (v.new_password || '').trim();
+      const confirm = (v.confirm_password || '').trim();
+
+      updateChecklist(pw);
+
+      if (pw && confirm) showMatch(pw === confirm);
+      else clearMatch();
+
+      if (oldPw && pw && oldPw === pw) showSame();
+      else clearSame();
+
+      const strengthOk = !passwordStrengthError(pw);
+      const matchOk = Boolean(pw) && Boolean(confirm) && pw === confirm;
+      const notSameAsOld = !oldPw || !pw ? true : (oldPw !== pw);
+
+      if (sendBtn && !sendBtnBaseDisabled && !isBusy(sendBtn)) {
+        const enableSend = Boolean(oldPw) && strengthOk && matchOk && notSameAsOld;
+        sendBtn.disabled = !enableSend;
+      }
+
+      if (confirmBtn && !confirmBtnBaseDisabled && !isBusy(confirmBtn)) {
+        const otpRaw = (otpEl && typeof otpEl.value === 'string') ? otpEl.value : '';
+        const otpOk = /^\d{6}$/.test(otpRaw);
+        const enableConfirm = otpOk && strengthOk && matchOk && notSameAsOld;
+        confirmBtn.disabled = !enableConfirm;
+      }
+    }
+
+    // Live interactions
+    if (newEl && reqBox) {
+      newEl.addEventListener('focus', function () {
+        reqBox.style.display = 'block';
+        liveUpdate();
+      });
+      newEl.addEventListener('blur', function () {
+        const pw = (newEl.value || '').trim();
+        if (pw.length === 0) reqBox.style.display = 'none';
+      });
+    }
+
+    if (oldEl) oldEl.addEventListener('input', liveUpdate);
+    if (newEl) newEl.addEventListener('input', liveUpdate);
+    if (confirmEl) confirmEl.addEventListener('input', liveUpdate);
+    if (otpEl) otpEl.addEventListener('input', liveUpdate);
+
     async function postJson(url, body) {
       const res = await fetch(url, {
         method: 'POST',
@@ -430,12 +610,24 @@
           setStatus('Please fill old password, new password and confirmation.', true);
           return;
         }
+        if ((v.old_password || '').trim() === (v.new_password || '').trim()) {
+          setStatus('Old and new passwords are same.', true);
+          liveUpdate();
+          return;
+        }
         if (v.new_password !== v.confirm_password) {
           setStatus('New password and confirmation do not match.', true);
           return;
         }
 
+        const strengthErr = passwordStrengthError(v.new_password);
+        if (strengthErr) {
+          setStatus(strengthErr, true);
+          return;
+        }
+
         sendBtn.disabled = true;
+        sendBtn.dataset.busy = '1';
         setStatus('Sending OTP…', false);
         try {
           const { res, data } = await postJson('/api/settings/password/init', v);
@@ -448,7 +640,8 @@
         } catch (e) {
           setStatus('Failed to send OTP. Please try again.', true);
         } finally {
-          sendBtn.disabled = false;
+          delete sendBtn.dataset.busy;
+          liveUpdate();
         }
       });
     }
@@ -457,9 +650,13 @@
       confirmBtn.addEventListener('click', async function () {
         setStatus('', false);
         const v = getVals();
-        const otp = (otpEl && otpEl.value) ? otpEl.value.trim() : '';
-        if (!otp) {
+        const otpRaw = (otpEl && typeof otpEl.value === 'string') ? otpEl.value : '';
+        if (!otpRaw) {
           setStatus('Please enter the OTP code.', true);
+          return;
+        }
+        if (!/^\d{6}$/.test(otpRaw)) {
+          setStatus('OTP must be exactly 6 digits (no spaces).', true);
           return;
         }
         if (!v.new_password || v.new_password !== v.confirm_password) {
@@ -467,11 +664,18 @@
           return;
         }
 
+        const strengthErr = passwordStrengthError(v.new_password);
+        if (strengthErr) {
+          setStatus(strengthErr, true);
+          return;
+        }
+
         confirmBtn.disabled = true;
+        confirmBtn.dataset.busy = '1';
         setStatus('Updating password…', false);
         try {
           const { res, data } = await postJson('/api/settings/password/confirm', {
-            otp,
+            otp: otpRaw,
             new_password: v.new_password,
             confirm_password: v.confirm_password,
           });
@@ -486,10 +690,14 @@
         } catch (e) {
           setStatus('Failed to update password. Please try again.', true);
         } finally {
-          confirmBtn.disabled = false;
+          delete confirmBtn.dataset.busy;
+          liveUpdate();
         }
       });
     }
+
+    // Initial state
+    liveUpdate();
   })();
   </script>
 
