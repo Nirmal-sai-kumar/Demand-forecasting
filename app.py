@@ -55,19 +55,10 @@ except Exception:  # pragma: no cover
     )
 
 try:
-    # Optional: AES-encrypted ZIP for sending PDF+XLSX together.
+    # Optional: AES-encrypted ZIP for sending multiple attachments together.
     import pyzipper  # type: ignore
 except Exception:  # pragma: no cover
     pyzipper = None
-
-try:
-    # Optional: used to apply worksheet/workbook protection to XLSX.
-    from openpyxl import load_workbook  # type: ignore
-    from openpyxl.workbook.protection import WorkbookProtection, hash_password  # type: ignore
-except Exception:  # pragma: no cover
-    load_workbook = None
-    WorkbookProtection = None
-    hash_password = None
 
 try:
     # Optional but recommended for robust email validation.
@@ -608,92 +599,6 @@ def _encrypt_zip_bytes(attachments: list[tuple[str, bytes]], password: str, mode
 def _encrypt_zip_bytes_aes(attachments: list[tuple[str, bytes]], password: str) -> bytes:
     """Backward-compatible helper: strong AES-encrypted ZIP."""
     return _encrypt_zip_bytes(attachments, password, mode="aes")
-
-
-def _protect_xlsx_bytes_if_requested(xlsx_bytes: bytes, password: str | None) -> bytes:
-    """Apply password protection to XLSX bytes if requested.
-
-    Important: OpenPyXL cannot apply "file open" encryption for XLSX.
-    This implements workbook/worksheet protection so edits require a password.
-    """
-    if not password:
-        return xlsx_bytes
-    if load_workbook is None or WorkbookProtection is None or hash_password is None:
-        raise RuntimeError("xlsx_protection_unavailable")
-
-    wb = load_workbook(io.BytesIO(xlsx_bytes))
-
-    # Best-effort lock workbook structure.
-    try:
-        wb.security = WorkbookProtection(lockStructure=True, workbookPassword=hash_password(password))
-    except Exception:
-        pass
-
-    for ws in wb.worksheets:
-        try:
-            ws.protection.sheet = True
-            ws.protection.set_password(password)
-        except Exception:
-            pass
-
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
-
-
-def _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes: bytes, password: str | None) -> bytes | None:
-    """Return XLSX bytes encrypted with a password-to-open, if possible.
-
-    This requires Windows + Microsoft Excel installed (COM automation).
-    If unavailable, returns None so callers can fall back.
-    """
-    if not password:
-        return None
-    if os.name != "nt":
-        return None
-
-    try:
-        import win32com.client  # type: ignore
-    except Exception:
-        return None
-
-    # Write input to a temp file, then use Excel to SaveAs with password.
-    with tempfile.TemporaryDirectory(prefix="xlsxpw_") as td:
-        in_path = os.path.join(td, "in.xlsx")
-        out_path = os.path.join(td, "out.xlsx")
-        with open(in_path, "wb") as f:
-            f.write(xlsx_bytes)
-
-        excel = None
-        wb = None
-        try:
-            excel = win32com.client.DispatchEx("Excel.Application")
-            excel.Visible = False
-            excel.DisplayAlerts = False
-            wb = excel.Workbooks.Open(in_path, ReadOnly=False)
-
-            # SaveAs supports Password parameter for password-to-open.
-            # FileFormat 51 is xlOpenXMLWorkbook (.xlsx)
-            wb.SaveAs(out_path, FileFormat=51, Password=password)
-        except Exception:
-            return None
-        finally:
-            try:
-                if wb is not None:
-                    wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-            try:
-                if excel is not None:
-                    excel.Quit()
-            except Exception:
-                pass
-
-        try:
-            with open(out_path, "rb") as f:
-                return f.read()
-        except Exception:
-            return None
 
 
 class CacheWriteError(RuntimeError):
@@ -1443,35 +1348,34 @@ def _parse_report_id(report_id: str | None) -> str | None:
     return v
 
 
-def _build_excel_report_file(report: dict, path: str) -> None:
-    """Generate the Excel report at the given path."""
-    with pd.ExcelWriter(path, engine='openpyxl') as writer:
-        pd.DataFrame([report.get('metrics', {})]).to_excel(writer, sheet_name="Metrics", index=False)
-        pd.DataFrame([report.get('insights', {})]).to_excel(writer, sheet_name="Insights", index=False)
-        pd.DataFrame([report.get('trends', {})]).to_excel(writer, sheet_name="Trends", index=False)
-        pd.DataFrame(report.get('future_forecast_table', [])).to_excel(
-            writer, sheet_name="Future_Forecast", index=False
-        )
-        pd.DataFrame(report.get('category_cost_table', [])).to_excel(
-            writer, sheet_name="Monthwise_Category_Cost", index=False
-        )
+def _build_dashboards_pdf_for_report(report_id: str, report: dict, path: str) -> None:
+    """Generate the dashboards/results PDF for a report."""
+    dashboard = _dashboard_aggregate_from_report(report)
+    imgs = _ensure_dashboard_charts(report_id, dashboard)
+    dashboard.update(imgs)
+    _build_dashboard_pdf_file(report_id, report, dashboard, path)
 
 
 def _ensure_public_report_files(report_id: str, report: dict) -> tuple[str, str]:
-    """Ensure public-facing PDF/XLSX files exist for Twilio MediaUrl fetching."""
+    """Ensure public-facing PDFs exist for Twilio MediaUrl fetching.
+
+    Returns:
+      (report_pdf_path, dashboards_pdf_path)
+    """
     rid = _parse_report_id(report_id)
     if not rid:
         raise RuntimeError("invalid_report_id")
 
     pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{rid}.pdf")
-    xlsx_path = os.path.join(DOWNLOAD_DIR, f"public_{rid}.xlsx")
+    dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{rid}_dash.pdf")
 
-    # Generate if missing (best-effort idempotent).
+    # Generate if missing.
     if not os.path.exists(pdf_path):
         _build_pdf_report_file(report, pdf_path)
-    if not os.path.exists(xlsx_path):
-        _build_excel_report_file(report, xlsx_path)
-    return pdf_path, xlsx_path
+    # Always regenerate the dashboards PDF so fixes to chart embedding
+    # (and any updated dashboard layouts) are reflected immediately.
+    _build_dashboards_pdf_for_report(rid, report, dash_pdf_path)
+    return pdf_path, dash_pdf_path
 
 
 def _twilio_error_to_user_message(err: Exception) -> str:
@@ -3742,34 +3646,6 @@ def upload():
         app.logger.exception("Prediction failed in /upload")
         return render_template("index.html", error="Prediction failed. Please check your dataset format."), 500
 
-# ---------- DOWNLOAD EXCEL ----------
-@app.route('/download/excel')
-def download_excel():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-
-    try:
-        report = _load_report_from_session()
-    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
-        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
-
-    report_id = session.get("report_id")
-    path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
-
-    _build_excel_report_file(report, path)
-
-    response = send_file(path, as_attachment=True)
-
-    @response.call_on_close
-    def _remove_generated_excel() -> None:
-        try:
-            os.remove(path)
-        except OSError:
-            # Cleanup failures must not affect user response.
-            app.logger.warning("Failed removing generated Excel: %s", path)
-
-    return response
-
 # ---------- DOWNLOAD PDF ----------
 @app.route('/download/pdf')
 def download_pdf():
@@ -3944,12 +3820,13 @@ def email_pdf():
 
 
 def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: CurrentUser | None = None, pdf_password: str | None = None) -> tuple:
-    """Generate the current session report files (PDF+XLSX) and email them.
+    """Generate the current session report PDFs and email them.
 
-    Backward compatible name: route paths still reference /email/pdf.
-    If a password is provided, we send 2 attachments:
-    - password-protected PDF (PDF encryption)
-    - password-protected Excel (password-to-open on Windows+Excel when available; otherwise edit-protected XLSX)
+    Delivers 2 PDFs:
+    - Report PDF
+    - Dashboards/Results PDF
+
+    If a password is provided, both PDFs are encrypted using the same password.
     """
     try:
         report = _load_report_from_session()
@@ -3957,17 +3834,17 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
     pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
-    xlsx_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
+    dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_dashboards_{report_id}.pdf")
     filename_pdf = f"retail_forecast_report_{report_id}.pdf"
-    filename_xlsx = f"retail_forecast_report_{report_id}.xlsx"
+    filename_dash_pdf = f"retail_dashboards_{report_id}.pdf"
 
     try:
         _build_pdf_report_file(report, pdf_path)
-        _build_excel_report_file(report, xlsx_path)
+        _build_dashboards_pdf_for_report(report_id, report, dash_pdf_path)
         with open(pdf_path, 'rb') as f:
             pdf_bytes = f.read()
-        with open(xlsx_path, 'rb') as f:
-            xlsx_bytes = f.read()
+        with open(dash_pdf_path, 'rb') as f:
+            dash_pdf_bytes = f.read()
 
         pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
 
@@ -3975,33 +3852,19 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
 
         if pdf_password:
             pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
-
-            # Prefer "password-to-open" XLSX on Windows when Excel is installed.
-            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
-            if xlsx_open_pw_bytes:
-                body = "Attached are your password-protected report files (PDF and Excel)."
-                delivered_kind = "pdf+xlsx_openpw"
-                attachments = [
-                    (filename_pdf, "application/pdf", pdf_bytes),
-                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_open_pw_bytes),
-                ]
-            else:
-                # Fallback: OpenPyXL cannot do password-to-open encryption, but we can still
-                # apply worksheet/workbook protection (edits require password).
-                protected_xlsx_bytes = _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
-
-                body = "Attached are your password-protected report files (PDF and Excel)."
-                delivered_kind = "pdf+xlsx_editpw"
-                attachments = [
-                    (filename_pdf, "application/pdf", pdf_bytes),
-                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", protected_xlsx_bytes),
-                ]
-        else:
-            body = "Attached are your Retail Demand Forecasting report files (PDF and Excel)."
-            delivered_kind = "pdf+xlsx"
+            dash_pdf_bytes = _encrypt_pdf_bytes_if_requested(dash_pdf_bytes, pdf_password)
+            body = "Attached are your password-protected report files (Report PDF and Dashboard PDF)."
+            delivered_kind = "pdf+dashpdf_pw"
             attachments = [
                 (filename_pdf, "application/pdf", pdf_bytes),
-                (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_bytes),
+                (filename_dash_pdf, "application/pdf", dash_pdf_bytes),
+            ]
+        else:
+            body = "Attached are your Retail Demand Forecasting report files (Report PDF and Dashboard PDF)."
+            delivered_kind = "pdf+dashpdf"
+            attachments = [
+                (filename_pdf, "application/pdf", pdf_bytes),
+                (filename_dash_pdf, "application/pdf", dash_pdf_bytes),
             ]
 
         _send_email_with_attachments_sendgrid(recipient_email, subject, body, attachments)
@@ -4021,8 +3884,6 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
         if "pdf_encryption_unavailable" in msg:
             return jsonify({"ok": False, "message": "PDF encryption is not available on the server."}), 503
-        if "zip_encryption_unavailable" in msg or "xlsx_protection_unavailable" in msg:
-            return jsonify({"ok": False, "message": "Excel password protection is not available on the server."}), 503
         app.logger.exception("Failed sending report email")
         _audit_event_best_effort(
             "report_delivery_failed",
@@ -4037,8 +3898,8 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
         try:
             if os.path.exists(pdf_path):
                 os.remove(pdf_path)
-            if os.path.exists(xlsx_path):
-                os.remove(xlsx_path)
+            if os.path.exists(dash_pdf_path):
+                os.remove(dash_pdf_path)
         except OSError:
             app.logger.warning("Failed removing emailed report files: %s", report_id)
 
@@ -4084,8 +3945,8 @@ def public_files(filename: str):
     """
     name = (filename or "").strip()
     # Only allow our expected filenames.
-    # Allow optional suffixes for derived protected files (e.g., public_<id>_pw.pdf, public_<id>_xlsx.zip).
-    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([A-Za-z0-9]+))?\.(pdf|xlsx|zip)", name)
+    # Allow optional suffixes for derived protected files (e.g., public_<id>_pw.pdf, public_<id>_dashpw.pdf).
+    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([A-Za-z0-9]+))?\.(pdf)", name)
     if not m:
         return ("Not found", 404)
 
@@ -4096,11 +3957,11 @@ def public_files(filename: str):
     if not report_id:
         return ("Not found", 404)
 
-    # For derived files (suffix present) and for all ZIPs, do not generate on demand.
-    if suffix or ext == "zip":
+    # We generate only the base report PDF and base dashboard PDF on demand.
+    # Password-protected variants (suffix: pw / dashpw) must already exist.
+    if suffix and suffix not in ("dash",):
         path = os.path.join(DOWNLOAD_DIR, name)
     else:
-        # Base files public_<id>.pdf|xlsx can be generated on demand from cached report JSON.
         try:
             report_path = os.path.join(DOWNLOAD_DIR, f"{report_id}.json")
             with open(report_path, "r", encoding="utf-8") as f:
@@ -4124,8 +3985,6 @@ def public_files(filename: str):
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
-    if ext == "zip":
-        return send_file(path, as_attachment=False, mimetype="application/zip")
     return send_file(path, as_attachment=False)
 
 
@@ -4442,45 +4301,36 @@ def _deliver_cached_report_via_email(
     report = _load_report_from_cache(report_id)
 
     pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
-    xlsx_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
+    dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_dashboards_{report_id}.pdf")
     filename_pdf = f"retail_forecast_report_{report_id}.pdf"
-    filename_xlsx = f"retail_forecast_report_{report_id}.xlsx"
+    filename_dash_pdf = f"retail_dashboards_{report_id}.pdf"
 
     try:
         _build_pdf_report_file(report, pdf_path)
-        _build_excel_report_file(report, xlsx_path)
+        _build_dashboards_pdf_for_report(report_id, report, dash_pdf_path)
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
-        with open(xlsx_path, "rb") as f:
-            xlsx_bytes = f.read()
+        with open(dash_pdf_path, "rb") as f:
+            dash_pdf_bytes = f.read()
 
         pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
         subject = "Demand Forecasting Report"
 
         if pdf_password:
             pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
-            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
-            if xlsx_open_pw_bytes:
-                body = "Attached are your password-protected report files (PDF and Excel)."
-                delivered_kind = "pdf+xlsx_openpw"
-                attachments = [
-                    (filename_pdf, "application/pdf", pdf_bytes),
-                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_open_pw_bytes),
-                ]
-            else:
-                protected_xlsx_bytes = _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
-                body = "Attached are your password-protected report files (PDF and Excel)."
-                delivered_kind = "pdf+xlsx_editpw"
-                attachments = [
-                    (filename_pdf, "application/pdf", pdf_bytes),
-                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", protected_xlsx_bytes),
-                ]
-        else:
-            body = "Attached are your Retail Demand Forecasting report files (PDF and Excel)."
-            delivered_kind = "pdf+xlsx"
+            dash_pdf_bytes = _encrypt_pdf_bytes_if_requested(dash_pdf_bytes, pdf_password)
+            body = "Attached are your password-protected report files (Report PDF and Dashboard PDF)."
+            delivered_kind = "pdf+dashpdf_pw"
             attachments = [
                 (filename_pdf, "application/pdf", pdf_bytes),
-                (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_bytes),
+                (filename_dash_pdf, "application/pdf", dash_pdf_bytes),
+            ]
+        else:
+            body = "Attached are your Retail Demand Forecasting report files (Report PDF and Dashboard PDF)."
+            delivered_kind = "pdf+dashpdf"
+            attachments = [
+                (filename_pdf, "application/pdf", pdf_bytes),
+                (filename_dash_pdf, "application/pdf", dash_pdf_bytes),
             ]
 
         _send_email_with_attachments_sendgrid(recipient_email, subject, body, attachments)
@@ -4496,8 +4346,8 @@ def _deliver_cached_report_via_email(
         try:
             if os.path.exists(pdf_path):
                 os.remove(pdf_path)
-            if os.path.exists(xlsx_path):
-                os.remove(xlsx_path)
+            if os.path.exists(dash_pdf_path):
+                os.remove(dash_pdf_path)
         except OSError:
             pass
 
@@ -5154,49 +5004,44 @@ def send_whatsapp():
         _ensure_public_report_files(report_id, report)
 
         if pdf_password:
-            pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.pdf")
-            xlsx_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.xlsx")
-            with open(pdf_path, "rb") as f:
-                pdf_bytes = f.read()
-            with open(xlsx_path, "rb") as f:
-                xlsx_bytes = f.read()
+            report_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.pdf")
+            dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}_dash.pdf")
+            with open(report_pdf_path, "rb") as f:
+                report_pdf_bytes = f.read()
+            with open(dash_pdf_path, "rb") as f:
+                dash_pdf_bytes = f.read()
 
-            # Create a password-protected PDF as its own public file.
-            protected_pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
-            protected_pdf_name = f"public_{report_id}_pw.pdf"
-            protected_pdf_path = os.path.join(DOWNLOAD_DIR, protected_pdf_name)
-            with open(protected_pdf_path, "wb") as f:
-                f.write(protected_pdf_bytes)
+            # Create password-protected public files for Twilio to fetch.
+            protected_report_pdf_bytes = _encrypt_pdf_bytes_if_requested(report_pdf_bytes, pdf_password)
+            protected_report_pdf_name = f"public_{report_id}_pw.pdf"
+            protected_report_pdf_path = os.path.join(DOWNLOAD_DIR, protected_report_pdf_name)
+            with open(protected_report_pdf_path, "wb") as f:
+                f.write(protected_report_pdf_bytes)
 
-            # Create a password-protected Excel as its own public file.
-            # Prefer password-to-open on Windows+Excel when available, otherwise fall back
-            # to edit-protected XLSX.
-            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
-            protected_xlsx_bytes = xlsx_open_pw_bytes or _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
-            protected_xlsx_name = f"public_{report_id}_pw.xlsx"
-            protected_xlsx_path = os.path.join(DOWNLOAD_DIR, protected_xlsx_name)
-            with open(protected_xlsx_path, "wb") as f:
-                f.write(protected_xlsx_bytes)
+            protected_dash_pdf_bytes = _encrypt_pdf_bytes_if_requested(dash_pdf_bytes, pdf_password)
+            protected_dash_pdf_name = f"public_{report_id}_dashpw.pdf"
+            protected_dash_pdf_path = os.path.join(DOWNLOAD_DIR, protected_dash_pdf_name)
+            with open(protected_dash_pdf_path, "wb") as f:
+                f.write(protected_dash_pdf_bytes)
 
-            protected_pdf_url = f"{public_base}/files/{protected_pdf_name}"
-            protected_xlsx_url = f"{public_base}/files/{protected_xlsx_name}"
+            protected_report_pdf_url = f"{public_base}/files/{protected_report_pdf_name}"
+            protected_dash_pdf_url = f"{public_base}/files/{protected_dash_pdf_name}"
 
             # Send as two separate WhatsApp messages for compatibility.
-            sid_pdf = _send_whatsapp_media_twilio(number, protected_pdf_url, "Your password-protected Report (PDF)")
-            app.logger.info("Twilio WhatsApp protected PDF sent sid=%s to=%s", sid_pdf, number)
-            sid_xlsx = _send_whatsapp_media_twilio(number, protected_xlsx_url, "Your password-protected Report (Excel)")
-            app.logger.info("Twilio WhatsApp protected Excel sent sid=%s to=%s", sid_xlsx, number)
-            sids = [sid_pdf, sid_xlsx]
+            sid_pdf = _send_whatsapp_media_twilio(number, protected_report_pdf_url, "Your password-protected Report (PDF)")
+            app.logger.info("Twilio WhatsApp protected report PDF sent sid=%s to=%s", sid_pdf, number)
+            sid_dash = _send_whatsapp_media_twilio(number, protected_dash_pdf_url, "Your password-protected Dashboard (PDF)")
+            app.logger.info("Twilio WhatsApp protected dashboards PDF sent sid=%s to=%s", sid_dash, number)
+            sids = [sid_pdf, sid_dash]
         else:
-            pdf_url = f"{public_base}/files/public_{report_id}.pdf"
-            xlsx_url = f"{public_base}/files/public_{report_id}.xlsx"
+            report_pdf_url = f"{public_base}/files/public_{report_id}.pdf"
+            dash_pdf_url = f"{public_base}/files/public_{report_id}_dash.pdf"
 
-            # Send as two separate WhatsApp messages to maximize compatibility.
-            sid_pdf = _send_whatsapp_media_twilio(number, pdf_url, "Your Demand Forecasting Report (PDF)")
-            app.logger.info("Twilio WhatsApp PDF sent sid=%s to=%s", sid_pdf, number)
-            sid_xlsx = _send_whatsapp_media_twilio(number, xlsx_url, "Your Demand Forecasting Report (Excel)")
-            app.logger.info("Twilio WhatsApp Excel sent sid=%s to=%s", sid_xlsx, number)
-            sids = [sid_pdf, sid_xlsx]
+            sid_pdf = _send_whatsapp_media_twilio(number, report_pdf_url, "Your Demand Forecasting Report (PDF)")
+            app.logger.info("Twilio WhatsApp report PDF sent sid=%s to=%s", sid_pdf, number)
+            sid_dash = _send_whatsapp_media_twilio(number, dash_pdf_url, "Your Demand Forecasting Dashboard (PDF)")
+            app.logger.info("Twilio WhatsApp dashboards PDF sent sid=%s to=%s", sid_dash, number)
+            sids = [sid_pdf, sid_dash]
 
         session["whatsapp_last_sent_at"] = now
         return jsonify({"ok": True, "message": "Report sent to WhatsApp successfully.", "sids": sids})
@@ -5218,8 +5063,6 @@ def send_whatsapp():
             return jsonify({"ok": False, "message": "WhatsApp service is not configured on the server."}), 500
         if "missing_twilio_sdk" in msg:
             return jsonify({"ok": False, "message": "WhatsApp service is unavailable on the server."}), 500
-        if "zip_encryption_unavailable" in msg or "xlsx_protection_unavailable" in msg:
-            return jsonify({"ok": False, "message": "Excel password protection is not available on the server."}), 503
         return jsonify({"ok": False, "message": _twilio_error_to_user_message(e)}), 500
 
 if __name__ == "__main__":

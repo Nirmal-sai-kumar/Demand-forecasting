@@ -154,14 +154,14 @@ On Render, set environment variables in your service:
 
 Do not rely on a local `.env` file for production deployments.
 
-Emailing the PDF report (optional):
+Emailing the report PDFs (optional):
 
 - `SENDGRID_API_KEY`: SendGrid API key (required to email PDFs)
 - `SENDGRID_FROM`: Verified sender email address in SendGrid (required)
 
 ## WhatsApp (Twilio) Report Sending (Optional)
 
-The results page includes a **“Send to WhatsApp”** button that sends the generated **PDF and Excel** report using the **Twilio WhatsApp Sandbox**.
+The results page includes a **“Send to WhatsApp”** button that sends two generated PDFs (**Report PDF** + **Dashboard PDF**) using the **Twilio WhatsApp Sandbox**.
 
 ### Required environment variables
 
