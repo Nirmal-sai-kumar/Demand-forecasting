@@ -4473,12 +4473,19 @@ def api_settings_password_confirm():
         return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
 
     payload = request.get_json(silent=True) or {}
-    otp = (payload.get("otp") or payload.get("code") or "").strip()
+    otp_value = payload.get("otp")
+    if otp_value is None:
+        otp_value = payload.get("code")
+    if otp_value is None:
+        otp_value = ""
+    otp = str(otp_value)
     new_password = (payload.get("new_password") or payload.get("newPassword") or "").strip()
     confirm_password = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
 
     if not otp:
         return jsonify({"ok": False, "message": "OTP is required."}), 400
+    if not re.fullmatch(r"\d{6}", otp):
+        return jsonify({"ok": False, "message": "OTP must be exactly 6 digits (no spaces)."}), 400
     if not new_password or not confirm_password:
         return jsonify({"ok": False, "message": "New password and confirmation are required."}), 400
     if new_password != confirm_password:

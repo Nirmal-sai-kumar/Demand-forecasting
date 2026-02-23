@@ -568,8 +568,9 @@
       }
 
       if (confirmBtn && !confirmBtnBaseDisabled && !isBusy(confirmBtn)) {
-        const otp = (otpEl && otpEl.value) ? otpEl.value.trim() : '';
-        const enableConfirm = Boolean(otp) && strengthOk && matchOk && notSameAsOld;
+        const otpRaw = (otpEl && typeof otpEl.value === 'string') ? otpEl.value : '';
+        const otpOk = /^\d{6}$/.test(otpRaw);
+        const enableConfirm = otpOk && strengthOk && matchOk && notSameAsOld;
         confirmBtn.disabled = !enableConfirm;
       }
     }
@@ -649,9 +650,13 @@
       confirmBtn.addEventListener('click', async function () {
         setStatus('', false);
         const v = getVals();
-        const otp = (otpEl && otpEl.value) ? otpEl.value.trim() : '';
-        if (!otp) {
+        const otpRaw = (otpEl && typeof otpEl.value === 'string') ? otpEl.value : '';
+        if (!otpRaw) {
           setStatus('Please enter the OTP code.', true);
+          return;
+        }
+        if (!/^\d{6}$/.test(otpRaw)) {
+          setStatus('OTP must be exactly 6 digits (no spaces).', true);
           return;
         }
         if (!v.new_password || v.new_password !== v.confirm_password) {
@@ -670,7 +675,7 @@
         setStatus('Updating password…', false);
         try {
           const { res, data } = await postJson('/api/settings/password/confirm', {
-            otp,
+            otp: otpRaw,
             new_password: v.new_password,
             confirm_password: v.confirm_password,
           });
