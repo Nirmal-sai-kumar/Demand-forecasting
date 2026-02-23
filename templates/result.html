@@ -367,6 +367,145 @@
             font-weight: bold;
             font-size: 13px;
         }
+
+        /* Password modal (monkey show/hide) */
+        .pw-modal {
+            position: fixed;
+            inset: 0;
+            display: none;
+            z-index: 2500;
+        }
+
+        .pw-modal[data-open="true"] {
+            display: block;
+        }
+
+        .pw-modal-backdrop {
+            position: absolute;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+        }
+
+        .pw-modal-dialog {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            width: min(520px, calc(100vw - 32px));
+            background: #ffffff;
+            border-radius: 12px;
+            border: 1px solid #cfd8dc;
+            box-shadow: 0 12px 30px rgba(0,0,0,0.20);
+            padding: 16px 16px 14px;
+        }
+
+        body.theme-dark .pw-modal-dialog {
+            background: #ecf0f1;
+        }
+
+        .pw-modal-dialog h3 {
+            margin: 0 0 6px;
+            color: #2c3e50;
+            font-size: 16px;
+        }
+
+        .pw-modal-sub {
+            margin: 0 0 12px;
+            font-size: 13px;
+            color: #546e7a;
+        }
+
+        .pw-input-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .pw-input-row input {
+            flex: 1;
+            padding: 10px 12px;
+            border: 1px solid #cfd8dc;
+            border-radius: 10px;
+            font-size: 14px;
+        }
+
+        .pw-toggle {
+            width: 44px;
+            height: 40px;
+            border-radius: 10px;
+            border: 1px solid #cfd8dc;
+            background: #ffffff;
+            cursor: pointer;
+            font-size: 18px;
+            line-height: 1;
+        }
+
+        .pw-toggle:hover {
+            background: #f4f6f8;
+        }
+
+        .pw-modal-actions {
+            margin-top: 12px;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+
+        .pw-modal-actions .btn {
+            padding: 10px 14px;
+            border-radius: 10px;
+        }
+
+        .pw-modal-actions button:disabled {
+            opacity: 0.65;
+            cursor: not-allowed;
+        }
+
+        .pw-modal-err {
+            display: none;
+            margin: 10px 0 0;
+            font-size: 13px;
+            color: #c62828;
+            font-weight: bold;
+        }
+
+        .pw-modal-match {
+            display: none;
+            margin: 10px 0 0;
+            font-size: 13px;
+            font-weight: bold;
+        }
+
+        .pw-modal-match.ok {
+            color: green;
+        }
+
+        .pw-modal-match.bad {
+            color: #c62828;
+        }
+
+        .pw-reqs {
+            display: none;
+            text-align: left;
+            font-size: 12px;
+            color: #666;
+            margin: 10px 0 0;
+            padding-left: 18px;
+        }
+
+        .pw-reqs li {
+            margin: 4px 0;
+        }
+
+        .req-met {
+            color: green;
+            font-weight: bold;
+        }
+
+        .req-miss {
+            color: #c62828;
+            font-weight: bold;
+        }
     </style>
 </head>
 
@@ -501,6 +640,294 @@
 
 </div>
 
+<!-- Password modal (used by Email/WhatsApp flows) -->
+<div class="pw-modal" id="pwModal" data-open="false" aria-hidden="true">
+    <div class="pw-modal-backdrop" id="pwModalBackdrop"></div>
+    <div class="pw-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="pwModalTitle">
+        <h3 id="pwModalTitle">Set password for PDFs</h3>
+        <p class="pw-modal-sub">This password will be required to open both PDFs.</p>
+        <p class="pw-modal-sub" style="margin-top: -6px;">⚠️ This password cannot be recovered. Please remember it.</p>
+        <div class="pw-input-row">
+            <input type="password" id="pwModalInput" placeholder="Enter password" minlength="8" autocomplete="new-password" />
+            <button type="button" class="pw-toggle" id="pwModalToggle" aria-label="Show password" title="Show password">🙈</button>
+        </div>
+        <div class="pw-input-row" style="margin-top: 10px;">
+            <input type="password" id="pwModalConfirm" placeholder="Confirm password" minlength="8" autocomplete="new-password" />
+            <button type="button" class="pw-toggle" id="pwModalConfirmToggle" aria-label="Show password" title="Show password">🙈</button>
+        </div>
+        <p id="pwModalMatch" class="pw-modal-match" aria-live="polite"></p>
+        <p id="pwModalError" class="pw-modal-err" role="alert" aria-atomic="true"></p>
+        <ul id="pwModalReqs" class="pw-reqs" aria-live="polite">
+            <li id="pwMReqLen" class="req-miss" role="checkbox" aria-checked="false" data-label="At least 8 characters">✗ At least 8 characters</li>
+            <li id="pwMReqLower" class="req-miss" role="checkbox" aria-checked="false" data-label="One small letter (a-z)">✗ One small letter (a-z)</li>
+            <li id="pwMReqUpper" class="req-miss" role="checkbox" aria-checked="false" data-label="One capital letter (A-Z)">✗ One capital letter (A-Z)</li>
+            <li id="pwMReqNum" class="req-miss" role="checkbox" aria-checked="false" data-label="One number (0-9)">✗ One number (0-9)</li>
+            <li id="pwMReqSpec" class="req-miss" role="checkbox" aria-checked="false" data-label="One special character (e.g., !@#$)">✗ One special character (e.g., !@#$)</li>
+        </ul>
+        <div class="pw-modal-actions">
+            <button type="button" class="btn btn-secondary" id="pwModalCancel">Cancel</button>
+            <button type="button" class="btn btn-tertiary" id="pwModalOk">OK</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    window.PASSWORD_POLICY = {{ password_policy|default({})|tojson }};
+</script>
+
+<script>
+(function () {
+    const modal = document.getElementById('pwModal');
+    const backdrop = document.getElementById('pwModalBackdrop');
+    const input = document.getElementById('pwModalInput');
+    const confirmInput = document.getElementById('pwModalConfirm');
+    const toggle = document.getElementById('pwModalToggle');
+    const confirmToggle = document.getElementById('pwModalConfirmToggle');
+    const okBtn = document.getElementById('pwModalOk');
+    const cancelBtn = document.getElementById('pwModalCancel');
+    const matchEl = document.getElementById('pwModalMatch');
+    const errEl = document.getElementById('pwModalError');
+    const reqBox = document.getElementById('pwModalReqs');
+
+    if (!modal || !backdrop || !input || !confirmInput || !toggle || !confirmToggle || !okBtn || !cancelBtn || !matchEl || !errEl || !reqBox) {
+        return;
+    }
+
+    let resolver = null;
+
+    function clearErr() {
+        errEl.textContent = '';
+        errEl.style.display = 'none';
+    }
+
+    function showErr(msg) {
+        errEl.textContent = msg;
+        errEl.style.display = 'block';
+    }
+
+    function clearMatch() {
+        matchEl.textContent = '';
+        matchEl.classList.remove('ok', 'bad');
+        matchEl.style.display = 'none';
+    }
+
+    function showMatch(isMatch) {
+        matchEl.textContent = isMatch ? '✓ Passwords match.' : '✗ Passwords do not match.';
+        matchEl.classList.toggle('ok', Boolean(isMatch));
+        matchEl.classList.toggle('bad', !isMatch);
+        matchEl.style.display = 'block';
+    }
+
+    function setReq(el, ok) {
+        if (!el) return;
+        el.className = ok ? 'req-met' : 'req-miss';
+        el.setAttribute('aria-checked', ok ? 'true' : 'false');
+        const label = el.getAttribute('data-label') || '';
+        el.textContent = (ok ? '✓ ' : '✗ ') + label;
+    }
+
+    function setToggleState(btn, isHidden) {
+        if (!btn) return;
+        btn.textContent = isHidden ? '🙈' : '👀';
+        btn.setAttribute('aria-label', isHidden ? 'Show password' : 'Hide password');
+        btn.setAttribute('title', isHidden ? 'Show password' : 'Hide password');
+    }
+
+    function updateChecklist(pw) {
+        const policy = window.PASSWORD_POLICY || {};
+        const minLen = Number(policy.min_len || 8);
+        const upperRe = new RegExp(policy.upper_pattern || '[A-Z]');
+        const digitRe = new RegExp(policy.digit_pattern || '\\d');
+        const specialRe = new RegExp(policy.special_pattern || '[^A-Za-z0-9]');
+        const lowerRe = /[a-z]/;
+
+        if (pw && pw.length > 0) {
+            reqBox.style.display = 'block';
+        }
+
+        setReq(document.getElementById('pwMReqLen'), (pw || '').length >= minLen);
+        setReq(document.getElementById('pwMReqLower'), lowerRe.test(pw || ''));
+        setReq(document.getElementById('pwMReqUpper'), upperRe.test(pw || ''));
+        setReq(document.getElementById('pwMReqNum'), digitRe.test(pw || ''));
+        setReq(document.getElementById('pwMReqSpec'), specialRe.test(pw || ''));
+    }
+
+    function passwordStrengthError(pw) {
+        if (!pw) return 'Please enter a password.';
+
+        const policy = window.PASSWORD_POLICY || {};
+        const minLen = Number(policy.min_len || 8);
+        const upperRe = new RegExp(policy.upper_pattern || '[A-Z]');
+        const digitRe = new RegExp(policy.digit_pattern || '\\d');
+        const specialRe = new RegExp(policy.special_pattern || '[^A-Za-z0-9]');
+        const lowerRe = /[a-z]/;
+
+        const missing = [];
+        if (pw.length < minLen) missing.push('at least 8 characters');
+        if (!lowerRe.test(pw)) missing.push('one small letter (a-z)');
+        if (!upperRe.test(pw)) missing.push('one capital letter (A-Z)');
+        if (!digitRe.test(pw)) missing.push('one number (0-9)');
+        if (!specialRe.test(pw)) missing.push('one special character (e.g., !@#$)');
+
+        if (missing.length === 0) return null;
+        if (missing.length === 1 && missing[0] === 'at least 8 characters') {
+            return 'Password is weak: must be at least 8 characters.';
+        }
+        return 'Password is weak. Missing: ' + missing.join(', ') + '.';
+    }
+
+    function setOkEnabled(enabled) {
+        okBtn.disabled = !enabled;
+        okBtn.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+    }
+
+    function liveUpdateOkAndMismatchError() {
+        const pw = (input.value || '').trim();
+        const confirm = (confirmInput.value || '').trim();
+        const strengthErr = passwordStrengthError(pw);
+
+        // Strength is communicated via checklist; show a separate match/mismatch message live.
+        clearErr();
+        if (pw && confirm) {
+            showMatch(pw === confirm);
+        } else {
+            clearMatch();
+        }
+
+        const ok = Boolean(pw) && Boolean(confirm) && pw === confirm && !strengthErr;
+        setOkEnabled(ok);
+    }
+
+    function validateAndMaybeShowError() {
+        const pw = (input.value || '').trim();
+        const confirm = (confirmInput.value || '').trim();
+
+        updateChecklist(pw);
+
+        if (!pw) {
+            showErr('Please enter a password.');
+            setOkEnabled(false);
+            return { ok: false, pw, confirm };
+        }
+        if (!confirm) {
+            showErr('Please confirm the password.');
+            setOkEnabled(false);
+            return { ok: false, pw, confirm };
+        }
+        if (pw !== confirm) {
+            showErr('Passwords do not match.');
+            setOkEnabled(false);
+            return { ok: false, pw, confirm };
+        }
+
+        const err = passwordStrengthError(pw);
+        if (err) {
+            showErr(err);
+            setOkEnabled(false);
+            return { ok: false, pw, confirm };
+        }
+
+        clearErr();
+        setOkEnabled(true);
+        return { ok: true, pw, confirm };
+    }
+
+    function setOpen(open) {
+        modal.dataset.open = open ? 'true' : 'false';
+        modal.setAttribute('aria-hidden', open ? 'false' : 'true');
+        if (open) {
+            input.value = '';
+            confirmInput.value = '';
+            input.type = 'password';
+            confirmInput.type = 'password';
+            setToggleState(toggle, true);
+            setToggleState(confirmToggle, true);
+            clearErr();
+            clearMatch();
+            reqBox.style.display = 'none';
+            updateChecklist('');
+            setOkEnabled(false);
+            try { input.focus(); } catch (e) {}
+        }
+    }
+
+    function finish(value) {
+        const fn = resolver;
+        resolver = null;
+        setOpen(false);
+        if (fn) fn(value);
+    }
+
+    function onKeyDown(e) {
+        if (modal.dataset.open !== 'true') return;
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            finish(null);
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            const res = validateAndMaybeShowError();
+            if (!res.ok) return;
+            finish(res.pw);
+        }
+    }
+
+    input.addEventListener('focus', function () {
+        reqBox.style.display = 'block';
+        updateChecklist((input.value || '').trim());
+        liveUpdateOkAndMismatchError();
+    });
+    input.addEventListener('blur', function () {
+        const pw = (input.value || '').trim();
+        if (pw.length === 0) reqBox.style.display = 'none';
+    });
+    input.addEventListener('input', function () {
+        updateChecklist((input.value || '').trim());
+        liveUpdateOkAndMismatchError();
+    });
+
+    confirmInput.addEventListener('input', function () {
+        liveUpdateOkAndMismatchError();
+    });
+
+    toggle.addEventListener('click', function () {
+        const isHidden = input.type === 'password';
+        input.type = isHidden ? 'text' : 'password';
+        setToggleState(toggle, input.type === 'password');
+        try { input.focus(); } catch (e) {}
+    });
+
+    confirmToggle.addEventListener('click', function () {
+        const isHidden = confirmInput.type === 'password';
+        confirmInput.type = isHidden ? 'text' : 'password';
+        setToggleState(confirmToggle, confirmInput.type === 'password');
+        try { confirmInput.focus(); } catch (e) {}
+    });
+
+    okBtn.addEventListener('click', function () {
+        const res = validateAndMaybeShowError();
+        if (!res.ok) return;
+        finish(res.pw);
+    });
+    cancelBtn.addEventListener('click', function () {
+        finish(null);
+    });
+    backdrop.addEventListener('click', function () {
+        finish(null);
+    });
+    document.addEventListener('keydown', onKeyDown);
+
+    window.askPdfPasswordWithMonkey = function () {
+        if (modal.dataset.open === 'true') {
+            return Promise.resolve(null);
+        }
+        return new Promise((resolve) => {
+            resolver = resolve;
+            setOpen(true);
+        });
+    };
+})();
+</script>
+
 <script>
 (function () {
     const selfBtn = document.getElementById('emailSelfBtn');
@@ -545,12 +972,13 @@
             let pdf_password = '';
             const wantsPassword = window.confirm('Protect the report files with a password? (Both PDFs will be encrypted with the same password)');
             if (wantsPassword) {
-                pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
-                if (!pdf_password) {
-                    const msg = 'Password protection was selected but no password was provided.';
-                    setStatus(msg);
-                    window.alert(msg);
+                pdf_password = await (window.askPdfPasswordWithMonkey ? window.askPdfPasswordWithMonkey() : Promise.resolve(''));
+                if (pdf_password === null) {
                     return;
+                }
+                // If user cancels/clears the modal, proceed without password.
+                if (!pdf_password) {
+                    pdf_password = '';
                 }
             }
 
@@ -585,12 +1013,13 @@
         let pdf_password = '';
         const wantsPassword = window.confirm('Protect the report files with a password? (Both PDFs will be encrypted with the same password)');
         if (wantsPassword) {
-            pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
-            if (!pdf_password) {
-                const msg = 'Password protection was selected but no password was provided.';
-                setStatus(msg);
-                window.alert(msg);
+            pdf_password = await (window.askPdfPasswordWithMonkey ? window.askPdfPasswordWithMonkey() : Promise.resolve(''));
+            if (pdf_password === null) {
                 return;
+            }
+            // If user cancels/clears the modal, proceed without password.
+            if (!pdf_password) {
+                pdf_password = '';
             }
         }
 
@@ -840,12 +1269,13 @@
         let pdf_password = '';
         const wantsPassword = window.confirm('Protect the report files with a password? (Sends 2 PDFs as separate files to WhatsApp)');
         if (wantsPassword) {
-            pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
-            if (!pdf_password) {
-                const msg = 'Password protection was selected but no password was provided.';
-                setStatus(msg);
-                window.alert(msg);
+            pdf_password = await (window.askPdfPasswordWithMonkey ? window.askPdfPasswordWithMonkey() : Promise.resolve(''));
+            if (pdf_password === null) {
                 return;
+            }
+            // If user cancels/clears the modal, proceed without password.
+            if (!pdf_password) {
+                pdf_password = '';
             }
         }
 
