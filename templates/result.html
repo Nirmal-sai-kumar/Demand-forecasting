@@ -442,7 +442,6 @@
     <div class="card">
         <h2>Download Forecast Reports</h2>
         <div class="download-buttons">
-            <a class="btn btn-secondary" href="/download/excel">📥 Download Excel</a>
             <a class="btn btn-secondary" href="/download/pdf">📄 Download PDF</a>
             <a class="btn btn-tertiary" href="#" id="emailSelfBtn">📩 Email to Me</a>
             <a class="btn btn-tertiary" href="#" id="emailPdfBtn">📧 Email</a>
@@ -544,7 +543,7 @@
 
             // Optional password protection for self email.
             let pdf_password = '';
-            const wantsPassword = window.confirm('Protect the report with a password? (PDF will be encrypted; Excel will ask for the same password when opened)');
+            const wantsPassword = window.confirm('Protect the report files with a password? (Both PDFs will be encrypted with the same password)');
             if (wantsPassword) {
                 pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
                 if (!pdf_password) {
@@ -578,13 +577,13 @@
 
     btn.addEventListener('click', async function (e) {
         e.preventDefault();
-        const email = (window.prompt('Enter email address to send the report files (PDF + Excel):') || '').trim();
+        const email = (window.prompt('Enter email address to send the report files (2 PDFs):') || '').trim();
         if (!email) return;
 
         // Optional password protection.
         // The password is NEVER sent via email body; it is used only to encrypt the PDF server-side.
         let pdf_password = '';
-        const wantsPassword = window.confirm('Protect the report with a password? (PDF will be encrypted; Excel will ask for the same password when opened)');
+        const wantsPassword = window.confirm('Protect the report files with a password? (Both PDFs will be encrypted with the same password)');
         if (wantsPassword) {
             pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
             if (!pdf_password) {
@@ -837,9 +836,9 @@
             return;
         }
 
-        // Optional password protection: sends two separate protected files (PDF + Excel).
+        // Optional password protection: sends two separate protected files (Report PDF + Dashboard PDF).
         let pdf_password = '';
-        const wantsPassword = window.confirm('Protect the report files with a password? (Sends PDF + Excel as separate files to WhatsApp)');
+        const wantsPassword = window.confirm('Protect the report files with a password? (Sends 2 PDFs as separate files to WhatsApp)');
         if (wantsPassword) {
             pdf_password = (window.prompt('Enter a strong password (min 8 chars, upper/lowercase, number, symbol):') || '').trim();
             if (!pdf_password) {
