@@ -3201,6 +3201,7 @@ def reset_password():
             error="Password reset is not configured on this server.",
             supabase_url="",
             supabase_anon_key="",
+            password_policy=_password_policy_payload(),
         )
 
     # Optional query-param tokens (some auth flows may use query instead of hash)
@@ -3215,12 +3216,14 @@ def reset_password():
             error="Missing recovery tokens. Please open this page from the reset email link.",
             supabase_url=supabase_url,
             supabase_anon_key=supabase_anon_key,
+            password_policy=_password_policy_payload(),
         )
 
     return render_template(
         "reset_password.html",
         supabase_url=supabase_url,
         supabase_anon_key=supabase_anon_key,
+        password_policy=_password_policy_payload(),
     )
 
 # ---------- HOME ----------
@@ -3253,6 +3256,7 @@ def result_page():
 
     return render_template(
         "result.html",
+        password_policy=_password_policy_payload(),
         past_image=report.get("past_image"),
         future_image=report.get("future_image"),
         months=int(report.get("months") or 0),
@@ -3330,7 +3334,7 @@ def settings_page():
     # Keep the session flag reasonably fresh.
     _refresh_sender_verified_state_best_effort()
 
-    return render_template("settings.html")
+    return render_template("settings.html", password_policy=_password_policy_payload())
 
 # ---------- LOGOUT ----------
 @app.route('/logout')
@@ -4406,6 +4410,8 @@ def api_settings_password_init():
         return jsonify({"ok": False, "message": "Old password is required."}), 400
     if not new_password or not confirm_password:
         return jsonify({"ok": False, "message": "New password and confirmation are required."}), 400
+    if old_password == new_password:
+        return jsonify({"ok": False, "message": "Old and new passwords are same."}), 400
     if new_password != confirm_password:
         return jsonify({"ok": False, "message": "New password and confirmation do not match."}), 400
 
