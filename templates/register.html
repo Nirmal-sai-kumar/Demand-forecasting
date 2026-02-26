@@ -137,6 +137,7 @@
     <p id="clientError" class="error" style="display:none;" role="alert" aria-atomic="true" tabindex="-1"></p>
 
     <form id="registerForm" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="register_nonce" value="{{ register_nonce|default('') }}">
 
         <input type="email" name="username" placeholder="Email" required {% if form_disabled %}disabled{% endif %}>

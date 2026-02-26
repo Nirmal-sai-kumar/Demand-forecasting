@@ -4,8 +4,9 @@ import base64
 import io
 import urllib.request
 import urllib.error
+from xml.sax.saxutils import escape as _xml_escape
 
-from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request, jsonify
+from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request, jsonify, Response
 import json
 import logging
 import os
@@ -19,6 +20,8 @@ import time
 from urllib.parse import urlparse
 from typing import List, Union, Optional
 from uuid import uuid4
+
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import numpy as np
 import xgboost as xgb
@@ -49,19 +52,10 @@ except Exception:  # pragma: no cover
     )
 
 try:
-    # Optional: AES-encrypted ZIP for sending PDF+XLSX together.
+    # Optional: AES-encrypted ZIP for sending multiple attachments together.
     import pyzipper  # type: ignore
 except Exception:  # pragma: no cover
     pyzipper = None
-
-try:
-    # Optional: used to apply worksheet/workbook protection to XLSX.
-    from openpyxl import load_workbook  # type: ignore
-    from openpyxl.workbook.protection import WorkbookProtection, hash_password  # type: ignore
-except Exception:  # pragma: no cover
-    load_workbook = None
-    WorkbookProtection = None
-    hash_password = None
 
 try:
     # Optional but recommended for robust email validation.
@@ -111,6 +105,7 @@ if not UNIT_TESTING:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    import matplotlib.ticker as mticker
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
@@ -138,6 +133,30 @@ else:
         raise RuntimeError("Supabase admin client is unavailable in UNIT_TESTING mode")
 
 logging.basicConfig(level=logging.INFO)
+
+
+def _is_production_env() -> bool:
+    """Return True when running in a deployed/public environment.
+
+    Render sets RENDER/RENDER_EXTERNAL_URL. For other hosts, use APP_ENV or FLASK_ENV.
+    """
+    env = (os.getenv("APP_ENV") or os.getenv("FLASK_ENV") or "").strip().lower()
+    if env in ("prod", "production"):
+        return True
+    if os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"):
+        return True
+    return False
+
+
+def _debug_enabled() -> bool:
+    """Enable debug locally, disable automatically in production."""
+    if _is_production_env():
+        return False
+    v = (os.getenv("FLASK_DEBUG") or "").strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    # Default: ON for local/dev environments.
+    return True
 
 # ---------- RUNTIME FOLDERS (writable on Render) ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -191,6 +210,12 @@ REPORT_SEND_RATE_LIMIT = int(os.getenv("REPORT_SEND_RATE_LIMIT", "10"))
 REPORT_SEND_RATE_WINDOW_SECONDS = int(os.getenv("REPORT_SEND_RATE_WINDOW_SECONDS", str(15 * 60)))
 
 RECIPIENT_COOLDOWN_SECONDS = int(os.getenv("RECIPIENT_COOLDOWN_SECONDS", str(5 * 60)))
+
+# ---------- SETTINGS: PASSWORD CHANGE OTP + AVATAR UPLOAD ----------
+PW_CHANGE_OTP_TTL_SECONDS = int(os.getenv("PW_CHANGE_OTP_TTL_SECONDS", str(10 * 60)))
+PW_CHANGE_OTP_COOLDOWN_SECONDS = int(os.getenv("PW_CHANGE_OTP_COOLDOWN_SECONDS", str(60)))
+PW_CHANGE_OTP_MAX_ATTEMPTS = int(os.getenv("PW_CHANGE_OTP_MAX_ATTEMPTS", str(5)))
+PW_CHANGE_MIN_PASSWORD_LEN = int(os.getenv("PW_CHANGE_MIN_PASSWORD_LEN", str(8)))
 
 COMMON_PASSWORDS = {
     "password",
@@ -577,92 +602,6 @@ def _encrypt_zip_bytes_aes(attachments: list[tuple[str, bytes]], password: str) 
     return _encrypt_zip_bytes(attachments, password, mode="aes")
 
 
-def _protect_xlsx_bytes_if_requested(xlsx_bytes: bytes, password: str | None) -> bytes:
-    """Apply password protection to XLSX bytes if requested.
-
-    Important: OpenPyXL cannot apply "file open" encryption for XLSX.
-    This implements workbook/worksheet protection so edits require a password.
-    """
-    if not password:
-        return xlsx_bytes
-    if load_workbook is None or WorkbookProtection is None or hash_password is None:
-        raise RuntimeError("xlsx_protection_unavailable")
-
-    wb = load_workbook(io.BytesIO(xlsx_bytes))
-
-    # Best-effort lock workbook structure.
-    try:
-        wb.security = WorkbookProtection(lockStructure=True, workbookPassword=hash_password(password))
-    except Exception:
-        pass
-
-    for ws in wb.worksheets:
-        try:
-            ws.protection.sheet = True
-            ws.protection.set_password(password)
-        except Exception:
-            pass
-
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
-
-
-def _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes: bytes, password: str | None) -> bytes | None:
-    """Return XLSX bytes encrypted with a password-to-open, if possible.
-
-    This requires Windows + Microsoft Excel installed (COM automation).
-    If unavailable, returns None so callers can fall back.
-    """
-    if not password:
-        return None
-    if os.name != "nt":
-        return None
-
-    try:
-        import win32com.client  # type: ignore
-    except Exception:
-        return None
-
-    # Write input to a temp file, then use Excel to SaveAs with password.
-    with tempfile.TemporaryDirectory(prefix="xlsxpw_") as td:
-        in_path = os.path.join(td, "in.xlsx")
-        out_path = os.path.join(td, "out.xlsx")
-        with open(in_path, "wb") as f:
-            f.write(xlsx_bytes)
-
-        excel = None
-        wb = None
-        try:
-            excel = win32com.client.DispatchEx("Excel.Application")
-            excel.Visible = False
-            excel.DisplayAlerts = False
-            wb = excel.Workbooks.Open(in_path, ReadOnly=False)
-
-            # SaveAs supports Password parameter for password-to-open.
-            # FileFormat 51 is xlOpenXMLWorkbook (.xlsx)
-            wb.SaveAs(out_path, FileFormat=51, Password=password)
-        except Exception:
-            return None
-        finally:
-            try:
-                if wb is not None:
-                    wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-            try:
-                if excel is not None:
-                    excel.Quit()
-            except Exception:
-                pass
-
-        try:
-            with open(out_path, "rb") as f:
-                return f.read()
-        except Exception:
-            return None
-
-
 class CacheWriteError(RuntimeError):
     """Raised when writing a cache/temp file fails."""
 
@@ -976,6 +915,17 @@ class AppConfig:
                     return s
             return None
 
+        def _getenv_str(name: str) -> str:
+            """Read env var as a trimmed string.
+
+            On Windows, some editors save `.env` as UTF-8 with BOM which can cause
+            python-dotenv to load the key name with a leading BOM (\ufeff).
+            """
+            v = os.getenv(name)
+            if v is None:
+                v = os.getenv("\ufeff" + name)
+            return (v or "").strip()
+
         def _safe_float_env(name: str, default: float) -> float:
             raw = os.getenv(name)
             if raw is None:
@@ -1008,7 +958,16 @@ class AppConfig:
             )
             or app_base_url
         ).rstrip("/")
-        flask_secret_key = os.getenv("FLASK_SECRET_KEY", "retail_secret_key")
+        flask_secret_key = _getenv_str("FLASK_SECRET_KEY")
+        if not flask_secret_key and not UNIT_TESTING:
+            raise RuntimeError(
+                "FLASK_SECRET_KEY is required. Set it as an environment variable (and do not commit it)."
+            )
+        # Enforce strong secrets for public deployments.
+        if flask_secret_key and len(flask_secret_key) < 32 and not UNIT_TESTING:
+            raise RuntimeError(
+                "FLASK_SECRET_KEY is too short. Use a long random value (>= 32 characters)."
+            )
         trend_eps = _safe_float_env("TREND_EPS", DEFAULT_TREND_EPS)
         cleanup_max_age_hours = _safe_float_env("CLEANUP_MAX_AGE_HOURS", DEFAULT_CLEANUP_MAX_AGE_HOURS)
 
@@ -1045,14 +1004,175 @@ app = Flask(__name__)
 app.static_folder = GRAPH_DIR
 app.secret_key = CONFIG.flask_secret_key
 
+
+def _format_rupees_millions(value: object) -> str:
+    """Format a numeric rupee amount using compact Millions (M).
+
+    Examples:
+    - 184921171 -> 184.9M
+    - 950000 -> 950,000
+    """
+    try:
+        numeric = float(value)
+    except Exception:
+        return str(value)
+
+    sign = "-" if numeric < 0 else ""
+    numeric = abs(numeric)
+
+    if numeric >= 1_000_000:
+        return f"{sign}{numeric / 1_000_000:.1f}M"
+    # For dashboard/report numbers, showing fractional millions is easier to scan.
+    # Avoid displaying tiny values as 0.00M.
+    if numeric >= 100_000:
+        return f"{sign}{numeric / 1_000_000:.2f}M"
+    return f"{sign}{numeric:,.0f}"
+
+
+@app.template_filter("format_millions")
+def _jinja_format_millions(value: object) -> str:
+    return _format_rupees_millions(value)
+
+# When behind a reverse proxy (Render), respect X-Forwarded-* for HTTPS detection.
+if _is_production_env():
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
 # Session cookie defaults (helps login sessions behave consistently)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    # Only mark session cookies as secure in production/HTTPS deployments.
+    SESSION_COOKIE_SECURE=_is_production_env(),
 )
 
 # Base URL for auth redirects
 APP_BASE_URL = CONFIG.app_base_url
+
+
+# ---------------- CSRF protection ----------------
+_CSRF_SESSION_KEY = "csrf_token"
+_CSRF_HEADER = "X-CSRF-Token"
+
+
+def _get_or_create_csrf_token() -> str:
+    token = session.get(_CSRF_SESSION_KEY)
+    if isinstance(token, str) and len(token) >= 32:
+        return token
+    token = secrets.token_urlsafe(32)
+    session[_CSRF_SESSION_KEY] = token
+    return token
+
+
+def _read_csrf_token_from_request() -> str | None:
+    # Header for fetch/XHR
+    header = (request.headers.get(_CSRF_HEADER) or request.headers.get("X-CSRFToken") or "").strip()
+    if header:
+        return header
+
+    # JSON body
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+        try:
+            v = payload.get("csrf_token") or payload.get("csrf")
+        except Exception:
+            v = None
+        if v is not None:
+            s = str(v).strip()
+            if s:
+                return s
+
+    # Form field
+    v = (request.form.get("csrf_token") or request.form.get("csrf") or "").strip()
+    return v or None
+
+
+def _csrf_failure_response():
+    msg = "Security check failed. Refresh the page and try again."
+    # Prefer JSON for APIs/fetch
+    wants_json = request.is_json or request.path.startswith("/api/") or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+    if wants_json:
+        return jsonify({"ok": False, "message": msg}), 400
+
+    # Render best-effort for common form endpoints.
+    if request.endpoint == "login":
+        return render_template("login.html", error=msg), 400
+    if request.endpoint == "register":
+        policy = _password_policy_payload()
+        return render_template(
+            "register.html",
+            error=msg,
+            password_policy=policy,
+            register_nonce=_issue_form_nonce("register_nonce"),
+        ), 400
+    if request.endpoint == "forgot_password":
+        return render_template("forgot_password.html", error=msg), 400
+    if request.endpoint == "upload":
+        return render_template("index.html", error=msg), 400
+
+    return (msg, 400)
+
+
+@app.before_request
+def _csrf_protect_unsafe_methods():
+    if UNIT_TESTING:
+        return None
+    if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
+        return None
+    if request.endpoint == "static":
+        return None
+
+    expected = session.get(_CSRF_SESSION_KEY)
+    supplied = _read_csrf_token_from_request()
+    if not expected or not supplied or not secrets.compare_digest(str(expected), str(supplied)):
+        return _csrf_failure_response()
+
+    return None
+
+
+@app.context_processor
+def _inject_csrf_token():
+    # Ensures templates can always render a token.
+    return {"csrf_token": _get_or_create_csrf_token()}
+
+
+def _request_is_https() -> bool:
+    if request.is_secure:
+        return True
+    xf_proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    return xf_proto == "https"
+
+
+@app.after_request
+def _set_security_headers(resp):
+    # Basic hardening headers
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), interest-cohort=()",
+    )
+
+    # Conservative CSP that still allows inline scripts used in templates.
+    # If you later move scripts to static files, you can remove 'unsafe-inline'.
+    csp = (
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'; "
+        "img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; "
+        "connect-src 'self' https://*.supabase.co"
+    )
+    resp.headers.setdefault("Content-Security-Policy", csp)
+
+    # HSTS only when actually on HTTPS
+    if _request_is_https():
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=15552000; includeSubDomains")
+
+    return resp
 
 
 def _get_env_float(name: str, default: float) -> float:
@@ -1229,35 +1349,34 @@ def _parse_report_id(report_id: str | None) -> str | None:
     return v
 
 
-def _build_excel_report_file(report: dict, path: str) -> None:
-    """Generate the Excel report at the given path."""
-    with pd.ExcelWriter(path, engine='openpyxl') as writer:
-        pd.DataFrame([report.get('metrics', {})]).to_excel(writer, sheet_name="Metrics", index=False)
-        pd.DataFrame([report.get('insights', {})]).to_excel(writer, sheet_name="Insights", index=False)
-        pd.DataFrame([report.get('trends', {})]).to_excel(writer, sheet_name="Trends", index=False)
-        pd.DataFrame(report.get('future_forecast_table', [])).to_excel(
-            writer, sheet_name="Future_Forecast", index=False
-        )
-        pd.DataFrame(report.get('category_cost_table', [])).to_excel(
-            writer, sheet_name="Monthwise_Category_Cost", index=False
-        )
+def _build_dashboards_pdf_for_report(report_id: str, report: dict, path: str) -> None:
+    """Generate the dashboards/results PDF for a report."""
+    dashboard = _dashboard_aggregate_from_report(report)
+    imgs = _ensure_dashboard_charts(report_id, dashboard)
+    dashboard.update(imgs)
+    _build_dashboard_pdf_file(report_id, report, dashboard, path)
 
 
 def _ensure_public_report_files(report_id: str, report: dict) -> tuple[str, str]:
-    """Ensure public-facing PDF/XLSX files exist for Twilio MediaUrl fetching."""
+    """Ensure public-facing PDFs exist for Twilio MediaUrl fetching.
+
+    Returns:
+      (report_pdf_path, dashboards_pdf_path)
+    """
     rid = _parse_report_id(report_id)
     if not rid:
         raise RuntimeError("invalid_report_id")
 
     pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{rid}.pdf")
-    xlsx_path = os.path.join(DOWNLOAD_DIR, f"public_{rid}.xlsx")
+    dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{rid}_dash.pdf")
 
-    # Generate if missing (best-effort idempotent).
+    # Generate if missing.
     if not os.path.exists(pdf_path):
         _build_pdf_report_file(report, pdf_path)
-    if not os.path.exists(xlsx_path):
-        _build_excel_report_file(report, xlsx_path)
-    return pdf_path, xlsx_path
+    # Always regenerate the dashboards PDF so fixes to chart embedding
+    # (and any updated dashboard layouts) are reflected immediately.
+    _build_dashboards_pdf_for_report(rid, report, dash_pdf_path)
+    return pdf_path, dash_pdf_path
 
 
 def _twilio_error_to_user_message(err: Exception) -> str:
@@ -2005,7 +2124,366 @@ def _load_report_from_session() -> dict:
 
     report_path = os.path.join(DOWNLOAD_DIR, f"{report_id}.json")
     with open(report_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        report = json.load(f)
+
+    # Defense-in-depth: if an owner_id is present in the report, ensure it matches
+    # the currently logged-in user.
+    expected_owner_id = (session.get("user_id") or "").strip()
+    report_owner_id = str(report.get("owner_id") or "").strip()
+    if report_owner_id and expected_owner_id and report_owner_id != expected_owner_id:
+        raise PermissionError("report_owner_mismatch")
+    return report
+
+
+def _dashboard_aggregate_from_report(report: dict) -> dict:
+    """Build dashboard aggregates + insight values from the report JSON."""
+    cat_rows = report.get("category_cost_table") or []
+    if not isinstance(cat_rows, list):
+        cat_rows = []
+
+    df_cat = pd.DataFrame(cat_rows)
+    if df_cat.empty:
+        return {
+            "category_sales": [],
+            "category_cost": [],
+            "trend": {"months": [], "series": {}},
+            "insights": {},
+        }
+
+    for col in ("month", "product_category", "total_units_sold", "total_cost"):
+        if col not in df_cat.columns:
+            return {
+                "category_sales": [],
+                "category_cost": [],
+                "trend": {"months": [], "series": {}},
+                "insights": {},
+            }
+
+    df_cat["month"] = pd.to_numeric(df_cat["month"], errors="coerce")
+    df_cat["total_units_sold"] = pd.to_numeric(df_cat["total_units_sold"], errors="coerce")
+    df_cat["total_cost"] = pd.to_numeric(df_cat["total_cost"], errors="coerce")
+    df_cat["product_category"] = df_cat["product_category"].astype(str)
+    df_cat = df_cat.dropna(subset=["month", "product_category", "total_units_sold", "total_cost"])
+    if df_cat.empty:
+        return {
+            "category_sales": [],
+            "category_cost": [],
+            "trend": {"months": [], "series": {}},
+            "insights": {},
+        }
+
+    units_by_cat = (
+        df_cat.groupby("product_category")["total_units_sold"].sum().sort_values(ascending=False)
+    )
+    cost_by_cat = (
+        df_cat.groupby("product_category")["total_cost"].sum().sort_values(ascending=False)
+    )
+
+    # Trend (use the selected forecast months)
+    max_month = int(df_cat["month"].max())
+    forecast_months = int(report.get("months") or 0)
+    if forecast_months < 1:
+        forecast_months = max_month
+    months = list(range(1, min(forecast_months, max_month) + 1))
+    trend_df = df_cat[df_cat["month"].isin(months)].copy()
+    pivot = (
+        trend_df.pivot_table(
+            index="month",
+            columns="product_category",
+            values="total_units_sold",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        .sort_index()
+    )
+
+    # Keep all categories (no artificial limit).
+
+    # Insights
+    insights: dict = {}
+    if not units_by_cat.empty:
+        # Growth based on month1 vs last available month.
+        last_month = int(df_cat["month"].max())
+        first = df_cat[df_cat["month"] == 1].groupby("product_category")["total_units_sold"].sum()
+        last = df_cat[df_cat["month"] == last_month].groupby("product_category")["total_units_sold"].sum()
+        growth_scores = {}
+        for cat in units_by_cat.index.tolist():
+            f = float(first.get(cat, 0.0))
+            l = float(last.get(cat, 0.0))
+            denom = f if f > 0 else 1.0
+            growth_scores[cat] = (l - f) / denom
+        growth_cat = max(growth_scores, key=growth_scores.get) if growth_scores else None
+        if growth_cat is not None:
+            insights["highest_growth_category"] = str(growth_cat)
+            # UX request: show percent without a leading '-' (absolute value).
+            insights["highest_growth_pct"] = round(abs(float(growth_scores[growth_cat])) * 100.0, 1)
+
+    if not cost_by_cat.empty:
+        insights["highest_cost_category"] = str(cost_by_cat.index[0])
+        insights["highest_cost_value"] = int(round(float(cost_by_cat.iloc[0])))
+
+    # Risk: category with highest forecast volatility (coefficient of variation).
+    if not pivot.empty:
+        risk_scores = {}
+        for cat in pivot.columns.tolist():
+            vals = pivot[cat].astype(float).values
+            mean = float(np.mean(vals)) if vals.size else 0.0
+            std = float(np.std(vals)) if vals.size else 0.0
+            risk_scores[cat] = (std / mean) if mean > 0 else std
+        risk_cat = max(risk_scores, key=risk_scores.get) if risk_scores else None
+        if risk_cat is not None:
+            insights["forecast_risk_category"] = str(risk_cat)
+            insights["forecast_risk_score"] = round(float(risk_scores[risk_cat]), 3)
+
+    category_sales = [
+        {"category": str(cat), "units": int(round(float(val)))}
+        for cat, val in units_by_cat.items()
+    ]
+    category_cost = [
+        {"category": str(cat), "cost": int(round(float(val)))}
+        for cat, val in cost_by_cat.items()
+    ]
+
+    trend_series = {str(cat): pivot[cat].astype(int).tolist() for cat in pivot.columns.tolist()}
+
+    return {
+        "category_sales": category_sales,
+        "category_cost": category_cost,
+        "trend": {"months": months, "series": trend_series},
+        "insights": insights,
+    }
+
+
+def _ensure_dashboard_charts(report_id: str, dashboard: dict) -> dict:
+    """Generate dashboard chart PNGs into GRAPH_DIR if missing."""
+    rid = _parse_report_id(report_id)
+    if not rid:
+        raise RuntimeError("invalid_report_id")
+
+    out = {}
+
+    def _path(name: str) -> str:
+        return os.path.join(GRAPH_DIR, name)
+
+    # Chart 1: Category-wise Sales (units)
+    cat_sales_img = f"dash_cat_sales_{rid}.png"
+    if not os.path.exists(_path(cat_sales_img)):
+        rows = dashboard.get("category_sales") or []
+        df = pd.DataFrame(rows)
+        if not df.empty and {"category", "units"}.issubset(df.columns):
+            df = df.sort_values("units", ascending=False).head(12)
+            plt.figure(figsize=(10.5, 4.5))
+            plt.bar(df["category"].astype(str), df["units"].astype(float))
+            plt.title("Category-wise Sales (Forecast Units)")
+            plt.xlabel("Category")
+            plt.ylabel("Units")
+            plt.xticks(rotation=25, ha="right")
+            plt.tight_layout()
+            plt.savefig(_path(cat_sales_img))
+            plt.close()
+    out["cat_sales_image"] = cat_sales_img
+
+    # Chart 2: Category Cost Distribution
+    cat_cost_img = f"dash_cat_cost_{rid}.png"
+    if not os.path.exists(_path(cat_cost_img)):
+        rows = dashboard.get("category_cost") or []
+        df = pd.DataFrame(rows)
+        if not df.empty and {"category", "cost"}.issubset(df.columns):
+            df = df.sort_values("cost", ascending=False)
+            if len(df) > 8:
+                top = df.head(7).copy()
+                other_cost = float(df.iloc[7:]["cost"].sum())
+                top = pd.concat([top, pd.DataFrame([{ "category": "Other", "cost": other_cost }])], ignore_index=True)
+                df = top
+            plt.figure(figsize=(8.5, 4.8))
+            plt.pie(
+                df["cost"].astype(float).values,
+                labels=df["category"].astype(str).values,
+                autopct="%1.1f%%",
+                startangle=140,
+            )
+            plt.title("Category Cost Distribution (Forecast)")
+            plt.tight_layout()
+            plt.savefig(_path(cat_cost_img))
+            plt.close()
+    out["cat_cost_image"] = cat_cost_img
+
+    # Chart 2b: Category Cost (Horizontal Bar)
+    cat_cost_barh_img = f"dash_cat_cost_barh_{rid}.png"
+    if not os.path.exists(_path(cat_cost_barh_img)):
+        rows = dashboard.get("category_cost") or []
+        df = pd.DataFrame(rows)
+        if not df.empty and {"category", "cost"}.issubset(df.columns):
+            df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
+            df["category"] = df["category"].astype(str)
+            df = df.dropna(subset=["cost", "category"])
+            if not df.empty:
+                df = df.sort_values("cost", ascending=False).head(12)
+                # Plot bottom-to-top so the largest category appears on top.
+                df = df.iloc[::-1]
+                plt.figure(figsize=(10.5, 5.2))
+                plt.barh(df["category"], df["cost"].astype(float))
+                plt.title("Category Cost (Horizontal Bar)")
+                ax = plt.gca()
+                # Matplotlib often displays a scientific-notation offset (e.g., '1e7')
+                # for large values; show explicit ₹ millions instead.
+                ax.xaxis.set_major_formatter(
+                    mticker.FuncFormatter(lambda x, pos: f"₹{(x / 1e6):.1f}M")
+                )
+                plt.xlabel("Cost (₹ M)")
+                plt.ylabel("Category")
+                plt.tight_layout()
+                plt.savefig(_path(cat_cost_barh_img))
+                plt.close()
+    out["cat_cost_barh_image"] = cat_cost_barh_img
+
+    # Chart 4: Forecast Trend by Category (forecast months)
+    trend_img = f"dash_trend_{rid}.png"
+    if not os.path.exists(_path(trend_img)):
+        trend = dashboard.get("trend") or {}
+        months = trend.get("months") or []
+        series = trend.get("series") or {}
+        if months and isinstance(series, dict) and series:
+            plt.figure(figsize=(11, 5))
+            for cat, vals in series.items():
+                if not isinstance(vals, list) or len(vals) != len(months):
+                    continue
+                plt.plot(months, vals, marker="o", linewidth=2, label=str(cat))
+            n = len(months)
+            plt.title(f"Forecast Trend by Category (Next {n} Month{'s' if n != 1 else ''})")
+            plt.xlabel("Month")
+            plt.ylabel("Units")
+            plt.xticks(months)
+            plt.grid(True)
+            plt.legend(loc="best", fontsize=8)
+            plt.tight_layout()
+            plt.savefig(_path(trend_img))
+            plt.close()
+    out["trend_image"] = trend_img
+    return out
+
+
+def _dashboard_payload_from_session() -> tuple[str, dict, dict]:
+    """Return (report_id, report, dashboard) for the current logged-in session."""
+    report = _load_report_from_session()
+    report_id = session.get("report_id")
+    if not report_id:
+        raise RuntimeError("no_report")
+    dashboard = _dashboard_aggregate_from_report(report)
+    imgs = _ensure_dashboard_charts(str(report_id), dashboard)
+    dashboard.update(imgs)
+    return str(report_id), report, dashboard
+
+
+def _build_dashboard_pdf_file(report_id: str, report: dict, dashboard: dict, path: str) -> None:
+    """Generate a PDF containing dashboard insights + charts.
+
+    Layout requirements:
+    - Title centered
+    - Remove the "Generated:" timestamp line
+    - Page 1: Top Insights + Category-wise Sales + Category Cost Distribution
+    - Page 2: Category Cost (Horizontal Bar) + Forecast Trend by Category
+    - Titles left aligned, charts centered
+    """
+
+    c = canvas.Canvas(path, pagesize=A4)
+    width, height = A4
+
+    left = 50
+    right = 50
+    top = height - 55
+    bottom = 60
+
+    FONT_REGULAR, FONT_BOLD = _get_pdf_font_names()
+
+    def _page_header() -> float:
+        c.setFont(FONT_BOLD, 16)
+        c.drawCentredString(width / 2, top, "Retail Demand Forecasting Report")
+        c.setFont(FONT_REGULAR, 11)
+        return top - 34
+
+    image_w = width - left - right
+    image_h = 235
+    gap = 18
+
+    def _draw_chart(y: float, img_name: str, title: str) -> float:
+        y -= 10
+        c.setFont(FONT_BOLD, 12)
+        c.drawString(left, y, title)
+        y -= 16
+        img_path = os.path.join(GRAPH_DIR, str(img_name or ""))
+        if img_name and os.path.exists(img_path):
+            if y - image_h < bottom:
+                c.showPage()
+                y = _page_header()
+            c.drawImage(
+                img_path,
+                left,
+                y - image_h,
+                image_w,
+                image_h,
+                preserveAspectRatio=True,
+                anchor="c",
+            )
+            return y - image_h - gap
+
+        c.setFont(FONT_REGULAR, 10)
+        c.drawString(left, y, "(chart unavailable)")
+        return y - 18
+
+    # ---------- PAGE 1 ----------
+    y = _page_header()
+
+    insights = dashboard.get("insights") or {}
+    c.setFont(FONT_BOLD, 12)
+    c.drawString(left, y, "Top Insights")
+    y -= 18
+    c.setFont(FONT_REGULAR, 11)
+
+    growth_cat = insights.get("highest_growth_category")
+    growth_pct = insights.get("highest_growth_pct")
+    cost_cat = insights.get("highest_cost_category")
+    cost_val = insights.get("highest_cost_value")
+    risk_cat = insights.get("forecast_risk_category")
+    risk_score = insights.get("forecast_risk_score")
+
+    try:
+        growth_pct_abs = abs(float(growth_pct)) if growth_pct is not None else None
+    except Exception:
+        growth_pct_abs = growth_pct
+
+    lines = [
+        (
+            f"Highest growth category: {growth_cat} {growth_pct_abs}%"
+            if (growth_cat is not None and growth_pct_abs is not None)
+            else "Highest growth category: N/A"
+        ),
+        (
+            f"Highest cost category: {cost_cat} (₹ {_format_rupees_millions(cost_val)})"
+            if (cost_cat is not None and cost_val is not None)
+            else "Highest cost category: N/A"
+        ),
+        (
+            f"Forecast risk category: {risk_cat} (score {risk_score})"
+            if (risk_cat is not None and risk_score is not None)
+            else "Forecast risk category: N/A"
+        ),
+    ]
+
+    for line in lines:
+        c.drawString(left, y, str(line))
+        y -= 14
+
+    y = _draw_chart(y, dashboard.get("cat_sales_image") or "", "Category-wise Sales")
+    y = _draw_chart(y, dashboard.get("cat_cost_image") or "", "Category Cost Distribution")
+
+    # ---------- PAGE 2 ----------
+    c.showPage()
+    y = _page_header()
+    y = _draw_chart(y, dashboard.get("cat_cost_barh_image") or "", "Category Cost (Horizontal Bar)")
+    y = _draw_chart(y, dashboard.get("trend_image") or "", "Forecast Trend by Category")
+
+    c.save()
 
 
 def _cleanup_runtime_dirs(max_age_hours: float | None = None) -> None:
@@ -2037,40 +2515,46 @@ def _cleanup_runtime_dirs(max_age_hours: float | None = None) -> None:
 def _trend_label(series: Union[pd.Series, np.ndarray, List[float]], eps: float | None = None) -> str:
     """Return a human-friendly trend label based on the fitted slope."""
     if eps is None:
-        eps = CONFIG.trend_eps
-    values = np.asarray(series, dtype=float)
+        eps = DEFAULT_TREND_EPS
+
+    try:
+        values = np.asarray(series, dtype=float)
+    except Exception:
+        return "Insufficient Data"
+
     values = values[np.isfinite(values)]
     if values.size < 2:
         return "Insufficient Data"
 
     x = np.arange(values.size, dtype=float)
-    slope = np.polyfit(x, values, 1)[0]
-    eps = float(eps)
-    if slope > eps:
-        return "Upward"
-    if slope < -eps:
-        return "Downward"
-    return "Flat"
+    try:
+        slope = float(np.polyfit(x, values, 1)[0])
+    except Exception:
+        return "Insufficient Data"
+
+    if slope > float(eps):
+        return "Increasing"
+    if slope < -float(eps):
+        return "Decreasing"
+    return "Stable"
 
 
-# ------------------------------
-# PDF Font caching / idempotent registration
-# ------------------------------
-
-_PDF_FONT_LOCK = threading.Lock()
+# ---------- PDF FONT HELPERS (Rupee symbol support) ----------
 _PDF_FONT_NAMES: tuple[str, str] | None = None
+_PDF_FONT_LOCK = threading.Lock()
 
-_FONT_CACHE_LOCKS_GUARD = threading.Lock()
 _FONT_CACHE_LOCKS: dict[str, threading.Lock] = {}
+_FONT_CACHE_LOCKS_LOCK = threading.Lock()
 
 
 def _get_path_lock(path: str) -> threading.Lock:
     """Return a stable per-path lock for in-process concurrency control."""
-    with _FONT_CACHE_LOCKS_GUARD:
-        lock = _FONT_CACHE_LOCKS.get(path)
+    key = os.path.abspath(str(path or ""))
+    with _FONT_CACHE_LOCKS_LOCK:
+        lock = _FONT_CACHE_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
-            _FONT_CACHE_LOCKS[path] = lock
+            _FONT_CACHE_LOCKS[key] = lock
         return lock
 
 
@@ -2251,12 +2735,89 @@ def _get_pdf_font_names() -> tuple[str, str]:
         return _PDF_FONT_NAMES
 
 # ---------- LANDING / LOGIN ----------
+
+
+def _public_site_base_url() -> str:
+    """Best-effort public base URL for robots/sitemap.
+
+    Prefer a public HTTPS base when configured or inferable, otherwise fall back
+    to the current request's url_root (which may be http:// for local dev).
+    """
+    base = _public_https_base_url_or_none() or _app_public_base_url() or ""
+    if not base:
+        try:
+            base = getattr(request, "url_root", "") or ""
+        except Exception:
+            base = ""
+    return base.strip().rstrip("/")
+
+
+@app.route("/robots.txt", methods=["GET"])
+def robots_txt():
+    base = _public_site_base_url()
+    sitemap_url = f"{base}/sitemap.xml" if base else "/sitemap.xml"
+
+    content = "\n".join(
+        [
+            "User-agent: *",
+            "Allow: /",
+            "Disallow: /home",
+            "Disallow: /upload",
+            "Disallow: /result",
+            "Disallow: /settings",
+            "Disallow: /logout",
+            "Disallow: /download/",
+            "Disallow: /email/",
+            "Disallow: /files/",
+            "Disallow: /api/",
+            "Disallow: /auth/",
+            "Disallow: /trusted-email/",
+            "Disallow: /share/",
+            f"Sitemap: {sitemap_url}",
+            "",
+        ]
+    )
+    resp = Response(content, mimetype="text/plain")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/sitemap.xml", methods=["GET"])
+def sitemap_xml():
+    base = _public_site_base_url()
+    if not base:
+        base = "/"
+
+    homepage = (base + "/") if base != "/" else "/"
+    lastmod = datetime.now(timezone.utc).date().isoformat()
+    homepage_escaped = _xml_escape(homepage)
+
+    xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+        "  <url>\n"
+        f"    <loc>{homepage_escaped}</loc>\n"
+        f"    <lastmod>{lastmod}</lastmod>\n"
+        "    <changefreq>weekly</changefreq>\n"
+        "    <priority>1.0</priority>\n"
+        "  </url>\n"
+        "</urlset>\n"
+    )
+
+    resp = Response(xml, mimetype="application/xml")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
 @app.route('/', methods=['GET', 'POST'])
 def landing():
     # Public homepage (always shown as the default page).
     # Backward compatibility: if an older login form posts to '/', handle it like '/login'.
     if request.method == 'POST':
         return login()
+    # If already authenticated, send user straight to the dashboard.
+    if session.get('logged_in'):
+        return redirect(url_for('home'))
     return render_template('homepage.html')
 
 
@@ -2328,8 +2889,57 @@ def login():
             # Don't block login if profile fetch fails, but don't fail silently.
             app.logger.warning("Profile fetch failed for user_id=%s", session.get('user_id'), exc_info=True)
 
+        # Fallback: derive a display name from email if profile username is missing.
+        if not (session.get('username') or '').strip():
+            em = (session.get('user_email') or '').strip()
+            if '@' in em:
+                session['username'] = em.split('@', 1)[0]
+
         return redirect(url_for('home'))
     return render_template("login.html")
+
+
+@app.route("/api/settings/display-name", methods=["POST"])
+def api_settings_display_name():
+    if not session.get('logged_in'):
+        return jsonify({"ok": False, "message": "Please login."}), 401
+
+    access_token = (session.get("access_token") or "").strip()
+    user_id = (session.get("user_id") or "").strip()
+    if not access_token or not user_id:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    raw_name = payload.get("username") or payload.get("display_name") or payload.get("name")
+    name = (raw_name or "").strip()
+
+    if not name:
+        return jsonify({"ok": False, "message": "Please enter a display name."}), 400
+    if len(name) < 2:
+        return jsonify({"ok": False, "message": "Display name is too short."}), 400
+    if len(name) > 32:
+        return jsonify({"ok": False, "message": "Display name is too long (max 32 characters)."}), 400
+    if any(ch in name for ch in ['\n', '\r', '\t']):
+        return jsonify({"ok": False, "message": "Display name contains invalid characters."}), 400
+
+    if UNIT_TESTING:
+        session['username'] = name
+        return jsonify({"ok": True, "username": name}), 200
+
+    try:
+        sb = get_supabase(access_token)
+
+        # Prefer update; if no row exists, attempt insert.
+        res = sb.table("profiles").update({"username": name}).eq("id", user_id).execute()
+        data = getattr(res, "data", None)
+        if isinstance(data, list) and len(data) == 0:
+            sb.table("profiles").insert({"id": user_id, "username": name}).execute()
+
+        session['username'] = name
+        return jsonify({"ok": True, "username": name}), 200
+    except Exception:
+        app.logger.exception("Failed updating display name")
+        return jsonify({"ok": False, "message": "Failed to update display name. Please try again."}), 500
 
 # ---------- REGISTER ----------
 @app.route('/register', methods=['GET', 'POST'])
@@ -2592,6 +3202,7 @@ def reset_password():
             error="Password reset is not configured on this server.",
             supabase_url="",
             supabase_anon_key="",
+            password_policy=_password_policy_payload(),
         )
 
     # Optional query-param tokens (some auth flows may use query instead of hash)
@@ -2606,12 +3217,14 @@ def reset_password():
             error="Missing recovery tokens. Please open this page from the reset email link.",
             supabase_url=supabase_url,
             supabase_anon_key=supabase_anon_key,
+            password_policy=_password_policy_payload(),
         )
 
     return render_template(
         "reset_password.html",
         supabase_url=supabase_url,
         supabase_anon_key=supabase_anon_key,
+        password_policy=_password_policy_payload(),
     )
 
 # ---------- HOME ----------
@@ -2619,7 +3232,110 @@ def reset_password():
 def home():
     if not session.get('logged_in'):
         return redirect(url_for('login'))
+    # Authenticated dashboard (upload page)
     return render_template("index.html")
+
+
+@app.route('/result', methods=['GET'])
+def result_page():
+    """Render the most recent forecast result stored in the user's session.
+
+    Previously, results were only shown immediately after /upload POST.
+    This route allows navigating back to Results from other pages.
+    """
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+
+    try:
+        report = _load_report_from_session()
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
+
+    metrics = report.get("metrics") or {}
+    insights = report.get("insights") or {}
+    trends = report.get("trends") or {}
+
+    return render_template(
+        "result.html",
+        password_policy=_password_policy_payload(),
+        past_image=report.get("past_image"),
+        future_image=report.get("future_image"),
+        months=int(report.get("months") or 0),
+        mae=metrics.get("MAE"),
+        rmse=metrics.get("RMSE"),
+        r2=metrics.get("R2"),
+        avg_demand=insights.get("Average Demand"),
+        recommendation=insights.get("Recommendation"),
+        past_actual_trend=trends.get("Past Actual Trend"),
+        past_pred_trend=trends.get("Past Predicted Trend"),
+        future_trend=trends.get("Future Forecast Trend"),
+        future_forecast_table=report.get("future_forecast_table") or [],
+        category_cost_table=report.get("category_cost_table") or [],
+    )
+
+
+# ---------- DASHBOARDS ----------
+@app.route("/dashboards", methods=["GET"])
+def dashboards_page():
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+
+    try:
+        report_id, report, dashboard = _dashboard_payload_from_session()
+    except PermissionError:
+        return render_template("index.html", error="Unauthorized report access."), 403
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
+
+    return render_template(
+        "dashboards.html",
+        insights=dashboard.get("insights") or {},
+        cat_sales_image=dashboard.get("cat_sales_image"),
+        cat_cost_image=dashboard.get("cat_cost_image"),
+        cat_cost_barh_image=dashboard.get("cat_cost_barh_image"),
+        trend_image=dashboard.get("trend_image"),
+        forecast_months=int(report.get("months") or 0),
+        has_category_data=bool(dashboard.get("category_sales")) and bool(dashboard.get("category_cost")),
+    )
+
+
+@app.route("/dashboards/pdf", methods=["GET"])
+def download_dashboards_pdf():
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+
+    try:
+        report_id, report, dashboard = _dashboard_payload_from_session()
+    except PermissionError:
+        return render_template("index.html", error="Unauthorized report access."), 403
+    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
+        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
+
+    path = os.path.join(DOWNLOAD_DIR, f"retail_dashboards_{report_id}.pdf")
+    _build_dashboard_pdf_file(report_id, report, dashboard, path)
+
+    response = send_file(path, as_attachment=True)
+
+    @response.call_on_close
+    def _remove_generated_dash_pdf() -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            app.logger.warning("Failed removing generated dashboard PDF: %s", path)
+
+    return response
+
+
+# ---------- SETTINGS ----------
+@app.route('/settings', methods=['GET'])
+def settings_page():
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+
+    # Keep the session flag reasonably fresh.
+    _refresh_sender_verified_state_best_effort()
+
+    return render_template("settings.html", password_policy=_password_policy_payload())
 
 # ---------- LOGOUT ----------
 @app.route('/logout')
@@ -2897,6 +3613,7 @@ def upload():
 
         # ---------- STORE FOR DOWNLOAD (avoid huge cookies) ----------
         report = {
+            "owner_id": (session.get("user_id") or "").strip(),
             "months": months,
             "metrics": {'MAE': mae, 'RMSE': rmse, 'R2': r2},
             "insights": {'Average Demand': avg_demand, 'Recommendation': recommendation},
@@ -2936,34 +3653,6 @@ def upload():
     except Exception:
         app.logger.exception("Prediction failed in /upload")
         return render_template("index.html", error="Prediction failed. Please check your dataset format."), 500
-
-# ---------- DOWNLOAD EXCEL ----------
-@app.route('/download/excel')
-def download_excel():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-
-    try:
-        report = _load_report_from_session()
-    except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
-        return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
-
-    report_id = session.get("report_id")
-    path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
-
-    _build_excel_report_file(report, path)
-
-    response = send_file(path, as_attachment=True)
-
-    @response.call_on_close
-    def _remove_generated_excel() -> None:
-        try:
-            os.remove(path)
-        except OSError:
-            # Cleanup failures must not affect user response.
-            app.logger.warning("Failed removing generated Excel: %s", path)
-
-    return response
 
 # ---------- DOWNLOAD PDF ----------
 @app.route('/download/pdf')
@@ -3139,12 +3828,13 @@ def email_pdf():
 
 
 def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: CurrentUser | None = None, pdf_password: str | None = None) -> tuple:
-    """Generate the current session report files (PDF+XLSX) and email them.
+    """Generate the current session report PDFs and email them.
 
-    Backward compatible name: route paths still reference /email/pdf.
-    If a password is provided, we send 2 attachments:
-    - password-protected PDF (PDF encryption)
-    - password-protected Excel (password-to-open on Windows+Excel when available; otherwise edit-protected XLSX)
+    Delivers 2 PDFs:
+    - Report PDF
+    - Dashboards/Results PDF
+
+    If a password is provided, both PDFs are encrypted using the same password.
     """
     try:
         report = _load_report_from_session()
@@ -3152,17 +3842,17 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
     pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
-    xlsx_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
+    dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_dashboards_{report_id}.pdf")
     filename_pdf = f"retail_forecast_report_{report_id}.pdf"
-    filename_xlsx = f"retail_forecast_report_{report_id}.xlsx"
+    filename_dash_pdf = f"retail_dashboards_{report_id}.pdf"
 
     try:
         _build_pdf_report_file(report, pdf_path)
-        _build_excel_report_file(report, xlsx_path)
+        _build_dashboards_pdf_for_report(report_id, report, dash_pdf_path)
         with open(pdf_path, 'rb') as f:
             pdf_bytes = f.read()
-        with open(xlsx_path, 'rb') as f:
-            xlsx_bytes = f.read()
+        with open(dash_pdf_path, 'rb') as f:
+            dash_pdf_bytes = f.read()
 
         pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
 
@@ -3170,33 +3860,19 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
 
         if pdf_password:
             pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
-
-            # Prefer "password-to-open" XLSX on Windows when Excel is installed.
-            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
-            if xlsx_open_pw_bytes:
-                body = "Attached are your password-protected report files (PDF and Excel)."
-                delivered_kind = "pdf+xlsx_openpw"
-                attachments = [
-                    (filename_pdf, "application/pdf", pdf_bytes),
-                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_open_pw_bytes),
-                ]
-            else:
-                # Fallback: OpenPyXL cannot do password-to-open encryption, but we can still
-                # apply worksheet/workbook protection (edits require password).
-                protected_xlsx_bytes = _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
-
-                body = "Attached are your password-protected report files (PDF and Excel)."
-                delivered_kind = "pdf+xlsx_editpw"
-                attachments = [
-                    (filename_pdf, "application/pdf", pdf_bytes),
-                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", protected_xlsx_bytes),
-                ]
-        else:
-            body = "Attached are your Retail Demand Forecasting report files (PDF and Excel)."
-            delivered_kind = "pdf+xlsx"
+            dash_pdf_bytes = _encrypt_pdf_bytes_if_requested(dash_pdf_bytes, pdf_password)
+            body = "Attached are your password-protected report files (Report PDF and Dashboard PDF)."
+            delivered_kind = "pdf+dashpdf_pw"
             attachments = [
                 (filename_pdf, "application/pdf", pdf_bytes),
-                (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_bytes),
+                (filename_dash_pdf, "application/pdf", dash_pdf_bytes),
+            ]
+        else:
+            body = "Attached are your Retail Demand Forecasting report files (Report PDF and Dashboard PDF)."
+            delivered_kind = "pdf+dashpdf"
+            attachments = [
+                (filename_pdf, "application/pdf", pdf_bytes),
+                (filename_dash_pdf, "application/pdf", dash_pdf_bytes),
             ]
 
         _send_email_with_attachments_sendgrid(recipient_email, subject, body, attachments)
@@ -3216,8 +3892,6 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
             return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
         if "pdf_encryption_unavailable" in msg:
             return jsonify({"ok": False, "message": "PDF encryption is not available on the server."}), 503
-        if "zip_encryption_unavailable" in msg or "xlsx_protection_unavailable" in msg:
-            return jsonify({"ok": False, "message": "Excel password protection is not available on the server."}), 503
         app.logger.exception("Failed sending report email")
         _audit_event_best_effort(
             "report_delivery_failed",
@@ -3232,8 +3906,8 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
         try:
             if os.path.exists(pdf_path):
                 os.remove(pdf_path)
-            if os.path.exists(xlsx_path):
-                os.remove(xlsx_path)
+            if os.path.exists(dash_pdf_path):
+                os.remove(dash_pdf_path)
         except OSError:
             app.logger.warning("Failed removing emailed report files: %s", report_id)
 
@@ -3279,8 +3953,8 @@ def public_files(filename: str):
     """
     name = (filename or "").strip()
     # Only allow our expected filenames.
-    # Allow optional suffixes for derived protected files (e.g., public_<id>_pw.pdf, public_<id>_xlsx.zip).
-    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([A-Za-z0-9]+))?\.(pdf|xlsx|zip)", name)
+    # Allow optional suffixes for derived protected files (e.g., public_<id>_pw.pdf, public_<id>_dashpw.pdf).
+    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([A-Za-z0-9]+))?\.(pdf)", name)
     if not m:
         return ("Not found", 404)
 
@@ -3291,11 +3965,11 @@ def public_files(filename: str):
     if not report_id:
         return ("Not found", 404)
 
-    # For derived files (suffix present) and for all ZIPs, do not generate on demand.
-    if suffix or ext == "zip":
+    # We generate only the base report PDF and base dashboard PDF on demand.
+    # Password-protected variants (suffix: pw / dashpw) must already exist.
+    if suffix and suffix not in ("dash",):
         path = os.path.join(DOWNLOAD_DIR, name)
     else:
-        # Base files public_<id>.pdf|xlsx can be generated on demand from cached report JSON.
         try:
             report_path = os.path.join(DOWNLOAD_DIR, f"{report_id}.json")
             with open(report_path, "r", encoding="utf-8") as f:
@@ -3319,8 +3993,6 @@ def public_files(filename: str):
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
-    if ext == "zip":
-        return send_file(path, as_attachment=False, mimetype="application/zip")
     return send_file(path, as_attachment=False)
 
 
@@ -3340,6 +4012,113 @@ def _require_verified_sender() -> tuple[CurrentUser | None, tuple[dict, int] | N
         return None, ({"ok": False, "message": "Please verify your email first."}, 403)
 
     return user, None
+
+
+def _validate_account_password_or_error(password: str) -> str | None:
+    pw = (password or "").strip()
+    if not pw:
+        return "Password cannot be empty."
+    if len(pw) < max(8, int(PW_CHANGE_MIN_PASSWORD_LEN)):
+        return f"Password must be at least {max(8, int(PW_CHANGE_MIN_PASSWORD_LEN))} characters."
+    if len(pw) > 128:
+        return "Password is too long."
+    if pw.lower() in COMMON_PASSWORDS:
+        return "Password is too common. Choose a stronger password."
+    return None
+
+
+def _pw_change_otp_key(user_id: str) -> str:
+    return "pwotp:" + hashlib.sha256((user_id or "").encode("utf-8")).hexdigest()
+
+
+def _pw_change_otp_cooldown_key(user_id: str) -> str:
+    return f"pwotp_cd:{(user_id or '').strip()}"
+
+
+def _pw_change_store_otp_record(user_id: str, otp_hash: str) -> None:
+    backend = _pw_store_backend()
+    key = _pw_change_otp_key(user_id)
+    record = {
+        "otp_hash": otp_hash,
+        "attempts": 0,
+        "created_at": int(time.time()),
+    }
+    raw = json.dumps(record).encode("utf-8")
+    if hasattr(backend, "setex"):
+        backend.setex(key, int(PW_CHANGE_OTP_TTL_SECONDS), raw)
+    else:
+        backend.set(key, raw, int(PW_CHANGE_OTP_TTL_SECONDS))
+
+
+def _pw_change_get_otp_record(user_id: str) -> dict | None:
+    backend = _pw_store_backend()
+    key = _pw_change_otp_key(user_id)
+    try:
+        raw = backend.get(key)
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+def _pw_change_set_otp_record(user_id: str, record: dict) -> None:
+    backend = _pw_store_backend()
+    key = _pw_change_otp_key(user_id)
+    raw = json.dumps(record).encode("utf-8")
+    if hasattr(backend, "setex"):
+        backend.setex(key, int(PW_CHANGE_OTP_TTL_SECONDS), raw)
+    else:
+        backend.set(key, raw, int(PW_CHANGE_OTP_TTL_SECONDS))
+
+
+def _pw_change_delete_otp_record(user_id: str) -> None:
+    backend = _pw_store_backend()
+    key = _pw_change_otp_key(user_id)
+    try:
+        backend.delete(key)
+    except Exception:
+        return
+
+
+def _otp_hash(value: str) -> str:
+    v = (value or "").strip()
+    # Add server secret so hashes aren't reusable across environments.
+    material = f"{CONFIG.flask_secret_key}|{v}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _supabase_auth_update_password(access_token: str, new_password: str) -> None:
+    """Update password via Supabase Auth (requires a valid access token)."""
+    if not CONFIG.supabase_url:
+        raise RuntimeError("supabase_not_configured")
+    url = (CONFIG.supabase_url or "").rstrip("/") + "/auth/v1/user"
+    data = json.dumps({"password": new_password}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "apikey": (CONFIG.supabase_anon_key or ""),
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = getattr(resp, "status", None)
+            if status not in (200, 204):
+                raise RuntimeError("supabase_password_update_failed")
+    except Exception as e:
+        raise RuntimeError("supabase_password_update_failed") from e
+
+
 
 
 def _send_email_plain_sendgrid(to_email: str, subject: str, body_text: str) -> None:
@@ -3530,45 +4309,36 @@ def _deliver_cached_report_via_email(
     report = _load_report_from_cache(report_id)
 
     pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.pdf")
-    xlsx_path = os.path.join(DOWNLOAD_DIR, f"retail_forecast_report_{report_id}.xlsx")
+    dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"retail_dashboards_{report_id}.pdf")
     filename_pdf = f"retail_forecast_report_{report_id}.pdf"
-    filename_xlsx = f"retail_forecast_report_{report_id}.xlsx"
+    filename_dash_pdf = f"retail_dashboards_{report_id}.pdf"
 
     try:
         _build_pdf_report_file(report, pdf_path)
-        _build_excel_report_file(report, xlsx_path)
+        _build_dashboards_pdf_for_report(report_id, report, dash_pdf_path)
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
-        with open(xlsx_path, "rb") as f:
-            xlsx_bytes = f.read()
+        with open(dash_pdf_path, "rb") as f:
+            dash_pdf_bytes = f.read()
 
         pdf_password = (pdf_password or "").strip() if pdf_password is not None else ""
         subject = "Demand Forecasting Report"
 
         if pdf_password:
             pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
-            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
-            if xlsx_open_pw_bytes:
-                body = "Attached are your password-protected report files (PDF and Excel)."
-                delivered_kind = "pdf+xlsx_openpw"
-                attachments = [
-                    (filename_pdf, "application/pdf", pdf_bytes),
-                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_open_pw_bytes),
-                ]
-            else:
-                protected_xlsx_bytes = _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
-                body = "Attached are your password-protected report files (PDF and Excel)."
-                delivered_kind = "pdf+xlsx_editpw"
-                attachments = [
-                    (filename_pdf, "application/pdf", pdf_bytes),
-                    (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", protected_xlsx_bytes),
-                ]
-        else:
-            body = "Attached are your Retail Demand Forecasting report files (PDF and Excel)."
-            delivered_kind = "pdf+xlsx"
+            dash_pdf_bytes = _encrypt_pdf_bytes_if_requested(dash_pdf_bytes, pdf_password)
+            body = "Attached are your password-protected report files (Report PDF and Dashboard PDF)."
+            delivered_kind = "pdf+dashpdf_pw"
             attachments = [
                 (filename_pdf, "application/pdf", pdf_bytes),
-                (filename_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx_bytes),
+                (filename_dash_pdf, "application/pdf", dash_pdf_bytes),
+            ]
+        else:
+            body = "Attached are your Retail Demand Forecasting report files (Report PDF and Dashboard PDF)."
+            delivered_kind = "pdf+dashpdf"
+            attachments = [
+                (filename_pdf, "application/pdf", pdf_bytes),
+                (filename_dash_pdf, "application/pdf", dash_pdf_bytes),
             ]
 
         _send_email_with_attachments_sendgrid(recipient_email, subject, body, attachments)
@@ -3584,8 +4354,8 @@ def _deliver_cached_report_via_email(
         try:
             if os.path.exists(pdf_path):
                 os.remove(pdf_path)
-            if os.path.exists(xlsx_path):
-                os.remove(xlsx_path)
+            if os.path.exists(dash_pdf_path):
+                os.remove(dash_pdf_path)
         except OSError:
             pass
 
@@ -3623,6 +4393,146 @@ def _audit_event_best_effort(
             app.logger.info("AUDIT %s %s", event_type, json.dumps(payload, default=str)[:2000])
         except Exception:
             pass
+
+
+@app.route("/api/settings/password/init", methods=["POST"])
+def api_settings_password_init():
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    old_password = (payload.get("old_password") or payload.get("oldPassword") or "").strip()
+    new_password = (payload.get("new_password") or payload.get("newPassword") or "").strip()
+    confirm_password = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
+
+    if not old_password:
+        return jsonify({"ok": False, "message": "Old password is required."}), 400
+    if not new_password or not confirm_password:
+        return jsonify({"ok": False, "message": "New password and confirmation are required."}), 400
+    if old_password == new_password:
+        return jsonify({"ok": False, "message": "Old and new passwords are same."}), 400
+    if new_password != confirm_password:
+        return jsonify({"ok": False, "message": "New password and confirmation do not match."}), 400
+
+    pw_err = _validate_account_password_or_error(new_password)
+    if pw_err:
+        return jsonify({"ok": False, "message": pw_err}), 400
+
+    cd_key = _pw_change_otp_cooldown_key(user.id)
+    if _cooldown_is_active(cd_key):
+        return jsonify({"ok": False, "message": "Please wait before requesting another OTP."}), 429
+
+    # Verify old password by attempting login.
+    if not UNIT_TESTING:
+        try:
+            sb = get_supabase()
+            try:
+                sb.auth.sign_in_with_password({"email": user.email, "password": old_password})
+            except TypeError:
+                sb.auth.sign_in_with_password(email=user.email, password=old_password)
+        except Exception as e:
+            msg = str(e).lower()
+            if "missing supabase config" in msg or "supabase" in msg and "missing" in msg:
+                return jsonify({"ok": False, "message": "Server is not configured for password changes."}), 500
+            return jsonify({"ok": False, "message": "Old password is incorrect."}), 400
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+    try:
+        _pw_change_store_otp_record(user.id, _otp_hash(otp))
+    except Exception:
+        return jsonify({"ok": False, "message": "Failed to start OTP flow. Please try again."}), 500
+
+    try:
+        subject = "OTP to confirm password change"
+        body = (
+            "You requested a password change.\n\n"
+            f"Your OTP code is: {otp}\n\n"
+            f"This code expires in {max(1, int(PW_CHANGE_OTP_TTL_SECONDS // 60))} minutes.\n"
+            "If you did not request this, you can ignore this email."
+        )
+        _send_email_plain_sendgrid(user.email, subject, body)
+        _cooldown_start(cd_key, int(PW_CHANGE_OTP_COOLDOWN_SECONDS))
+        return jsonify({"ok": True, "message": "OTP sent to your email."}), 200
+    except Exception as e:
+        _pw_change_delete_otp_record(user.id)
+        msg = str(e).lower()
+        if "missing_sendgrid_config" in msg:
+            return jsonify({"ok": False, "message": "Email service is not configured on the server."}), 500
+        return jsonify({"ok": False, "message": "Failed to send OTP. Please try again later."}), 500
+
+
+@app.route("/api/settings/password/confirm", methods=["POST"])
+def api_settings_password_confirm():
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    otp_value = payload.get("otp")
+    if otp_value is None:
+        otp_value = payload.get("code")
+    if otp_value is None:
+        otp_value = ""
+    otp = str(otp_value)
+    new_password = (payload.get("new_password") or payload.get("newPassword") or "").strip()
+    confirm_password = (payload.get("confirm_password") or payload.get("confirmPassword") or "").strip()
+
+    if not otp:
+        return jsonify({"ok": False, "message": "OTP is required."}), 400
+    if not re.fullmatch(r"\d{6}", otp):
+        return jsonify({"ok": False, "message": "OTP must be exactly 6 digits (no spaces)."}), 400
+    if not new_password or not confirm_password:
+        return jsonify({"ok": False, "message": "New password and confirmation are required."}), 400
+    if new_password != confirm_password:
+        return jsonify({"ok": False, "message": "New password and confirmation do not match."}), 400
+
+    pw_err = _validate_account_password_or_error(new_password)
+    if pw_err:
+        return jsonify({"ok": False, "message": pw_err}), 400
+
+    record = _pw_change_get_otp_record(user.id)
+    if not record:
+        return jsonify({"ok": False, "message": "OTP is invalid or expired. Please request a new OTP."}), 400
+
+    attempts = 0
+    try:
+        attempts = int(record.get("attempts") or 0)
+    except Exception:
+        attempts = 0
+
+    if attempts >= int(PW_CHANGE_OTP_MAX_ATTEMPTS):
+        _pw_change_delete_otp_record(user.id)
+        return jsonify({"ok": False, "message": "Too many invalid attempts. Please request a new OTP."}), 400
+
+    expected = (record.get("otp_hash") or "").strip()
+    if not expected or not secrets.compare_digest(expected, _otp_hash(otp)):
+        record["attempts"] = attempts + 1
+        try:
+            _pw_change_set_otp_record(user.id, record)
+        except Exception:
+            pass
+        if (attempts + 1) >= int(PW_CHANGE_OTP_MAX_ATTEMPTS):
+            _pw_change_delete_otp_record(user.id)
+            return jsonify({"ok": False, "message": "Too many invalid attempts. Please request a new OTP."}), 400
+        return jsonify({"ok": False, "message": "OTP is incorrect."}), 400
+
+    try:
+        _supabase_auth_update_password(access_token, new_password)
+    except Exception:
+        return jsonify({"ok": False, "message": "Failed to update password. Please try again later."}), 500
+
+    _pw_change_delete_otp_record(user.id)
+    session.clear()
+    return jsonify({"ok": True, "message": "Password updated. Please login again.", "redirect_to": "/login"}), 200
 
 
 @app.route("/api/trusted-emails", methods=["GET", "POST"])
@@ -3680,6 +4590,35 @@ def api_trusted_emails():
             return jsonify({"ok": False, "message": "Too many verification emails. Please try again later."}), 429
         app.logger.exception("Failed initiating trusted email verification")
         return jsonify({"ok": False, "message": "Failed to send verification email. Please try again later."}), 500
+
+
+@app.route("/api/trusted-emails/<trusted_id>", methods=["DELETE"])
+def api_trusted_emails_delete(trusted_id: str):
+    user, err = _require_verified_sender()
+    if err:
+        return jsonify(err[0]), err[1]
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    tid = (trusted_id or "").strip()
+    if not tid:
+        return jsonify({"ok": False, "message": "Invalid trusted email id."}), 400
+
+    if UNIT_TESTING:
+        return jsonify({"ok": True}), 200
+
+    try:
+        sb = get_supabase(access_token)
+        res = sb.table("trusted_emails").delete().eq("id", tid).eq("owner_id", user.id).execute()
+        deleted = getattr(res, "data", None)
+        if isinstance(deleted, list) and len(deleted) == 0:
+            return jsonify({"ok": False, "message": "Item not found."}), 404
+        return jsonify({"ok": True}), 200
+    except Exception:
+        app.logger.exception("Failed deleting trusted email")
+        return jsonify({"ok": False, "message": "Failed to delete trusted email."}), 500
 
 
 @app.route("/api/report-shares", methods=["POST"])
@@ -4082,49 +5021,44 @@ def send_whatsapp():
         _ensure_public_report_files(report_id, report)
 
         if pdf_password:
-            pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.pdf")
-            xlsx_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.xlsx")
-            with open(pdf_path, "rb") as f:
-                pdf_bytes = f.read()
-            with open(xlsx_path, "rb") as f:
-                xlsx_bytes = f.read()
+            report_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.pdf")
+            dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}_dash.pdf")
+            with open(report_pdf_path, "rb") as f:
+                report_pdf_bytes = f.read()
+            with open(dash_pdf_path, "rb") as f:
+                dash_pdf_bytes = f.read()
 
-            # Create a password-protected PDF as its own public file.
-            protected_pdf_bytes = _encrypt_pdf_bytes_if_requested(pdf_bytes, pdf_password)
-            protected_pdf_name = f"public_{report_id}_pw.pdf"
-            protected_pdf_path = os.path.join(DOWNLOAD_DIR, protected_pdf_name)
-            with open(protected_pdf_path, "wb") as f:
-                f.write(protected_pdf_bytes)
+            # Create password-protected public files for Twilio to fetch.
+            protected_report_pdf_bytes = _encrypt_pdf_bytes_if_requested(report_pdf_bytes, pdf_password)
+            protected_report_pdf_name = f"public_{report_id}_pw.pdf"
+            protected_report_pdf_path = os.path.join(DOWNLOAD_DIR, protected_report_pdf_name)
+            with open(protected_report_pdf_path, "wb") as f:
+                f.write(protected_report_pdf_bytes)
 
-            # Create a password-protected Excel as its own public file.
-            # Prefer password-to-open on Windows+Excel when available, otherwise fall back
-            # to edit-protected XLSX.
-            xlsx_open_pw_bytes = _encrypt_xlsx_bytes_password_to_open_or_none(xlsx_bytes, pdf_password)
-            protected_xlsx_bytes = xlsx_open_pw_bytes or _protect_xlsx_bytes_if_requested(xlsx_bytes, pdf_password)
-            protected_xlsx_name = f"public_{report_id}_pw.xlsx"
-            protected_xlsx_path = os.path.join(DOWNLOAD_DIR, protected_xlsx_name)
-            with open(protected_xlsx_path, "wb") as f:
-                f.write(protected_xlsx_bytes)
+            protected_dash_pdf_bytes = _encrypt_pdf_bytes_if_requested(dash_pdf_bytes, pdf_password)
+            protected_dash_pdf_name = f"public_{report_id}_dashpw.pdf"
+            protected_dash_pdf_path = os.path.join(DOWNLOAD_DIR, protected_dash_pdf_name)
+            with open(protected_dash_pdf_path, "wb") as f:
+                f.write(protected_dash_pdf_bytes)
 
-            protected_pdf_url = f"{public_base}/files/{protected_pdf_name}"
-            protected_xlsx_url = f"{public_base}/files/{protected_xlsx_name}"
+            protected_report_pdf_url = f"{public_base}/files/{protected_report_pdf_name}"
+            protected_dash_pdf_url = f"{public_base}/files/{protected_dash_pdf_name}"
 
             # Send as two separate WhatsApp messages for compatibility.
-            sid_pdf = _send_whatsapp_media_twilio(number, protected_pdf_url, "Your password-protected Report (PDF)")
-            app.logger.info("Twilio WhatsApp protected PDF sent sid=%s to=%s", sid_pdf, number)
-            sid_xlsx = _send_whatsapp_media_twilio(number, protected_xlsx_url, "Your password-protected Report (Excel)")
-            app.logger.info("Twilio WhatsApp protected Excel sent sid=%s to=%s", sid_xlsx, number)
-            sids = [sid_pdf, sid_xlsx]
+            sid_pdf = _send_whatsapp_media_twilio(number, protected_report_pdf_url, "Your password-protected Report (PDF)")
+            app.logger.info("Twilio WhatsApp protected report PDF sent sid=%s to=%s", sid_pdf, number)
+            sid_dash = _send_whatsapp_media_twilio(number, protected_dash_pdf_url, "Your password-protected Dashboard (PDF)")
+            app.logger.info("Twilio WhatsApp protected dashboards PDF sent sid=%s to=%s", sid_dash, number)
+            sids = [sid_pdf, sid_dash]
         else:
-            pdf_url = f"{public_base}/files/public_{report_id}.pdf"
-            xlsx_url = f"{public_base}/files/public_{report_id}.xlsx"
+            report_pdf_url = f"{public_base}/files/public_{report_id}.pdf"
+            dash_pdf_url = f"{public_base}/files/public_{report_id}_dash.pdf"
 
-            # Send as two separate WhatsApp messages to maximize compatibility.
-            sid_pdf = _send_whatsapp_media_twilio(number, pdf_url, "Your Demand Forecasting Report (PDF)")
-            app.logger.info("Twilio WhatsApp PDF sent sid=%s to=%s", sid_pdf, number)
-            sid_xlsx = _send_whatsapp_media_twilio(number, xlsx_url, "Your Demand Forecasting Report (Excel)")
-            app.logger.info("Twilio WhatsApp Excel sent sid=%s to=%s", sid_xlsx, number)
-            sids = [sid_pdf, sid_xlsx]
+            sid_pdf = _send_whatsapp_media_twilio(number, report_pdf_url, "Your Demand Forecasting Report (PDF)")
+            app.logger.info("Twilio WhatsApp report PDF sent sid=%s to=%s", sid_pdf, number)
+            sid_dash = _send_whatsapp_media_twilio(number, dash_pdf_url, "Your Demand Forecasting Dashboard (PDF)")
+            app.logger.info("Twilio WhatsApp dashboards PDF sent sid=%s to=%s", sid_dash, number)
+            sids = [sid_pdf, sid_dash]
 
         session["whatsapp_last_sent_at"] = now
         return jsonify({"ok": True, "message": "Report sent to WhatsApp successfully.", "sids": sids})
@@ -4146,9 +5080,8 @@ def send_whatsapp():
             return jsonify({"ok": False, "message": "WhatsApp service is not configured on the server."}), 500
         if "missing_twilio_sdk" in msg:
             return jsonify({"ok": False, "message": "WhatsApp service is unavailable on the server."}), 500
-        if "zip_encryption_unavailable" in msg or "xlsx_protection_unavailable" in msg:
-            return jsonify({"ok": False, "message": "Excel password protection is not available on the server."}), 503
         return jsonify({"ok": False, "message": _twilio_error_to_user_message(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Debug ON locally by default; OFF automatically in production.
+    app.run(debug=_debug_enabled())

@@ -2,11 +2,36 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="csrf-token" content="{{ csrf_token }}" />
   <title>Trusted Emails</title>
   <style>
     body { margin: 0; font-family: Arial, sans-serif; background: #f4f6f8; }
-    .navbar { background: #2c3e50; padding: 15px 25px; color: white; display: flex; justify-content: space-between; align-items: center; }
-    .navbar a { color: white; text-decoration: none; font-weight: bold; margin-left: 15px; }
+    body.theme-dark { background: #2c3e50; }
+    .navbar { background: #2c3e50; padding: 15px 25px; color: white; display: flex; justify-content: space-between; align-items: center; flex-wrap: nowrap; }
+    .navbar > div:last-child { display: flex; align-items: center; }
+    .navbar a { color: white; text-decoration: none; font-weight: bold; margin-left: 15px; white-space: nowrap; }
+    .navbar a:hover { text-decoration: underline; }
+    .navbar a[aria-disabled="true"] { opacity: 0.7; pointer-events: none; text-decoration: none; }
+
+    .user-menu { position: relative; display: inline-block; margin-left: 15px; }
+    .user-trigger { background: transparent; border: 0; color: white; font-weight: bold; font-family: inherit; font-size: inherit; cursor: pointer; padding: 0; }
+    .user-trigger:hover { text-decoration: underline; }
+    .user-trigger:focus { outline: 2px solid #ecf0f1; outline-offset: 4px; border-radius: 6px; }
+    .user-dropdown { position: absolute; right: 0; top: calc(100% + 10px); min-width: 190px; background: white; border: 1px solid #cfd8dc; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.18); padding: 8px; display: none; z-index: 1000; }
+    .user-dropdown[data-open="true"] { display: block; }
+    .user-dropdown a { margin-left: 0; }
+    .navbar .user-dropdown .user-item { display: block; padding: 10px 10px; border-radius: 8px; text-decoration: none; color: #2c3e50; font-weight: bold; }
+    .navbar .user-dropdown .user-item:hover { background: #f4f6f8; text-decoration: none; }
+    .navbar .user-dropdown button.user-item { width: 100%; margin-top: 0; background: transparent; border: 0; text-align: left; font-size: inherit; cursor: pointer; }
+    .user-item[aria-disabled="true"] { opacity: 0.6; pointer-events: none; }
+    .user-divider { height: 1px; background: #e3e6ea; margin: 6px 4px; }
+
+    .user-settings { padding: 6px 8px 2px; display: none; }
+    .user-settings[data-open="true"] { display: block; }
+    .theme-row { display: flex; gap: 8px; }
+    .user-settings .theme-btn { flex: 1; padding: 9px 10px; border-radius: 8px; border: 1px solid #cfd8dc; background: #ffffff; color: #2c3e50; font-weight: bold; cursor: pointer; width: auto; margin-top: 0; }
+    .user-settings .theme-btn:hover { background: #f4f6f8; }
+    .user-settings .theme-btn[aria-pressed="true"] { border-color: #2c3e50; }
     .wrap { max-width: 900px; margin: 30px auto; padding: 0 16px; }
     .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0px 6px 15px rgba(0,0,0,0.1); }
     h1 { margin-top: 0; color: #2c3e50; }
@@ -14,11 +39,25 @@
     input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 6px; }
     button { padding: 10px 14px; border: 0; border-radius: 6px; background: #2c3e50; color: white; font-weight: bold; cursor: pointer; }
     button:disabled { opacity: 0.7; cursor: not-allowed; }
+    button.del {
+      background: #e74c3c;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-weight: bold;
+    }
+    button.del:hover { background: #c0392b; }
     .hint { color: #555; margin-top: 10px; }
     .status { margin-top: 12px; font-weight: bold; color: #2c3e50; }
-    table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0; font-size: 13px; }
     th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
     th { background: #ecf0f1; }
+
+    /* Zebra striping for readability */
+    tbody tr:nth-child(even) { background: #fafafa; }
+
+    /* Sticky header requires scroll container */
+    .table-scroll { max-height: 420px; overflow: auto; border: 1px solid #e3e6ea; border-radius: 10px; margin-top: 14px; }
+    thead th { position: sticky; top: 0; z-index: 2; }
   </style>
 </head>
 <body>
@@ -26,7 +65,33 @@
     <div><strong>Retail Demand Forecasting</strong> — Trusted Emails</div>
     <div>
       <a href="/home">Upload</a>
-      <a href="/logout">Logout</a>
+      {% if session.get('report_id') %}
+        <a href="{{ url_for('result_page') }}">Results</a>
+        <a href="{{ url_for('dashboards_page') }}">Dashboards</a>
+      {% else %}
+        <a href="#" aria-disabled="true" class="disabled">Results</a>
+        <a href="#" aria-disabled="true" class="disabled">Dashboards</a>
+      {% endif %}
+      <a href="/trusted-emails/manage">Trusted Emails</a>
+      {% set _username = (session.get('username') or '').strip() %}
+      {% set _email = (session.get('user_email') or '').strip() %}
+      {% if _username %}
+        {% set _user_label = _username %}
+      {% elif _email %}
+        {% set _user_label = _email.split('@')[0] %}
+      {% else %}
+        {% set _user_label = 'User' %}
+      {% endif %}
+      <span class="user-menu">
+        <button type="button" class="user-trigger" id="userMenuBtn" aria-haspopup="true" aria-expanded="false">
+          👤 {{ _user_label }} ▾
+        </button>
+        <div class="user-dropdown" id="userMenuDropdown" role="menu" aria-label="User menu" data-open="false">
+          <a class="user-item" href="/settings" role="menuitem">Settings</a>
+          <div class="user-divider" role="separator" aria-hidden="true"></div>
+          <a class="user-item" href="/logout" role="menuitem">Logout</a>
+        </div>
+      </span>
     </div>
   </div>
 
@@ -42,18 +107,21 @@
       </div>
       <div id="status" class="status" role="status" aria-live="polite"></div>
 
-      <table aria-label="Trusted emails">
-        <thead>
-          <tr>
-            <th>Email</th>
-            <th>Verified</th>
-            <th>Added</th>
-          </tr>
-        </thead>
-        <tbody id="rows">
-          <tr><td colspan="3">Loading…</td></tr>
-        </tbody>
-      </table>
+      <div class="table-scroll" aria-label="Trusted emails table (scrollable)">
+        <table aria-label="Trusted emails">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Verified</th>
+              <th>Added</th>
+              <th style="width: 90px;">Action</th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr><td colspan="4">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -64,21 +132,97 @@
     const statusEl = document.getElementById('status');
     const rowsEl = document.getElementById('rows');
 
-    function setStatus(msg) {
+    function getCsrfToken() {
+      const meta = document.querySelector('meta[name="csrf-token"]');
+      return meta ? (meta.getAttribute('content') || '') : '';
+    }
+
+    let statusTimer = null;
+    function setStatus(msg, autoClearMs) {
+      if (statusTimer) {
+        clearTimeout(statusTimer);
+        statusTimer = null;
+      }
       statusEl.textContent = msg || '';
+      if (msg && autoClearMs && Number.isFinite(autoClearMs)) {
+        statusTimer = setTimeout(() => {
+          statusEl.textContent = '';
+          statusTimer = null;
+        }, autoClearMs);
+      }
+    }
+
+    async function deleteTrustedEmail(id, email) {
+      const tid = String(id || '').trim();
+      if (!tid) return;
+      const label = (email || '').trim() || 'this email';
+      const ok = confirm(`Delete ${label} from trusted emails?`);
+      if (!ok) return;
+
+      setStatus('Deleting…');
+      try {
+        const res = await fetch(`/api/trusted-emails/${encodeURIComponent(tid)}`, {
+          method: 'DELETE',
+          headers: { 'X-CSRF-Token': getCsrfToken() }
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          setStatus((data && data.message) ? data.message : 'Failed to delete.');
+          return;
+        }
+        await load();
+        setStatus('Deleted.', 3000);
+      } catch (e) {
+        setStatus('Failed to delete. Please try again.');
+      }
     }
 
     function render(items) {
-      rowsEl.innerHTML = '';
+      while (rowsEl.firstChild) rowsEl.removeChild(rowsEl.firstChild);
       if (!items || !items.length) {
-        rowsEl.innerHTML = '<tr><td colspan="3">No trusted emails yet.</td></tr>';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 4;
+        td.textContent = 'No trusted emails yet.';
+        tr.appendChild(td);
+        rowsEl.appendChild(tr);
         return;
       }
       for (const it of items) {
         const tr = document.createElement('tr');
-        const verified = it.is_verified ? 'Yes' : 'No';
-        const created = it.created_at ? String(it.created_at).replace('T', ' ').replace('Z','') : '';
-        tr.innerHTML = `<td>${it.email || ''}</td><td>${verified}</td><td>${created}</td>`;
+        const verified = it && it.is_verified ? 'Yes' : 'No';
+        const created = (it && it.created_at) ? String(it.created_at).replace('T', ' ').replace('Z','') : '';
+        const safeEmail = (it && it.email) ? String(it.email) : '';
+        const canDelete = !!(it && it.id);
+
+        const tdEmail = document.createElement('td');
+        tdEmail.textContent = safeEmail;
+        const tdVerified = document.createElement('td');
+        tdVerified.textContent = verified;
+        const tdCreated = document.createElement('td');
+        tdCreated.textContent = created;
+        const tdAction = document.createElement('td');
+        tdAction.style.textAlign = 'center';
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'del';
+        btn.title = 'Delete';
+        btn.setAttribute('aria-label', 'Delete');
+        btn.textContent = 'Delete';
+        if (!canDelete) {
+          btn.disabled = true;
+        } else {
+          btn.addEventListener('click', function () {
+            deleteTrustedEmail(it.id, it.email);
+          });
+        }
+        tdAction.appendChild(btn);
+
+        tr.appendChild(tdEmail);
+        tr.appendChild(tdVerified);
+        tr.appendChild(tdCreated);
+        tr.appendChild(tdAction);
         rowsEl.appendChild(tr);
       }
     }
@@ -89,7 +233,13 @@
       const data = await res.json().catch(() => null);
       if (!res.ok) {
         setStatus((data && data.message) ? data.message : 'Failed to load trusted emails.');
-        rowsEl.innerHTML = '<tr><td colspan="3">Failed to load.</td></tr>';
+        while (rowsEl.firstChild) rowsEl.removeChild(rowsEl.firstChild);
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 4;
+        td.textContent = 'Failed to load.';
+        tr.appendChild(td);
+        rowsEl.appendChild(tr);
         return;
       }
       render((data && data.items) ? data.items : []);
@@ -104,22 +254,120 @@
       try {
         const res = await fetch('/api/trusted-emails', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
           body: JSON.stringify({ email })
         });
         const data = await res.json().catch(() => null);
-        const msg = (data && data.message) ? data.message : (res.ok ? 'Sent.' : 'Failed.');
-        setStatus(msg);
-        if (res.ok) {
-          emailEl.value = '';
-          await load();
+
+        if (!res.ok) {
+          const errMsg = (data && data.message) ? data.message : 'Failed to send verification.';
+          setStatus(errMsg);
+          return;
         }
+
+        const okMsg = `Verification link sent to ${email}. Please check your inbox.`;
+
+        emailEl.value = '';
+        await load();
+        setStatus(okMsg, 6000);
+      } catch (e) {
+        setStatus('Failed to send verification. Please try again.');
       } finally {
         addBtn.disabled = false;
       }
     });
 
     load();
+  })();
+  </script>
+
+  <script>
+  (function () {
+    const btn = document.getElementById('userMenuBtn');
+    const menu = document.getElementById('userMenuDropdown');
+    const settingsBtn = document.getElementById('userSettingsBtn');
+    const settingsPanel = document.getElementById('userSettingsPanel');
+    const themeLight = document.getElementById('themeLight');
+    const themeDark = document.getElementById('themeDark');
+    if (!btn || !menu) return;
+
+    function closeMenu() {
+      menu.dataset.open = 'false';
+      btn.setAttribute('aria-expanded', 'false');
+      if (settingsPanel) settingsPanel.dataset.open = 'false';
+      if (settingsBtn) settingsBtn.setAttribute('aria-expanded', 'false');
+    }
+
+    function openMenu() {
+      menu.dataset.open = 'true';
+      btn.setAttribute('aria-expanded', 'true');
+    }
+
+    function toggleMenu() {
+      if (menu.dataset.open === 'true') closeMenu();
+      else openMenu();
+    }
+
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleMenu();
+    });
+
+    function setTheme(theme) {
+      const t = (theme || '').toLowerCase() === 'dark' ? 'dark' : 'light';
+      try { localStorage.setItem('theme', t); } catch (e) {}
+      if (t === 'dark') document.body.classList.add('theme-dark');
+      else document.body.classList.remove('theme-dark');
+      if (themeLight) themeLight.setAttribute('aria-pressed', t === 'light' ? 'true' : 'false');
+      if (themeDark) themeDark.setAttribute('aria-pressed', t === 'dark' ? 'true' : 'false');
+    }
+
+    (function initTheme() {
+      let t = 'light';
+      try { t = localStorage.getItem('theme') || 'light'; } catch (e) {}
+      setTheme(t);
+    })();
+
+    if (settingsBtn && settingsPanel) {
+      settingsBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const open = settingsPanel.dataset.open === 'true';
+        settingsPanel.dataset.open = open ? 'false' : 'true';
+        settingsBtn.setAttribute('aria-expanded', open ? 'false' : 'true');
+      });
+    }
+
+    if (themeLight) {
+      themeLight.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        setTheme('light');
+      });
+    }
+
+    if (themeDark) {
+      themeDark.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        setTheme('dark');
+      });
+    }
+
+    menu.addEventListener('click', function (e) {
+      e.stopPropagation();
+    });
+
+    document.addEventListener('click', function () {
+      closeMenu();
+    });
+
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeMenu();
+    });
+
+    closeMenu();
   })();
   </script>
 </body>
