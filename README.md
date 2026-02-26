@@ -65,8 +65,14 @@ Open: `http://127.0.0.1:5000`
 
 ## Using the App (Upload & Forecast)
 
-  - `date`
-  - `units_sold`
+### Upload requirements
+
+- Allowed file types: `.csv`, `.xlsx`, `.xls`
+- Required columns (case-insensitive):
+    - `date`
+    - `units_sold`
+- Minimum history: at least **30 rows/days** of valid `date` + `units_sold`
+- Forecast range: **1-12 months** (the UI enforces this)
 
 ### Excel notes
 - `.xlsx` is read using `openpyxl`.
@@ -102,6 +108,13 @@ On Render, you can set `APP_BASE_URL` explicitly, or rely on Render's built-in `
 
 `APP_BASE_URL` is used to construct safe redirect URLs for Supabase Auth flows (email confirmation / reset password).
 
+### Redirect base URL variables (auth emails vs internal redirects)
+
+- `APP_BASE_URL`: base URL for the Flask app itself (used for same-host redirect safety and general links)
+- `EMAIL_REDIRECT_BASE_URL`: base URL embedded into Supabase-generated email links (confirmation + reset password). Set this to your deployed public domain in production.
+- `PUBLIC_BASE_URL`: optional alias used as a fallback for `EMAIL_REDIRECT_BASE_URL`
+- `RENDER_EXTERNAL_URL`: Render-provided fallback for `APP_BASE_URL` when `APP_BASE_URL` is not set
+
 In Supabase Dashboard → **Auth** → **URL Configuration**, add these to **Additional Redirect URLs**:
 
 - `http://127.0.0.1:5000/auth/callback`
@@ -127,6 +140,15 @@ Emailing the PDF report (optional):
 
 - `SENDGRID_API_KEY`: SendGrid API key (required to email PDFs)
 - `SENDGRID_FROM`: Verified sender email address in SendGrid (required)
+
+### SendGrid setup (quick steps)
+
+1) Create a SendGrid account.
+2) In SendGrid → Settings → API Keys, create an API key with **Mail Send** permission.
+3) Verify a sender identity (Single Sender Verification or Domain Authentication).
+4) Set `.env`:
+    - `SENDGRID_API_KEY=<your-api-key>`
+    - `SENDGRID_FROM=<your-verified-sender-email>`
 
 ## WhatsApp (Twilio) Report Sending (Optional)
 
