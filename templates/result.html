@@ -596,7 +596,6 @@
 
         {% if category_cost_table %}
 
-
         <div class="table-scroll" id="catTableScroll">
             <table id="categoryTable">
                 <thead>
@@ -613,7 +612,7 @@
                         <td>{{ row.month }}</td>
                         <td>{{ row.product_category }}</td>
                         <td>{{ row.total_units_sold }}</td>
-                        <td>₹ {{ row.total_cost | format_millions }}</td>
+                        <td>₹ {{ row.total_cost_raw if row.total_cost_raw is defined else row.total_cost }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>

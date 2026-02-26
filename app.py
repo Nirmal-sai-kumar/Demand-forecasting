@@ -26,9 +26,6 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import numpy as np
 import xgboost as xgb
 
-# Keep app import lightweight during unit tests.
-UNIT_TESTING = os.getenv("UNIT_TESTING") == "1"
-
 import pandas as pd
 
 
@@ -89,6 +86,10 @@ _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 # IMPORTANT: never let a local .env override hosting provider environment variables.
 # Render/Heroku/etc. set env vars externally; those should win.
 load_dotenv(dotenv_path=os.path.join(_PROJECT_DIR, ".env"), override=False)
+
+# Keep app import lightweight during unit tests.
+# IMPORTANT: evaluate after load_dotenv() so .env values are respected.
+UNIT_TESTING = os.getenv("UNIT_TESTING") == "1"
 
 # ---------- RUNTIME DIR (set early for Matplotlib) ----------
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", tempfile.gettempdir())
@@ -1479,7 +1480,7 @@ def _send_email_with_pdf_attachment_sendgrid(
 
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            status = getattr(resp, "status", None)
+            status = resp.getcode()
             if status not in (200, 202):
                 raise RuntimeError("sendgrid_failed")
     except urllib.error.HTTPError as e:
@@ -1543,7 +1544,7 @@ def _send_email_with_attachments_sendgrid(
 
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            status = getattr(resp, "status", None)
+            status = resp.getcode()
             if status not in (200, 202):
                 raise RuntimeError("sendgrid_failed")
     except urllib.error.HTTPError as e:
@@ -3603,7 +3604,10 @@ def upload():
                                         'month': i,
                                         'product_category': str(cat),
                                         'total_units_sold': int(units),
+                                        # Keep a raw rupee value for display/export.
+                                        # This avoids compact formatting like "1.5M" in the UI.
                                         'total_cost': int(total_cost),
+                                        'total_cost_raw': int(total_cost),
                                     }
                                 )
 
@@ -4142,7 +4146,7 @@ def _send_email_plain_sendgrid(to_email: str, subject: str, body_text: str) -> N
 
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            status = getattr(resp, "status", None)
+            status = resp.getcode()
             if status not in (200, 202):
                 raise RuntimeError("sendgrid_failed")
     except urllib.error.HTTPError as e:
