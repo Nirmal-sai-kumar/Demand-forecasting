@@ -229,6 +229,117 @@
             font-size: 14px;
         }
 
+        .fc-block {
+            text-align: left;
+            margin: 14px 0 0;
+        }
+
+        .fc-legend {
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 8px;
+        }
+
+        .fc-radio-row {
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .fc-radio {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: #2c3e50;
+        }
+
+        .fc-radio input {
+            width: auto;
+            margin: 0;
+            padding: 0;
+        }
+
+        .fc-row {
+            display: flex;
+            gap: 12px;
+        }
+
+        .fc-row > * {
+            flex: 1;
+        }
+
+        .fc-note {
+            text-align: left;
+            margin: 10px 0 6px;
+            color: #555;
+            font-size: 13px;
+        }
+
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1200;
+        }
+
+        .modal {
+            width: min(640px, 94vw);
+            background: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 18px 40px rgba(0,0,0,0.25);
+            padding: 18px 18px 14px;
+            text-align: left;
+        }
+
+        .modal h3 {
+            margin: 6px 0 10px;
+            color: #2c3e50;
+        }
+
+        .month-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 8px;
+        }
+
+        .month-chip {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border: 1px solid #e3e6ea;
+            border-radius: 10px;
+            padding: 8px 10px;
+            font-size: 13px;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 12px;
+        }
+
+        .modal-actions button {
+            width: auto;
+            margin-top: 0;
+            padding: 10px 12px;
+            border-radius: 10px;
+            font-size: 14px;
+        }
+
+        .btn-secondary {
+            background: #2c3e50;
+        }
+
+        .btn-secondary:hover {
+            background: #22303d;
+        }
+
 
         button {
             width: 100%;
@@ -381,6 +492,43 @@
 
         <input type="file" id="file" name="file" accept=".xlsx,.xls,.csv" required>
 
+        <div class="fc-block" id="forecastControls">
+            <div class="fc-legend">Forecast type</div>
+            <div class="fc-radio-row" role="radiogroup" aria-label="Forecast type">
+                <label class="fc-radio"><input type="radio" name="forecast_type" value="horizon" checked> Next N Months</label>
+                <label class="fc-radio"><input type="radio" name="forecast_type" value="month"> Specific Month</label>
+                <label class="fc-radio"><input type="radio" name="forecast_type" value="season"> Season</label>
+            </div>
+
+            <div class="fc-row" id="specificMonthRow" style="display:none;">
+                <select id="specificMonth" name="selected_month">
+                    <option value="" disabled selected>Select month</option>
+                    <option value="1">January</option>
+                    <option value="2">February</option>
+                    <option value="3">March</option>
+                    <option value="4">April</option>
+                    <option value="5">May</option>
+                    <option value="6">June</option>
+                    <option value="7">July</option>
+                    <option value="8">August</option>
+                    <option value="9">September</option>
+                    <option value="10">October</option>
+                    <option value="11">November</option>
+                    <option value="12">December</option>
+                </select>
+            </div>
+
+            <div class="fc-row" id="seasonRow" style="display:none;">
+                <select id="seasonName" name="season_name">
+                    <option value="" disabled selected>Select season</option>
+                    <option value="Winter">Winter</option>
+                    <option value="Summer">Summer</option>
+                    <option value="Rainy">Rainy</option>
+                </select>
+                <button id="seasonMapBtn" type="button" class="btn-secondary" style="margin-top:12px;">Season mapping</button>
+            </div>
+        </div>
+
         <select name="months" id="months" required>
             <option value="" disabled selected>Select Forecast Duration</option>
             {% for i in range(1, 13) %}
@@ -397,6 +545,27 @@
     {% if error %}
         <div class="error" style="display:block;">{{ error }}</div>
     {% endif %}
+</div>
+
+<div id="seasonModalBackdrop" class="modal-backdrop" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Season mapping">
+        <h3>Season mapping</h3>
+        <div class="fc-note">Choose which calendar months belong to each season. This is stored in your browser and used for Season forecasts.</div>
+
+        <div class="fc-legend" style="margin-top:10px;">Winter</div>
+        <div class="month-grid" id="winterMonths"></div>
+
+        <div class="fc-legend" style="margin-top:14px;">Summer</div>
+        <div class="month-grid" id="summerMonths"></div>
+
+        <div class="fc-legend" style="margin-top:14px;">Rainy</div>
+        <div class="month-grid" id="rainyMonths"></div>
+
+        <div class="modal-actions">
+            <button id="seasonModalCancel" type="button" class="btn-secondary">Cancel</button>
+            <button id="seasonModalSave" type="button">Save mapping</button>
+        </div>
+    </div>
 </div>
 
 <div id="overlay" class="overlay" aria-hidden="true">
@@ -416,8 +585,51 @@
     const errEl = document.getElementById('clientError');
     const infoEl = document.getElementById('clientInfo');
     const overlay = document.getElementById('overlay');
+    const specificMonthRow = document.getElementById('specificMonthRow');
+    const specificMonthEl = document.getElementById('specificMonth');
+    const seasonRow = document.getElementById('seasonRow');
+    const seasonEl = document.getElementById('seasonName');
+
+    const seasonModalBackdrop = document.getElementById('seasonModalBackdrop');
+    const seasonMapBtn = document.getElementById('seasonMapBtn');
+    const seasonModalCancel = document.getElementById('seasonModalCancel');
+    const seasonModalSave = document.getElementById('seasonModalSave');
+    const winterBox = document.getElementById('winterMonths');
+    const summerBox = document.getElementById('summerMonths');
+    const rainyBox = document.getElementById('rainyMonths');
+
+    const baseAction = form ? String(form.getAttribute('action') || '') : '';
 
     const allowedExt = ['.csv', '.xlsx', '.xls'];
+
+    const DEFAULT_SEASON_MAPPING = {
+        winter: [10, 11, 12, 1, 2],
+        summer: [3, 4, 5],
+        rainy: [6, 7, 8, 9]
+    };
+
+    const MONTHS = [
+        { n: 1, label: 'Jan' },
+        { n: 2, label: 'Feb' },
+        { n: 3, label: 'Mar' },
+        { n: 4, label: 'Apr' },
+        { n: 5, label: 'May' },
+        { n: 6, label: 'Jun' },
+        { n: 7, label: 'Jul' },
+        { n: 8, label: 'Aug' },
+        { n: 9, label: 'Sep' },
+        { n: 10, label: 'Oct' },
+        { n: 11, label: 'Nov' },
+        { n: 12, label: 'Dec' },
+    ];
+
+    function monthLabel(n) {
+        const v = Number(n);
+        for (const m of MONTHS) {
+            if (Number(m.n) === v) return String(m.label);
+        }
+        return String(n);
+    }
 
     function showErr(msg) {
         if (!errEl) return;
@@ -435,6 +647,93 @@
     function clearMsgs() {
         showErr('');
         showInfo('');
+    }
+
+    function getForecastType() {
+        const els = document.querySelectorAll('input[name="forecast_type"]');
+        for (const el of els) {
+            if (el && el.checked) return String(el.value || 'horizon');
+        }
+        return 'horizon';
+    }
+
+    function updateForecastUi() {
+        const t = getForecastType();
+        if (specificMonthRow) specificMonthRow.style.display = (t === 'month') ? 'flex' : 'none';
+        if (seasonRow) seasonRow.style.display = (t === 'season') ? 'flex' : 'none';
+        if (monthsEl) monthsEl.style.display = (t === 'horizon') ? 'block' : 'none';
+
+        // If user switches back to horizon, ensure form action is clean (no stale query params).
+        if (t === 'horizon' && baseAction) {
+            form.action = baseAction;
+        }
+    }
+
+    function safeJsonParse(s) {
+        try { return JSON.parse(String(s || '')); } catch (e) { return null; }
+    }
+
+    function loadSeasonMapping() {
+        try {
+            const raw = localStorage.getItem('seasonMapping');
+            const v = safeJsonParse(raw);
+            if (v && typeof v === 'object') return v;
+        } catch (e) {}
+        return DEFAULT_SEASON_MAPPING;
+    }
+
+    function saveSeasonMapping(mapping) {
+        try { localStorage.setItem('seasonMapping', JSON.stringify(mapping)); } catch (e) {}
+    }
+
+    function renderSeasonGrid(container, seasonKey, mapping) {
+        if (!container) return;
+        container.innerHTML = '';
+        const selected = new Set((mapping && mapping[seasonKey]) ? mapping[seasonKey].map(Number) : []);
+        for (const m of MONTHS) {
+            const id = `sm_${seasonKey}_${m.n}`;
+            const wrap = document.createElement('label');
+            wrap.className = 'month-chip';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.id = id;
+            cb.checked = selected.has(m.n);
+            cb.dataset.season = seasonKey;
+            cb.dataset.month = String(m.n);
+            const text = document.createElement('span');
+            text.textContent = m.label;
+            wrap.appendChild(cb);
+            wrap.appendChild(text);
+            container.appendChild(wrap);
+        }
+    }
+
+    function openSeasonModal() {
+        if (!seasonModalBackdrop) return;
+        const mapping = loadSeasonMapping();
+        renderSeasonGrid(winterBox, 'winter', mapping);
+        renderSeasonGrid(summerBox, 'summer', mapping);
+        renderSeasonGrid(rainyBox, 'rainy', mapping);
+        seasonModalBackdrop.style.display = 'flex';
+        seasonModalBackdrop.setAttribute('aria-hidden', 'false');
+    }
+
+    function closeSeasonModal() {
+        if (!seasonModalBackdrop) return;
+        seasonModalBackdrop.style.display = 'none';
+        seasonModalBackdrop.setAttribute('aria-hidden', 'true');
+    }
+
+    function collectSeasonMappingFromModal() {
+        const mapping = { winter: [], summer: [], rainy: [] };
+        const inputs = seasonModalBackdrop ? seasonModalBackdrop.querySelectorAll('input[type="checkbox"][data-season][data-month]') : [];
+        for (const cb of inputs) {
+            if (!cb.checked) continue;
+            const seasonKey = String(cb.dataset.season || '');
+            const m = Number(cb.dataset.month || 0);
+            if (mapping[seasonKey] && m >= 1 && m <= 12) mapping[seasonKey].push(m);
+        }
+        return mapping;
     }
 
     function filenameExt(name) {
@@ -504,8 +803,85 @@
         });
     }
 
+    // Forecast UI toggles
+    const ftEls = document.querySelectorAll('input[name="forecast_type"]');
+    for (const el of ftEls) {
+        el.addEventListener('change', updateForecastUi);
+    }
+    updateForecastUi();
+
+    if (seasonMapBtn) {
+        seasonMapBtn.addEventListener('click', function () {
+            openSeasonModal();
+        });
+    }
+    if (seasonModalCancel) seasonModalCancel.addEventListener('click', closeSeasonModal);
+    if (seasonModalBackdrop) {
+        seasonModalBackdrop.addEventListener('click', function (e) {
+            if (e.target === seasonModalBackdrop) closeSeasonModal();
+        });
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') closeSeasonModal();
+        });
+    }
+    if (seasonModalSave) {
+        seasonModalSave.addEventListener('click', function () {
+            const raw = collectSeasonMappingFromModal();
+
+            // Normalize: ensure ints, range 1-12, unique per season.
+            const mapping = {
+                winter: Array.from(new Set((raw.winter || []).map(Number))).filter(m => m >= 1 && m <= 12),
+                summer: Array.from(new Set((raw.summer || []).map(Number))).filter(m => m >= 1 && m <= 12),
+                rainy: Array.from(new Set((raw.rainy || []).map(Number))).filter(m => m >= 1 && m <= 12),
+            };
+
+            // Basic validation: each season needs at least 1 month.
+            if (mapping.winter.length === 0 || mapping.summer.length === 0 || mapping.rainy.length === 0) {
+                window.alert('Please select at least 1 month for Winter, Summer, and Rainy before saving.');
+                return;
+            }
+
+            // Prevent overlaps (a month should not belong to multiple seasons).
+            const used = new Map();
+            for (const [seasonKey, months] of Object.entries(mapping)) {
+                for (const m of months) {
+                    const prev = used.get(m);
+                    if (prev) {
+                        window.alert(`Month ${monthLabel(m)} is selected in both ${prev} and ${seasonKey}. Please choose each month only once.`);
+                        return;
+                    }
+                    used.set(m, seasonKey);
+                }
+            }
+
+            saveSeasonMapping(mapping);
+            closeSeasonModal();
+            showInfo('Season mapping saved.');
+        });
+    }
+
     form.addEventListener('submit', async function (e) {
         clearMsgs();
+
+        const forecastType = getForecastType();
+
+        // Validate forecast-type specific controls. (Do not change existing Next-N-Months behavior.)
+        if (forecastType === 'month') {
+            const m = specificMonthEl ? String(specificMonthEl.value || '') : '';
+            if (!m) {
+                e.preventDefault();
+                showErr('Please select a specific month.');
+                return;
+            }
+        }
+        if (forecastType === 'season') {
+            const s = seasonEl ? String(seasonEl.value || '') : '';
+            if (!s) {
+                e.preventDefault();
+                showErr('Please select a season.');
+                return;
+            }
+        }
 
         const file = fileEl && fileEl.files ? fileEl.files[0] : null;
         if (!file) {
@@ -518,10 +894,43 @@
             showErr('Unsupported file type. Please upload .csv, .xlsx, or .xls');
             return;
         }
-        if (!monthsEl || !monthsEl.value) {
-            e.preventDefault();
-            showErr('Please select forecast duration (months).');
-            return;
+        if (forecastType === 'horizon') {
+            // Ensure stale month/season selections don't leak into the Results page.
+            try { localStorage.removeItem('forecastSelections'); } catch (e0) {}
+
+            // Keep the upload endpoint clean.
+            if (baseAction) {
+                form.action = baseAction;
+            }
+
+            if (!monthsEl || !monthsEl.value) {
+                e.preventDefault();
+                showErr('Please select forecast duration (months).');
+                return;
+            }
+        } else {
+            // Keep /upload contract intact: it requires months. Use a safe placeholder.
+            if (monthsEl) {
+                // IMPORTANT: the months dropdown is hidden in this mode but may still hold
+                // a previous selection (e.g., 7). Force 1 so the server doesn't generate
+                // an unrelated N-month report.
+                monthsEl.value = '1';
+            }
+
+            // Do not memorize previous special forecast selections.
+            try { localStorage.removeItem('forecastSelections'); } catch (e1) {}
+
+            const selectedMonth = specificMonthEl ? String(specificMonthEl.value || '') : '';
+            const seasonName = seasonEl ? String(seasonEl.value || '') : '';
+
+            // Preserve params in the URL so result page can auto-run.
+            try {
+                const u = new URL(form.action, window.location.origin);
+                u.searchParams.set('forecast_type', forecastType);
+                if (forecastType === 'month') u.searchParams.set('selected_month', selectedMonth);
+                if (forecastType === 'season') u.searchParams.set('season_name', seasonName);
+                form.action = u.pathname + u.search;
+            } catch (e2) {}
         }
 
         const ok = await validateCsvHeadersIfPossible(file);
