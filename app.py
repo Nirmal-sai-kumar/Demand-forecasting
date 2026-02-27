@@ -31,6 +31,13 @@ UNIT_TESTING = os.getenv("UNIT_TESTING") == "1"
 
 import pandas as pd
 
+from forecast_engine import (
+    compute_months_ahead,
+    forecast_monthly_univariate,
+    parse_iso_date,
+    resolve_season_months,
+)
+
 
 try:
     import redis  # type: ignore
@@ -1005,10 +1012,10 @@ app.secret_key = CONFIG.flask_secret_key
 
 
 def _format_rupees_millions(value: object) -> str:
-    """Format a numeric rupee amount using compact Millions (M).
+    """Format a numeric rupee amount as plain rupees (no M/K/Cr abbreviations).
 
     Examples:
-    - 184921171 -> 184.9M
+    - 184921171 -> 184,921,171
     - 950000 -> 950,000
     """
     try:
@@ -1018,13 +1025,6 @@ def _format_rupees_millions(value: object) -> str:
 
     sign = "-" if numeric < 0 else ""
     numeric = abs(numeric)
-
-    if numeric >= 1_000_000:
-        return f"{sign}{numeric / 1_000_000:.1f}M"
-    # For dashboard/report numbers, showing fractional millions is easier to scan.
-    # Avoid displaying tiny values as 0.00M.
-    if numeric >= 100_000:
-        return f"{sign}{numeric / 1_000_000:.2f}M"
     return f"{sign}{numeric:,.0f}"
 
 
@@ -1672,6 +1672,15 @@ def _build_pdf_report_file(report: dict, path: str) -> None:
         c.setFont(FONT_REGULAR, 11)
         return y - 10
 
+    def fmt_rupees_plain(value: object) -> str:
+        try:
+            x = float(value)
+        except Exception:
+            return str(value)
+        sign = "-" if x < 0 else ""
+        x = abs(x)
+        return f"{sign}{x:,.0f}"
+
     # ---------- PAGE 1: Title + Graphs first ----------
     c.setFont(FONT_BOLD, 14)
     c.drawString(left, height - 50, "Retail Demand Forecasting Report")
@@ -1748,7 +1757,7 @@ def _build_pdf_report_file(report: dict, path: str) -> None:
                 str(m),
                 str(r.get('product_category', '')),
                 str(r.get('total_units_sold', '')),
-                f"₹ {r.get('total_cost', '')}",
+                f"₹ {fmt_rupees_plain(r.get('total_cost', ''))}",
             ])
         col_widths = [70, width - left - right - (70 + 90 + 120), 90, 120]
         y = draw_table(y, headers, rows, col_widths=col_widths)
@@ -2253,7 +2262,199 @@ def _dashboard_aggregate_from_report(report: dict) -> dict:
     }
 
 
-def _ensure_dashboard_charts(report_id: str, dashboard: dict) -> dict:
+def _dashboard_override_from_session() -> dict | None:
+    """Return an override report dict for dashboards if a special forecast was recently run.
+
+    Shape:
+      {
+        "dataset_id": <uuid>,
+        "forecast_type": "month"|"season",
+        "tag": <string>,
+        "report": {"months": int, "category_cost_table": list[dict]}
+      }
+    """
+    try:
+        v = session.get("dashboard_override")
+        if not isinstance(v, dict):
+            return None
+        dataset_id = str(v.get("dataset_id") or "").strip()
+        if not dataset_id:
+            return None
+        if dataset_id != str(session.get("report_id") or "").strip():
+            return None
+        ft = str(v.get("forecast_type") or "").strip().lower()
+        if ft not in ("month", "season"):
+            return None
+        report = v.get("report")
+        if not isinstance(report, dict):
+            return None
+        months = int(report.get("months") or 0)
+        if months < 1:
+            return None
+        cct = report.get("category_cost_table")
+        if not isinstance(cct, list):
+            return None
+        tag = str(v.get("tag") or "").strip()
+        return {"dataset_id": dataset_id, "forecast_type": ft, "tag": tag, "report": report}
+    except Exception:
+        return None
+
+
+def _safe_dashboard_tag(value: str) -> str:
+    s = str(value or "").strip().lower()
+    s = re.sub(r"[^a-z0-9_\-]+", "_", s)
+    return s[:40] if s else ""
+
+
+def _recommendation_from_avg(avg: float | int | None) -> str:
+    """Mirror client-side recommendationFromAvg() used in templates/result.html."""
+    try:
+        a = float(avg) if avg is not None else float("nan")
+    except Exception:
+        a = float("nan")
+    if not np.isfinite(a):
+        return "Moderate demand expected. Maintain balanced inventory."
+    if a > 70:
+        return "High demand expected. Maintain high inventory."
+    if a > 40:
+        return "Moderate demand expected. Maintain balanced inventory."
+    return "Low demand expected. Avoid overstocking."
+
+
+def _latest_report_for_delivery() -> dict:
+    """Return the report dict that should be used for Report PDF / send flows.
+
+    If the user ran a special forecast (month/season) and a snapshot exists in
+    session, use that snapshot so PDFs match the latest user selection.
+    """
+    base = _load_report_from_session()
+    override = _dashboard_override_from_session()
+    if not override or not isinstance(override.get("report"), dict):
+        return base
+
+    orep = override["report"]
+    return {
+        "months": int(orep.get("months") or 0),
+        "category_cost_table": orep.get("category_cost_table") or [],
+        "insights": orep.get("insights") or {},
+        "trends": orep.get("trends") or {},
+        # Historical graph is safe; future graph may not match special forecasts.
+        "past_image": base.get("past_image"),
+        "future_image": None,
+    }
+
+
+def _category_cost_table_from_month_rows(rows: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        gk = r.get("group_keys") if isinstance(r.get("group_keys"), dict) else {}
+        cat = gk.get("product_category") or gk.get("category")
+        if cat is None:
+            # Fallback: try the only group key, else skip.
+            if len(gk) == 1:
+                cat = list(gk.values())[0]
+        if cat is None:
+            continue
+
+        try:
+            units = int(r.get("units_pred") or 0)
+        except Exception:
+            units = 0
+
+        revenue = r.get("revenue_pred")
+        try:
+            cost = int(round(float(revenue))) if revenue is not None else None
+        except Exception:
+            cost = None
+
+        out.append(
+            {
+                "month": 1,
+                "product_category": str(cat),
+                "total_units_sold": int(units),
+                "total_cost": cost,
+            }
+        )
+    return out
+
+
+def _category_cost_table_from_season_rows(per_month: list[dict], season_months: list[int]) -> tuple[list[dict], int]:
+    """Convert season API rows to a sequential-month category_cost_table.
+
+    Returns (table, months_count). The table uses month indexes 1..K where K=len(season_months).
+    """
+    out: list[dict] = []
+    if not isinstance(per_month, list):
+        return out, 0
+
+    sm: list[int] = []
+    for m in (season_months or []):
+        try:
+            mi = int(m)
+        except Exception:
+            continue
+        if 1 <= mi <= 12 and mi not in sm:
+            sm.append(mi)
+
+    if not sm:
+        # Best-effort: derive ordering from rows.
+        raw = []
+        for r in per_month:
+            try:
+                raw.append(int(r.get("month") or 0))
+            except Exception:
+                pass
+        for mi in raw:
+            if 1 <= mi <= 12 and mi not in sm:
+                sm.append(mi)
+
+    month_to_idx = {m: (i + 1) for i, m in enumerate(sm)}
+    for r in per_month:
+        if not isinstance(r, dict):
+            continue
+        try:
+            cal_m = int(r.get("month") or 0)
+        except Exception:
+            cal_m = 0
+        idx = month_to_idx.get(cal_m)
+        if not idx:
+            continue
+
+        gk = r.get("group_keys") if isinstance(r.get("group_keys"), dict) else {}
+        cat = gk.get("product_category") or gk.get("category")
+        if cat is None:
+            if len(gk) == 1:
+                cat = list(gk.values())[0]
+        if cat is None:
+            continue
+
+        try:
+            units = int(r.get("units_pred") or 0)
+        except Exception:
+            units = 0
+
+        revenue = r.get("revenue_pred")
+        try:
+            cost = int(round(float(revenue))) if revenue is not None else None
+        except Exception:
+            cost = None
+
+        out.append(
+            {
+                "month": int(idx),
+                "product_category": str(cat),
+                "total_units_sold": int(units),
+                "total_cost": cost,
+            }
+        )
+    return out, len(sm)
+
+
+def _ensure_dashboard_charts(report_id: str, dashboard: dict, *, tag: str = "") -> dict:
     """Generate dashboard chart PNGs into GRAPH_DIR if missing."""
     rid = _parse_report_id(report_id)
     if not rid:
@@ -2264,8 +2465,11 @@ def _ensure_dashboard_charts(report_id: str, dashboard: dict) -> dict:
     def _path(name: str) -> str:
         return os.path.join(GRAPH_DIR, name)
 
+    safe_tag = _safe_dashboard_tag(tag)
+    suffix = f"_{safe_tag}" if safe_tag else ""
+
     # Chart 1: Category-wise Sales (units)
-    cat_sales_img = f"dash_cat_sales_{rid}.png"
+    cat_sales_img = f"dash_cat_sales_{rid}{suffix}.png"
     if not os.path.exists(_path(cat_sales_img)):
         rows = dashboard.get("category_sales") or []
         df = pd.DataFrame(rows)
@@ -2283,7 +2487,7 @@ def _ensure_dashboard_charts(report_id: str, dashboard: dict) -> dict:
     out["cat_sales_image"] = cat_sales_img
 
     # Chart 2: Category Cost Distribution
-    cat_cost_img = f"dash_cat_cost_{rid}.png"
+    cat_cost_img = f"dash_cat_cost_{rid}{suffix}.png"
     if not os.path.exists(_path(cat_cost_img)):
         rows = dashboard.get("category_cost") or []
         df = pd.DataFrame(rows)
@@ -2308,7 +2512,7 @@ def _ensure_dashboard_charts(report_id: str, dashboard: dict) -> dict:
     out["cat_cost_image"] = cat_cost_img
 
     # Chart 2b: Category Cost (Horizontal Bar)
-    cat_cost_barh_img = f"dash_cat_cost_barh_{rid}.png"
+    cat_cost_barh_img = f"dash_cat_cost_barh_{rid}{suffix}.png"
     if not os.path.exists(_path(cat_cost_barh_img)):
         rows = dashboard.get("category_cost") or []
         df = pd.DataFrame(rows)
@@ -2324,12 +2528,11 @@ def _ensure_dashboard_charts(report_id: str, dashboard: dict) -> dict:
                 plt.barh(df["category"], df["cost"].astype(float))
                 plt.title("Category Cost (Horizontal Bar)")
                 ax = plt.gca()
-                # Matplotlib often displays a scientific-notation offset (e.g., '1e7')
-                # for large values; show explicit ₹ millions instead.
+                # Avoid scientific-notation offsets for large values.
                 ax.xaxis.set_major_formatter(
-                    mticker.FuncFormatter(lambda x, pos: f"₹{(x / 1e6):.1f}M")
+                    mticker.FuncFormatter(lambda x, pos: f"₹{x:,.0f}")
                 )
-                plt.xlabel("Cost (₹ M)")
+                plt.xlabel("Cost (₹)")
                 plt.ylabel("Category")
                 plt.tight_layout()
                 plt.savefig(_path(cat_cost_barh_img))
@@ -2337,7 +2540,7 @@ def _ensure_dashboard_charts(report_id: str, dashboard: dict) -> dict:
     out["cat_cost_barh_image"] = cat_cost_barh_img
 
     # Chart 4: Forecast Trend by Category (forecast months)
-    trend_img = f"dash_trend_{rid}.png"
+    trend_img = f"dash_trend_{rid}{suffix}.png"
     if not os.path.exists(_path(trend_img)):
         trend = dashboard.get("trend") or {}
         months = trend.get("months") or []
@@ -2368,10 +2571,132 @@ def _dashboard_payload_from_session() -> tuple[str, dict, dict]:
     report_id = session.get("report_id")
     if not report_id:
         raise RuntimeError("no_report")
+
+    # Optional override: special forecasts (month/season) can store a dashboard snapshot.
+    override = _dashboard_override_from_session()
+    tag = ""
+    if override and isinstance(override.get("report"), dict):
+        report = override["report"]
+        tag = override.get("tag") or override.get("forecast_type") or ""
+
     dashboard = _dashboard_aggregate_from_report(report)
-    imgs = _ensure_dashboard_charts(str(report_id), dashboard)
+    imgs = _ensure_dashboard_charts(str(report_id), dashboard, tag=tag)
     dashboard.update(imgs)
     return str(report_id), report, dashboard
+
+
+@app.route('/api/dashboards/snapshot', methods=['POST'])
+def api_dashboards_snapshot():
+    """Store a dashboard snapshot for the current report_id in session.
+
+    This allows server-rendered /dashboards charts to reflect Specific Month / Season forecasts
+    without re-running forecast computations server-side.
+    """
+    if not session.get('logged_in'):
+        return jsonify({"ok": False, "message": "Please login first."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    dataset_id = str(payload.get('dataset_id') or '').strip()
+    if not dataset_id:
+        return jsonify({"ok": False, "message": "dataset_id is required."}), 400
+
+    # Security: only allow the current session's uploaded dataset.
+    if str(session.get("report_id") or "").strip() and dataset_id != str(session.get("report_id") or "").strip():
+        return jsonify({"ok": False, "message": "Unauthorized dataset_id."}), 403
+
+    ft = str(payload.get('forecast_type') or '').strip().lower()
+    if ft not in ('month', 'season'):
+        return jsonify({"ok": False, "message": "forecast_type must be month or season."}), 400
+
+    tag = ''
+    report: dict = {}
+
+    if ft == 'month':
+        try:
+            selected_month = int(payload.get('selected_month') or 0)
+        except Exception:
+            selected_month = 0
+        if selected_month < 1 or selected_month > 12:
+            return jsonify({"ok": False, "message": "selected_month must be 1..12."}), 400
+        rows = payload.get('rows') if isinstance(payload.get('rows'), list) else []
+        cct = _category_cost_table_from_month_rows(rows)
+        total_units = 0
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                total_units += int(r.get("units_pred") or 0)
+            except Exception:
+                pass
+        avg_demand = int(round((total_units / len(rows)) if rows else total_units))
+        report = {
+            "months": 1,
+            "category_cost_table": cct,
+            "insights": {
+                "Average Demand": avg_demand,
+                "Recommendation": _recommendation_from_avg(avg_demand),
+                "Forecast Type": "Specific Month",
+                "Selected Month": int(selected_month),
+            },
+        }
+        tag = f"month_{selected_month}"
+
+    if ft == 'season':
+        season_name = str(payload.get('season_name') or '').strip()
+        per_month = payload.get('per_month') if isinstance(payload.get('per_month'), list) else []
+        season_months = payload.get('season_months') if isinstance(payload.get('season_months'), list) else []
+        if not season_months:
+            # Fallback: derive ordered unique months from per_month rows.
+            try:
+                ordered = sorted(
+                    [r for r in per_month if isinstance(r, dict)],
+                    key=lambda r: int(r.get('months_ahead') or 0),
+                )
+                seen: set[int] = set()
+                derived: list[int] = []
+                for r in ordered:
+                    try:
+                        m = int(r.get('month') or 0)
+                    except Exception:
+                        continue
+                    if 1 <= m <= 12 and m not in seen:
+                        seen.add(m)
+                        derived.append(m)
+                season_months = derived
+            except Exception:
+                season_months = []
+        cct, months_count = _category_cost_table_from_season_rows(per_month, season_months)
+        total_units = 0
+        for r in per_month:
+            if not isinstance(r, dict):
+                continue
+            try:
+                total_units += int(r.get("units_pred") or 0)
+            except Exception:
+                pass
+        months_count_i = int(months_count or 0)
+        avg_demand = int(round((total_units / months_count_i) if months_count_i > 0 else total_units))
+        report = {
+            "months": months_count_i,
+            "category_cost_table": cct,
+            "insights": {
+                "Average Demand": avg_demand,
+                "Recommendation": _recommendation_from_avg(avg_demand),
+                "Forecast Type": "Season",
+                "Season": (season_name or "Season"),
+            },
+        }
+        tag = f"season_{season_name}" if season_name else "season"
+        if report["months"] < 1:
+            report["months"] = 1
+
+    session['dashboard_override'] = {
+        'dataset_id': dataset_id,
+        'forecast_type': ft,
+        'tag': _safe_dashboard_tag(tag),
+        'report': report,
+    }
+    return jsonify({"ok": True}), 200
 
 
 def _build_dashboard_pdf_file(report_id: str, report: dict, dashboard: dict, path: str) -> None:
@@ -3353,6 +3678,12 @@ def upload():
 
     app.logger.info("/upload POST received")
 
+    # A new forecast run should reset any prior dashboards override.
+    try:
+        session.pop('dashboard_override', None)
+    except Exception:
+        pass
+
     try:
         _cleanup_runtime_dirs()
 
@@ -3650,6 +3981,589 @@ def upload():
         app.logger.exception("Prediction failed in /upload")
         return render_template("index.html", error="Prediction failed. Please check your dataset format."), 500
 
+
+def _first_existing_col(df: pd.DataFrame, *names: str) -> str | None:
+    cols = set(str(c).lower().strip() for c in df.columns)
+    for n in names:
+        if (n or "").lower().strip() in cols:
+            # Return the actual column name casing as in df
+            for c in df.columns:
+                if str(c).lower().strip() == (n or "").lower().strip():
+                    return str(c)
+            return str(n)
+    return None
+
+
+def _find_uploaded_dataset_path(dataset_id: str) -> tuple[str, str]:
+    """Return (path, ext) for the saved upload matching the dataset/report id."""
+    rid = _parse_report_id(dataset_id)
+    if not rid:
+        raise RuntimeError("invalid_dataset_id")
+    for ext in sorted(ALLOWED_UPLOAD_EXTS):
+        path = os.path.join(UPLOAD_DIR, f"{rid}{ext}")
+        if os.path.exists(path):
+            return path, ext
+    raise FileNotFoundError("dataset_not_found")
+
+
+def _model_version_string() -> str:
+    try:
+        st = os.stat(MODEL_PATH)
+        return f"{os.path.basename(MODEL_PATH)}@{int(st.st_mtime)}"
+    except Exception:
+        return os.path.basename(MODEL_PATH)
+
+
+def _coerce_scope(value: str | None) -> str:
+    v = (value or "").strip().lower()
+    if v in {"store+product", "store_product", "store-product"}:
+        return "store_product"
+    if v in {"store+category", "store_category", "store-category"}:
+        return "store_category"
+    if v in {"category", "category_all_stores", "category-all-stores", "category (all stores)"}:
+        return "category_all_stores"
+    if v in {"global", "all", "overall"}:
+        return "global"
+    return "category_all_stores"
+
+
+def _apply_price_override(
+    *,
+    base_price: float | None,
+    scenario: dict | None,
+    target_month: int,
+    group_keys: dict[str, str],
+) -> tuple[float | None, dict[str, object]]:
+    """Return (price_used, scenario_used_fragment)."""
+    used: dict[str, object] = {}
+    price_used = base_price
+    sc = scenario or {}
+
+    # Global override
+    g = sc.get("global") if isinstance(sc.get("global"), dict) else {}
+    if isinstance(g, dict) and g.get("price") is not None:
+        try:
+            price_used = float(g.get("price"))
+            used["price_global"] = price_used
+        except Exception:
+            pass
+
+    # Month-level override (keyed by month number 1..12)
+    months_obj = sc.get("months") if isinstance(sc.get("months"), dict) else {}
+    if isinstance(months_obj, dict):
+        m_cfg = months_obj.get(str(int(target_month)))
+        if isinstance(m_cfg, dict) and m_cfg.get("price") is not None:
+            try:
+                price_used = float(m_cfg.get("price"))
+                used["price_month"] = {"month": int(target_month), "value": price_used}
+            except Exception:
+                pass
+
+    # Simple CSV/row overrides: list of objects that may include store/product/category keys.
+    overrides = sc.get("price_overrides")
+    if isinstance(overrides, list):
+        for row in overrides:
+            if not isinstance(row, dict):
+                continue
+            p = row.get("price")
+            if p is None:
+                continue
+            match = True
+            for k, v in group_keys.items():
+                if k in row and str(row.get(k)) != str(v):
+                    match = False
+                    break
+            if not match:
+                continue
+            try:
+                price_used = float(p)
+                used["price_row"] = {"match": group_keys, "value": price_used}
+            except Exception:
+                pass
+            break
+
+    return price_used, used
+
+
+def _best_effort_persist_forecast(
+    *,
+    run_id: str,
+    dataset_id: str,
+    run_type: str,
+    run_params: dict,
+    model_version: str,
+    predictions: list[dict],
+    access_token: str,
+) -> None:
+    """Persist forecast_runs and predictions into Supabase (best-effort).
+
+    This intentionally must not break the API response if storage isn't configured.
+    """
+    try:
+        sb = get_supabase(access_token)
+    except Exception:
+        return
+
+    try:
+        sb.table("forecast_runs").insert(
+            {
+                "id": run_id,
+                "dataset_id": dataset_id,
+                "run_type": run_type,
+                "run_params": run_params,
+                "model_version": model_version,
+            }
+        ).execute()
+    except Exception:
+        # Table might not exist yet / RLS.
+        return
+
+    try:
+        if predictions:
+            sb.table("predictions").insert(predictions).execute()
+    except Exception:
+        return
+
+
+@app.route('/api/predict/month', methods=['POST'])
+def api_predict_month():
+    if not session.get('logged_in'):
+        return jsonify({"ok": False, "message": "Please login first."}), 401
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    dataset_id = str(payload.get("dataset_id") or session.get("report_id") or "").strip()
+    if not dataset_id:
+        return jsonify({"ok": False, "message": "dataset_id is required."}), 400
+
+    # Security: only allow the current session's uploaded dataset.
+    if str(session.get("report_id") or "").strip() and dataset_id != str(session.get("report_id") or "").strip():
+        return jsonify({"ok": False, "message": "Unauthorized dataset_id."}), 403
+
+    try:
+        selected_month = int(payload.get("selected_month") or 0)
+    except Exception:
+        selected_month = 0
+    if selected_month < 1 or selected_month > 12:
+        return jsonify({"ok": False, "message": "selected_month must be between 1 and 12."}), 400
+
+    scope = _coerce_scope(payload.get("scope"))
+    scenario = payload.get("scenario") if isinstance(payload.get("scenario"), dict) else {}
+    filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+
+    try:
+        dataset_path, ext = _find_uploaded_dataset_path(dataset_id)
+    except FileNotFoundError:
+        return jsonify({"ok": False, "message": "Dataset not found. Please upload again."}), 400
+    except RuntimeError:
+        return jsonify({"ok": False, "message": "Invalid dataset_id."}), 400
+
+    try:
+        df = _read_dataset_file(dataset_path, ext)
+    except Exception:
+        return jsonify({"ok": False, "message": "Unable to read dataset."}), 400
+
+    df.columns = df.columns.str.lower().str.strip()
+    if 'date' not in df.columns or 'units_sold' not in df.columns:
+        return jsonify({"ok": False, "message": "Dataset must contain date and units_sold."}), 400
+
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['units_sold'] = pd.to_numeric(df['units_sold'], errors='coerce')
+    df = df.dropna(subset=['date', 'units_sold']).sort_values('date')
+    if df.empty:
+        return jsonify({"ok": False, "message": "Dataset has no valid rows."}), 400
+
+    # Optional filters
+    store_col = _first_existing_col(df, 'store_id', 'store', 'store_code', 'store_name')
+    product_col = _first_existing_col(df, 'product_id', 'product', 'sku')
+    category_col = _first_existing_col(df, 'product_category', 'category')
+    price_col = _first_existing_col(df, 'price', 'selling_price', 'unit_price')
+
+    store_filter = (filters.get('store_id') or filters.get('store') or '') if isinstance(filters, dict) else ''
+    product_filter = (filters.get('product_id') or filters.get('product') or '') if isinstance(filters, dict) else ''
+    if store_filter and store_col:
+        df = df[df[store_col].astype(str) == str(store_filter)]
+    if product_filter and product_col:
+        df = df[df[product_col].astype(str) == str(product_filter)]
+    if df.empty:
+        return jsonify({"ok": False, "message": "No rows match the provided filters."}), 400
+
+    last_date = pd.Timestamp(df['date'].max())
+    months_ahead = compute_months_ahead(last_date, selected_month)
+    if months_ahead < 1:
+        months_ahead = 1
+    if months_ahead > MAX_FORECAST_MONTHS:
+        return jsonify({"ok": False, "message": f"Forecast horizon too large (max {MAX_FORECAST_MONTHS} months)."}), 400
+
+    cutoff = parse_iso_date(payload.get('backtest_cutoff') if isinstance(payload, dict) else None)
+
+    # Only use the last 12 months for forecasting.
+    df_recent = df[df['date'] >= (last_date - pd.DateOffset(months=12))].copy()
+    if df_recent.empty:
+        df_recent = df.copy()
+
+    def predict_one(features_df: pd.DataFrame) -> np.ndarray:
+        return _safe_predict(model, features_df)
+
+    # Build groups based on scope
+    group_cols: list[str] = []
+    if scope == 'store_product':
+        if store_col:
+            group_cols.append(store_col)
+        if product_col:
+            group_cols.append(product_col)
+    elif scope == 'store_category':
+        if store_col:
+            group_cols.append(store_col)
+        if category_col:
+            group_cols.append(category_col)
+    elif scope == 'category_all_stores':
+        if category_col:
+            group_cols.append(category_col)
+    else:
+        group_cols = []
+
+    if group_cols:
+        grouped = df_recent.groupby(group_cols, sort=False)
+    else:
+        grouped = [((), df_recent)]
+
+    rows: list[dict] = []
+    storage_predictions: list[dict] = []
+    scenario_used: dict[str, object] = {}
+    any_fallback = False
+    for key, g in grouped:
+        g = g.sort_values('date')
+        history = g['units_sold'].astype(float).tolist()
+        monthly, meta = forecast_monthly_univariate(history, predict_one, FEATURE_COLS, months_ahead)
+        if meta.get('fallback'):
+            any_fallback = True
+
+        units_pred = float(monthly[months_ahead - 1])
+        units_pred_rounded = int(round(units_pred))
+        if units_pred_rounded < 0:
+            units_pred_rounded = 0
+
+        group_keys: dict[str, str] = {}
+        if group_cols:
+            if not isinstance(key, tuple):
+                key = (key,)
+            for idx, col in enumerate(group_cols):
+                group_keys[col] = str(key[idx])
+
+        base_price = None
+        if price_col and not g.empty:
+            try:
+                base_price = float(pd.to_numeric(g[price_col], errors='coerce').dropna().iloc[-1])
+            except Exception:
+                base_price = None
+
+        price_used, sc_used = _apply_price_override(
+            base_price=base_price,
+            scenario=scenario,
+            target_month=selected_month,
+            group_keys=group_keys,
+        )
+        if sc_used:
+            scenario_used.update(sc_used)
+
+        revenue_pred = None
+        if price_used is not None:
+            try:
+                revenue_pred = float(units_pred_rounded) * float(price_used)
+            except Exception:
+                revenue_pred = None
+
+        target_date = (last_date + pd.DateOffset(months=months_ahead)).normalize()
+        target_date_str = target_date.strftime('%Y-%m-%d')
+
+        rows.append(
+            {
+                "group_keys": group_keys,
+                "units_pred": units_pred_rounded,
+                "revenue_pred": revenue_pred,
+                "target_month": selected_month,
+                "target_date": target_date_str,
+                "fallback": meta.get('fallback'),
+            }
+        )
+
+        storage_predictions.append(
+            {
+                "run_id": None,  # filled after run_id generated
+                "date": target_date_str,
+                "group_keys": group_keys,
+                "units_pred": units_pred_rounded,
+                "revenue_pred": revenue_pred,
+                "is_forecasted": True,
+            }
+        )
+
+    total_units = int(sum(int(r.get('units_pred') or 0) for r in rows))
+    run_id = str(uuid4())
+    for p in storage_predictions:
+        p["run_id"] = run_id
+
+    model_version = _model_version_string()
+
+    accuracy = None
+    if cutoff is not None:
+        try:
+            cutoff = pd.Timestamp(cutoff)
+            bt_months_ahead = compute_months_ahead(cutoff, selected_month)
+            target_bt = (cutoff + pd.DateOffset(months=bt_months_ahead)).normalize()
+            # Compare against actual average daily units in the target calendar month.
+            actual_mask = (df['date'].dt.year == target_bt.year) & (df['date'].dt.month == target_bt.month)
+            actual_vals = df.loc[actual_mask, 'units_sold'].astype(float)
+            if not actual_vals.empty:
+                actual = float(actual_vals.mean())
+                # Use global forecast (first row) for backtest accuracy (scope-specific backtest would be heavier).
+                pred = float(rows[0]['units_pred']) if rows else float('nan')
+                mae = float(abs(actual - pred))
+                rmse = float(np.sqrt((actual - pred) ** 2))
+                accuracy = {"mae": mae, "rmse": rmse, "cutoff": str(cutoff.date()), "target": str(target_bt.date())}
+        except Exception:
+            accuracy = None
+
+    run_params = {
+        "selected_month": selected_month,
+        "scope": scope,
+        "filters": filters,
+        "scenario": scenario,
+    }
+    _best_effort_persist_forecast(
+        run_id=run_id,
+        dataset_id=dataset_id,
+        run_type="month",
+        run_params=run_params,
+        model_version=model_version,
+        predictions=storage_predictions,
+        access_token=access_token,
+    )
+
+    return jsonify(
+        {
+            "ok": True,
+            "run_id": run_id,
+            "rows": rows,
+            "totals": {"units_pred": total_units},
+            "metadata": {
+                "months_ahead": months_ahead,
+                "target_date": (last_date + pd.DateOffset(months=months_ahead)).strftime('%Y-%m-%d'),
+                "model_version": model_version,
+                "scenario_used": scenario_used,
+                "fallback_used": any_fallback,
+                "accuracy": accuracy,
+            },
+        }
+    ), 200
+
+
+@app.route('/api/predict/season', methods=['POST'])
+def api_predict_season():
+    if not session.get('logged_in'):
+        return jsonify({"ok": False, "message": "Please login first."}), 401
+
+    access_token = (session.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
+
+    payload = request.get_json(silent=True) or {}
+    dataset_id = str(payload.get("dataset_id") or session.get("report_id") or "").strip()
+    if not dataset_id:
+        return jsonify({"ok": False, "message": "dataset_id is required."}), 400
+
+    if str(session.get("report_id") or "").strip() and dataset_id != str(session.get("report_id") or "").strip():
+        return jsonify({"ok": False, "message": "Unauthorized dataset_id."}), 403
+
+    season_name = str(payload.get('season_name') or payload.get('season') or '').strip()
+    if not season_name:
+        return jsonify({"ok": False, "message": "season_name is required."}), 400
+
+    scope = _coerce_scope(payload.get("scope"))
+    scenario = payload.get("scenario") if isinstance(payload.get("scenario"), dict) else {}
+    filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+
+    try:
+        dataset_path, ext = _find_uploaded_dataset_path(dataset_id)
+    except FileNotFoundError:
+        return jsonify({"ok": False, "message": "Dataset not found. Please upload again."}), 400
+    except RuntimeError:
+        return jsonify({"ok": False, "message": "Invalid dataset_id."}), 400
+
+    try:
+        df = _read_dataset_file(dataset_path, ext)
+    except Exception:
+        return jsonify({"ok": False, "message": "Unable to read dataset."}), 400
+
+    df.columns = df.columns.str.lower().str.strip()
+    if 'date' not in df.columns or 'units_sold' not in df.columns:
+        return jsonify({"ok": False, "message": "Dataset must contain date and units_sold."}), 400
+
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['units_sold'] = pd.to_numeric(df['units_sold'], errors='coerce')
+    df = df.dropna(subset=['date', 'units_sold']).sort_values('date')
+    if df.empty:
+        return jsonify({"ok": False, "message": "Dataset has no valid rows."}), 400
+
+    store_col = _first_existing_col(df, 'store_id', 'store', 'store_code', 'store_name')
+    product_col = _first_existing_col(df, 'product_id', 'product', 'sku')
+    category_col = _first_existing_col(df, 'product_category', 'category')
+    price_col = _first_existing_col(df, 'price', 'selling_price', 'unit_price')
+
+    store_filter = (filters.get('store_id') or filters.get('store') or '') if isinstance(filters, dict) else ''
+    product_filter = (filters.get('product_id') or filters.get('product') or '') if isinstance(filters, dict) else ''
+    if store_filter and store_col:
+        df = df[df[store_col].astype(str) == str(store_filter)]
+    if product_filter and product_col:
+        df = df[df[product_col].astype(str) == str(product_filter)]
+    if df.empty:
+        return jsonify({"ok": False, "message": "No rows match the provided filters."}), 400
+
+    last_date = pd.Timestamp(df['date'].max())
+
+    # Optional client override for season mapping.
+    mapping_override = payload.get('season_mapping') if isinstance(payload.get('season_mapping'), dict) else None
+    try:
+        season = resolve_season_months(season_name, mapping_override)
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+
+    months_ahead_list = [compute_months_ahead(last_date, int(m)) for m in season.season_months]
+    max_ahead = int(max(months_ahead_list))
+    if max_ahead > MAX_FORECAST_MONTHS:
+        return jsonify({"ok": False, "message": f"Forecast horizon too large (max {MAX_FORECAST_MONTHS} months)."}), 400
+
+    df_recent = df[df['date'] >= (last_date - pd.DateOffset(months=12))].copy()
+    if df_recent.empty:
+        df_recent = df.copy()
+
+    def predict_one(features_df: pd.DataFrame) -> np.ndarray:
+        return _safe_predict(model, features_df)
+
+    group_cols: list[str] = []
+    if scope == 'store_product':
+        if store_col:
+            group_cols.append(store_col)
+        if product_col:
+            group_cols.append(product_col)
+    elif scope == 'store_category':
+        if store_col:
+            group_cols.append(store_col)
+        if category_col:
+            group_cols.append(category_col)
+    elif scope == 'category_all_stores':
+        if category_col:
+            group_cols.append(category_col)
+    else:
+        group_cols = []
+
+    if group_cols:
+        grouped = df_recent.groupby(group_cols, sort=False)
+    else:
+        grouped = [((), df_recent)]
+
+    per_month: list[dict] = []
+    storage_predictions: list[dict] = []
+
+    for key, g in grouped:
+        g = g.sort_values('date')
+        history = g['units_sold'].astype(float).tolist()
+        monthly, meta = forecast_monthly_univariate(history, predict_one, FEATURE_COLS, max_ahead)
+
+        group_keys: dict[str, str] = {}
+        if group_cols:
+            if not isinstance(key, tuple):
+                key = (key,)
+            for idx, col in enumerate(group_cols):
+                group_keys[col] = str(key[idx])
+
+        base_price = None
+        if price_col and not g.empty:
+            try:
+                base_price = float(pd.to_numeric(g[price_col], errors='coerce').dropna().iloc[-1])
+            except Exception:
+                base_price = None
+
+        for target_month, ahead in zip(season.season_months, months_ahead_list):
+            units_pred = float(monthly[int(ahead) - 1])
+            units_pred_rounded = int(round(units_pred))
+            if units_pred_rounded < 0:
+                units_pred_rounded = 0
+
+            price_used, sc_used = _apply_price_override(
+                base_price=base_price,
+                scenario=scenario,
+                target_month=int(target_month),
+                group_keys=group_keys,
+            )
+
+            revenue_pred = None
+            if price_used is not None:
+                try:
+                    revenue_pred = float(units_pred_rounded) * float(price_used)
+                except Exception:
+                    revenue_pred = None
+
+            target_date = (last_date + pd.DateOffset(months=int(ahead))).normalize()
+            target_date_str = target_date.strftime('%Y-%m-%d')
+
+            per_month.append(
+                {
+                    "group_keys": group_keys,
+                    "month": int(target_month),
+                    "months_ahead": int(ahead),
+                    "target_date": target_date_str,
+                    "units_pred": units_pred_rounded,
+                    "revenue_pred": revenue_pred,
+                }
+            )
+
+            storage_predictions.append(
+                {
+                    "run_id": None,  # filled after run_id generated
+                    "date": target_date_str,
+                    "group_keys": group_keys,
+                    "units_pred": units_pred_rounded,
+                    "revenue_pred": revenue_pred,
+                    "is_forecasted": True,
+                }
+            )
+
+    run_id = str(uuid4())
+    for p in storage_predictions:
+        p["run_id"] = run_id
+    model_version = _model_version_string()
+
+    run_params = {
+        "season_name": season.season_name,
+        "season_months": season.season_months,
+        "scope": scope,
+        "filters": filters,
+        "scenario": scenario,
+        "season_mapping": season.mapping_used,
+    }
+    _best_effort_persist_forecast(
+        run_id=run_id,
+        dataset_id=dataset_id,
+        run_type="season",
+        run_params=run_params,
+        model_version=model_version,
+        predictions=storage_predictions,
+        access_token=access_token,
+    )
+
+    return jsonify(
+        {
+            "ok": True,
+            "run_id": run_id,
+            "per_month": per_month,
+        }
+    ), 200
+
 # ---------- DOWNLOAD PDF ----------
 @app.route('/download/pdf')
 def download_pdf():
@@ -3657,7 +4571,7 @@ def download_pdf():
         return redirect(url_for('login'))
 
     try:
-        report = _load_report_from_session()
+        report = _latest_report_for_delivery()
     except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
         return render_template("index.html", error="Report not found. Please upload a dataset again."), 400
 
@@ -3833,7 +4747,7 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
     If a password is provided, both PDFs are encrypted using the same password.
     """
     try:
-        report = _load_report_from_session()
+        report = _latest_report_for_delivery()
     except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
@@ -3844,7 +4758,10 @@ def _deliver_report_pdf_via_email(recipient_email: str, report_id: str, sender: 
 
     try:
         _build_pdf_report_file(report, pdf_path)
-        _build_dashboards_pdf_for_report(report_id, report, dash_pdf_path)
+
+        # Build dashboards PDF using the same latest override-aware payload as /dashboards.
+        _rid, dash_report, dash_dashboard = _dashboard_payload_from_session()
+        _build_dashboard_pdf_file(report_id, dash_report, dash_dashboard, dash_pdf_path)
         with open(pdf_path, 'rb') as f:
             pdf_bytes = f.read()
         with open(dash_pdf_path, 'rb') as f:
@@ -3950,7 +4867,7 @@ def public_files(filename: str):
     name = (filename or "").strip()
     # Only allow our expected filenames.
     # Allow optional suffixes for derived protected files (e.g., public_<id>_pw.pdf, public_<id>_dashpw.pdf).
-    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([A-Za-z0-9]+))?\.(pdf)", name)
+    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([A-Za-z0-9_\-]+))?\.(pdf)", name)
     if not m:
         return ("Not found", 404)
 
@@ -5004,7 +5921,7 @@ def send_whatsapp():
         }), 500
 
     try:
-        report = _load_report_from_session()
+        report = _latest_report_for_delivery()
     except (RuntimeError, FileNotFoundError, json.JSONDecodeError):
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
@@ -5014,11 +5931,30 @@ def send_whatsapp():
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
     try:
-        _ensure_public_report_files(report_id, report)
+        override = _dashboard_override_from_session()
+        tag = _safe_dashboard_tag((override or {}).get("tag") or "") if override else ""
+
+        if tag:
+            # Generate public files with a suffix so /files does not overwrite them
+            # using cached report JSON.
+            report_pdf_name = f"public_{report_id}_{tag}.pdf"
+            dash_pdf_name = f"public_{report_id}_dash_{tag}.pdf"
+            report_pdf_path = os.path.join(DOWNLOAD_DIR, report_pdf_name)
+            dash_pdf_path = os.path.join(DOWNLOAD_DIR, dash_pdf_name)
+
+            _build_pdf_report_file(report, report_pdf_path)
+            _rid, dash_report, dash_dashboard = _dashboard_payload_from_session()
+            _build_dashboard_pdf_file(report_id, dash_report, dash_dashboard, dash_pdf_path)
+        else:
+            _ensure_public_report_files(report_id, report)
 
         if pdf_password:
-            report_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.pdf")
-            dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}_dash.pdf")
+            if tag:
+                report_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}_{tag}.pdf")
+                dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}_dash_{tag}.pdf")
+            else:
+                report_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}.pdf")
+                dash_pdf_path = os.path.join(DOWNLOAD_DIR, f"public_{report_id}_dash.pdf")
             with open(report_pdf_path, "rb") as f:
                 report_pdf_bytes = f.read()
             with open(dash_pdf_path, "rb") as f:
@@ -5026,13 +5962,13 @@ def send_whatsapp():
 
             # Create password-protected public files for Twilio to fetch.
             protected_report_pdf_bytes = _encrypt_pdf_bytes_if_requested(report_pdf_bytes, pdf_password)
-            protected_report_pdf_name = f"public_{report_id}_pw.pdf"
+            protected_report_pdf_name = f"public_{report_id}_{tag + '_pw' if tag else 'pw'}.pdf"
             protected_report_pdf_path = os.path.join(DOWNLOAD_DIR, protected_report_pdf_name)
             with open(protected_report_pdf_path, "wb") as f:
                 f.write(protected_report_pdf_bytes)
 
             protected_dash_pdf_bytes = _encrypt_pdf_bytes_if_requested(dash_pdf_bytes, pdf_password)
-            protected_dash_pdf_name = f"public_{report_id}_dashpw.pdf"
+            protected_dash_pdf_name = f"public_{report_id}_{'dash_' + tag + '_pw' if tag else 'dashpw'}.pdf"
             protected_dash_pdf_path = os.path.join(DOWNLOAD_DIR, protected_dash_pdf_name)
             with open(protected_dash_pdf_path, "wb") as f:
                 f.write(protected_dash_pdf_bytes)
@@ -5047,8 +5983,12 @@ def send_whatsapp():
             app.logger.info("Twilio WhatsApp protected dashboards PDF sent sid=%s to=%s", sid_dash, number)
             sids = [sid_pdf, sid_dash]
         else:
-            report_pdf_url = f"{public_base}/files/public_{report_id}.pdf"
-            dash_pdf_url = f"{public_base}/files/public_{report_id}_dash.pdf"
+            if tag:
+                report_pdf_url = f"{public_base}/files/public_{report_id}_{tag}.pdf"
+                dash_pdf_url = f"{public_base}/files/public_{report_id}_dash_{tag}.pdf"
+            else:
+                report_pdf_url = f"{public_base}/files/public_{report_id}.pdf"
+                dash_pdf_url = f"{public_base}/files/public_{report_id}_dash.pdf"
 
             sid_pdf = _send_whatsapp_media_twilio(number, report_pdf_url, "Your Demand Forecasting Report (PDF)")
             app.logger.info("Twilio WhatsApp report PDF sent sid=%s to=%s", sid_pdf, number)
