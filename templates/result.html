@@ -11,6 +11,19 @@
         }
     </script>
 
+    <script>
+        // Prevent UI "flash" for special forecast modes (month/season) before the main script runs.
+        (function () {
+            try {
+                const ft = String(new URLSearchParams(window.location.search || '').get('forecast_type') || '').toLowerCase();
+                if (ft === 'month' || ft === 'season') {
+                    document.documentElement.classList.add('special-forecast');
+                    if (ft === 'month') document.documentElement.classList.add('special-month');
+                }
+            } catch (e) {}
+        })();
+    </script>
+
     <style>
         body {
             margin: 0;
@@ -189,6 +202,13 @@
         .card + .card {
             margin-top: 8px;
         }
+
+        /* Hide horizon-only sections early for special forecasts (prevents brief visible flash). */
+        html.special-forecast #futureForecastCard { display: none; }
+        html.special-month #specialForecastCard { display: none; }
+        /* In specific-month mode we will re-show these via JS after API loads. */
+        html.special-month #businessInsightsCard { display: none; }
+        html.special-month #categoryCostCard { display: none; }
 
         h2 {
             margin-bottom: 20px;
@@ -516,8 +536,8 @@
     <div>
         <a href="/home">Upload</a>
             {% if session.get('report_id') %}
-                <a href="{{ url_for('result_page') }}">Results</a>
-                <a href="{{ url_for('dashboards_page') }}">Dashboards</a>
+                <a href="{{ url_for('result_page') }}" id="navResultsLink">Results</a>
+                <a href="{{ url_for('dashboards_page') }}" id="navDashboardsLink">Dashboards</a>
             {% else %}
                 <a href="#" aria-disabled="true" class="disabled">Results</a>
                 <a href="#" aria-disabled="true" class="disabled">Dashboards</a>
@@ -561,15 +581,30 @@
     </div>
 
     <!-- GRAPH 2 -->
-    <div class="card">
+    <div class="card" id="futureForecastCard">
         <h2>Future Sales Forecast ({{ months }} Month{{ 's' if months > 1 else '' }}) — Forecast Trend: {{ future_trend }}</h2>
         <img src="{{ url_for('static', filename=future_image) }}">
 
     </div>
 
+    <!-- Specific Month / Season forecast (rendered client-side via /api/predict/month or /api/predict/season) -->
+    <div class="card" id="specialForecastCard" style="display: none;">
+        <h2 id="specialForecastTitle">Forecast</h2>
+        <p class="no-data" id="specialForecastSubtitle" style="margin-top: -8px;"></p>
+        <p class="no-data" id="specialForecastStatus" style="margin-top: 10px;"></p>
+        <div class="insight-box" id="specialForecastTotals" style="display: none;"></div>
+        <div class="table-scroll" id="specialForecastTableWrap" style="display: none; margin-top: 14px;">
+            <table id="specialForecastTable">
+                <thead id="specialForecastThead"></thead>
+                <tbody id="specialForecastTbody"></tbody>
+            </table>
+        </div>
+        <p class="no-data" id="specialForecastError" style="display: none; margin-top: 12px;"></p>
+    </div>
+
 
     <!-- BUSINESS INSIGHTS -->
-    <div class="card">
+    <div class="card" id="businessInsightsCard">
         <h2>Business Insights & Recommendation</h2>
         <div class="insight-box">
             <p><strong>📊 Average Monthly Demand:</strong> {{ avg_demand }} units</p>
@@ -581,7 +616,7 @@
     <div class="card">
         <h2>Download Forecast Reports</h2>
         <div class="download-buttons">
-            <a class="btn btn-secondary" href="/download/pdf">📄 Download PDF</a>
+            <a class="btn btn-secondary" href="/download/pdf" id="downloadPdfLink">📄 Download PDF</a>
             <a class="btn btn-tertiary" href="#" id="emailSelfBtn">📩 Email to Me</a>
             <a class="btn btn-tertiary" href="#" id="emailPdfBtn">📧 Email</a>
             <a class="btn btn-tertiary" href="#" id="whatsappBtn">📱 Send to WhatsApp</a>
@@ -591,7 +626,7 @@
     </div>
 
     <!-- FINAL REVIEWER FEATURE -->
-    <div class="card">
+    <div class="card" id="categoryCostCard">
         <h2>Category Cost & Stock Analysis (Forecast {{ months }} Month{{ 's' if months > 1 else '' }})</h2>
 
         {% if category_cost_table %}
@@ -673,6 +708,513 @@
 
 <script>
     window.PASSWORD_POLICY = {{ password_policy|default({})|tojson }};
+</script>
+
+<script>
+    window.RESULTS_DATASET_ID = {{ (session.get('report_id') or '')|tojson }};
+</script>
+
+<script>
+(function () {
+    const card = document.getElementById('specialForecastCard');
+    const titleEl = document.getElementById('specialForecastTitle');
+    const subtitleEl = document.getElementById('specialForecastSubtitle');
+    const statusEl = document.getElementById('specialForecastStatus');
+    const totalsEl = document.getElementById('specialForecastTotals');
+    const tableWrap = document.getElementById('specialForecastTableWrap');
+    const theadEl = document.getElementById('specialForecastThead');
+    const tbodyEl = document.getElementById('specialForecastTbody');
+    const errEl = document.getElementById('specialForecastError');
+
+    if (!card || !titleEl || !subtitleEl || !statusEl || !totalsEl || !tableWrap || !theadEl || !tbodyEl || !errEl) {
+        return;
+    }
+
+    function safeJsonParse(text) {
+        try { return JSON.parse(text); } catch (e) { return null; }
+    }
+
+    function readLocal(key) {
+        try {
+            const v = localStorage.getItem(key);
+            if (!v) return null;
+            return safeJsonParse(v);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function monthName(m) {
+        const names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        const idx = Number(m) - 1;
+        return (idx >= 0 && idx < 12) ? names[idx] : String(m);
+    }
+
+    function fmtNumber(n) {
+        if (n === null || n === undefined) return '-';
+        const x = Number(n);
+        if (!Number.isFinite(x)) return '-';
+        try { return new Intl.NumberFormat('en-IN').format(x); } catch (e) { return String(x); }
+    }
+
+    function fmtCurrencyINR(n) {
+        if (n === null || n === undefined) return '-';
+        const x = Number(n);
+        if (!Number.isFinite(x)) return '-';
+        try { return '₹ ' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(Math.round(x)); } catch (e) { return '₹ ' + String(Math.round(x)); }
+    }
+
+    function groupKeysLabel(group_keys) {
+        if (!group_keys || typeof group_keys !== 'object') return 'All';
+        const entries = Object.entries(group_keys).filter(([k, v]) => String(v || '').trim().length > 0);
+        if (entries.length === 0) return 'All';
+        return entries.map(([k, v]) => `${k}=${String(v)}`).join(', ');
+    }
+
+    function showError(msg) {
+        errEl.textContent = msg || 'Failed to load forecast.';
+        errEl.style.display = 'block';
+        statusEl.textContent = '';
+        totalsEl.style.display = 'none';
+        tableWrap.style.display = 'none';
+    }
+
+    function setLoading(text) {
+        errEl.style.display = 'none';
+        statusEl.textContent = text || 'Loading forecast...';
+        totalsEl.style.display = 'none';
+        tableWrap.style.display = 'none';
+        tbodyEl.innerHTML = '';
+        theadEl.innerHTML = '';
+    }
+
+    function hideHorizonOnlyCards() {
+        const futureCard = document.getElementById('futureForecastCard');
+        const insightsCard = document.getElementById('businessInsightsCard');
+        const catCard = document.getElementById('categoryCostCard');
+        if (futureCard) futureCard.style.display = 'none';
+        if (insightsCard) insightsCard.style.display = 'none';
+        if (catCard) catCard.style.display = 'none';
+    }
+
+    function hideFutureForecastCardOnly() {
+        const futureCard = document.getElementById('futureForecastCard');
+        if (futureCard) futureCard.style.display = 'none';
+    }
+
+    function updateBusinessInsights(avgDemand, recommendation) {
+        const card = document.getElementById('businessInsightsCard');
+        if (!card) return;
+        const box = card.querySelector('.insight-box');
+        if (!box) return;
+        box.innerHTML = '';
+        box.insertAdjacentHTML('beforeend', `<p><strong>📊 Average Monthly Demand:</strong> ${fmtNumber(avgDemand)} units</p>`);
+        box.insertAdjacentHTML('beforeend', `<p><strong>💡 Recommendation:</strong> ${String(recommendation || '')}</p>`);
+    }
+
+    function recommendationFromAvg(avg) {
+        const a = Number(avg);
+        if (!Number.isFinite(a)) return 'Moderate demand expected. Maintain balanced inventory.';
+        if (a > 70) return 'High demand expected. Maintain high inventory.';
+        if (a > 40) return 'Moderate demand expected. Maintain balanced inventory.';
+        return 'Low demand expected. Avoid overstocking.';
+    }
+
+    function formatMillionsINR(value) {
+        const x = Number(value);
+        if (!Number.isFinite(x)) return '-';
+        // Legacy name: now returns plain rupees (no K/L/Cr abbreviations).
+        try { return new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(Math.round(x)); } catch (e) { return String(Math.round(x)); }
+    }
+
+    function renderCategoryCostForSpecificMonth(selectedMonthLabel, rows) {
+        const catCard = document.getElementById('categoryCostCard');
+        if (!catCard) return;
+
+        // Update title to reflect the selected month.
+        const h2 = catCard.querySelector('h2');
+        if (h2) {
+            h2.textContent = selectedMonthLabel ? `Category Cost & Stock Analysis (${selectedMonthLabel})` : 'Category Cost & Stock Analysis';
+        }
+
+        // Hide pagination controls (few rows) if present.
+        const controls = catCard.querySelector('.table-controls');
+        if (controls) controls.style.display = 'none';
+
+        const scroll = document.getElementById('catTableScroll');
+        if (!scroll) return;
+
+        // Hide the server-side "no data" paragraph if present.
+        const noData = catCard.querySelector('.no-data');
+        if (noData) noData.style.display = 'none';
+
+        const agg = new Map();
+        for (const r of (rows || [])) {
+            const gk = r && r.group_keys ? r.group_keys : null;
+            const cat = (gk && (gk.product_category || gk.category)) ? String(gk.product_category || gk.category) : groupKeysLabel(gk);
+            const units = Number(r.units_pred);
+            const revenue = (r.revenue_pred === null || r.revenue_pred === undefined) ? null : Number(r.revenue_pred);
+
+            const prev = agg.get(cat) || { units: 0, revenue: 0, hasRevenue: false };
+            prev.units += Number.isFinite(units) ? units : 0;
+            if (revenue !== null && Number.isFinite(revenue)) {
+                prev.revenue += revenue;
+                prev.hasRevenue = true;
+            }
+            agg.set(cat, prev);
+        }
+
+        const items = Array.from(agg.entries()).map(([cat, v]) => ({
+            product_category: cat,
+            units: Math.round(v.units || 0),
+            revenue: v.hasRevenue ? v.revenue : null,
+        }));
+
+        // Stable ordering: highest units first.
+        items.sort((a, b) => (b.units - a.units) || String(a.product_category).localeCompare(String(b.product_category)));
+
+        // Render a table without the Month column.
+        const tbody = items.map(it => {
+            const costCell = (it.revenue === null) ? '-' : fmtCurrencyINR(it.revenue);
+            return `<tr><td>${String(it.product_category)}</td><td>${fmtNumber(it.units)}</td><td>${costCell}</td></tr>`;
+        }).join('');
+
+        scroll.innerHTML = `
+            <table id="categoryTable">
+                <thead>
+                    <tr>
+                        <th>Product Category</th>
+                        <th>Units Sold</th>
+                        <th>Total Cost (₹)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${tbody}
+                </tbody>
+            </table>
+        `;
+    }
+
+    function renderCategoryCostForSeason(seasonName, seasonMonths, perMonthRows) {
+        const catCard = document.getElementById('categoryCostCard');
+        if (!catCard) return;
+
+        const h2 = catCard.querySelector('h2');
+        if (h2) {
+            const titleSeason = seasonName ? `Season: ${String(seasonName)}` : 'Season';
+            h2.textContent = `Category Cost & Stock Analysis (${titleSeason})`;
+        }
+
+        // Keep pagination controls available for long season tables.
+        const controls = catCard.querySelector('.table-controls');
+        if (controls) controls.style.display = 'flex';
+
+        const scroll = document.getElementById('catTableScroll');
+        if (!scroll) return;
+
+        const noData = catCard.querySelector('.no-data');
+        if (noData) noData.style.display = 'none';
+
+        const monthOrder = Array.isArray(seasonMonths) ? seasonMonths.map(m => Number(m)).filter(m => m >= 1 && m <= 12) : [];
+        const monthIdx = new Map();
+        for (let i = 0; i < monthOrder.length; i++) monthIdx.set(monthOrder[i], i);
+
+        const agg = new Map();
+        for (const r of (perMonthRows || [])) {
+            if (!r) continue;
+            const m = Number(r.month);
+            if (!Number.isFinite(m) || m < 1 || m > 12) continue;
+            const gk = r.group_keys || null;
+            const cat = (gk && (gk.product_category || gk.category)) ? String(gk.product_category || gk.category) : groupKeysLabel(gk);
+            const units = Number(r.units_pred);
+            const revenue = (r.revenue_pred === null || r.revenue_pred === undefined) ? null : Number(r.revenue_pred);
+
+            const key = `${m}||${cat}`;
+            const prev = agg.get(key) || { month: m, product_category: cat, units: 0, revenue: 0, hasRevenue: false };
+            prev.units += Number.isFinite(units) ? units : 0;
+            if (revenue !== null && Number.isFinite(revenue)) {
+                prev.revenue += revenue;
+                prev.hasRevenue = true;
+            }
+            agg.set(key, prev);
+        }
+
+        const items = Array.from(agg.values()).map(v => ({
+            month: v.month,
+            product_category: v.product_category,
+            units: Math.round(v.units || 0),
+            revenue: v.hasRevenue ? v.revenue : null,
+        }));
+
+        items.sort((a, b) => {
+            const am = monthIdx.has(a.month) ? monthIdx.get(a.month) : a.month;
+            const bm = monthIdx.has(b.month) ? monthIdx.get(b.month) : b.month;
+            if (am !== bm) return am - bm;
+            // Within a month: highest units first.
+            if ((b.units - a.units) !== 0) return (b.units - a.units);
+            return String(a.product_category).localeCompare(String(b.product_category));
+        });
+
+        const tbody = items.map(it => {
+            const costCell = (it.revenue === null) ? '-' : fmtCurrencyINR(it.revenue);
+            return `<tr><td>${monthName(it.month)}</td><td>${String(it.product_category)}</td><td>${fmtNumber(it.units)}</td><td>${costCell}</td></tr>`;
+        }).join('');
+
+        scroll.innerHTML = `
+            <table id="categoryTable">
+                <thead>
+                    <tr>
+                        <th>Month</th>
+                        <th>Product Category</th>
+                        <th>Units Sold</th>
+                        <th>Total Cost (₹)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${tbody}
+                </tbody>
+            </table>
+        `;
+    }
+
+    async function postJson(url, body) {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() },
+            body: JSON.stringify(body || {})
+        });
+        const data = await res.json().catch(() => null);
+        return { ok: res.ok, status: res.status, data };
+    }
+
+    function tryUpdateNavLinks() {
+        try {
+            const qs = window.location.search || '';
+            const dash = document.getElementById('navDashboardsLink');
+            if (dash) dash.setAttribute('href', '/dashboards' + qs);
+            const pdf = document.getElementById('downloadPdfLink');
+            if (pdf) pdf.setAttribute('href', '/download/pdf' + qs);
+        } catch (e0) {}
+    }
+
+    (async function init() {
+        tryUpdateNavLinks();
+        const params = new URLSearchParams(window.location.search || '');
+        const seasonMapping = readLocal('seasonMapping');
+
+        const datasetId = (window.RESULTS_DATASET_ID || '').trim();
+        if (!datasetId) {
+            card.style.display = 'block';
+            titleEl.textContent = 'Forecast';
+            subtitleEl.textContent = '';
+            hideHorizonOnlyCards();
+            showError('Missing dataset id. Please upload the dataset again.');
+            return;
+        }
+
+        // Determine whether to run special forecast:
+        // Only run when URL explicitly includes forecast_type.
+        // Do NOT re-run based on saved localStorage; user requested no memorized previous action.
+        const urlForecastType = String(params.get('forecast_type') || '').toLowerCase();
+
+        let forecastType = '';
+        if (urlForecastType === 'month' || urlForecastType === 'season') {
+            forecastType = urlForecastType;
+        } else {
+            // Normal horizon results: keep server-rendered graphs/tables.
+            return;
+        }
+
+        const scope = 'category_all_stores';
+        const selectedMonth = String(params.get('selected_month') || '');
+        const seasonName = String(params.get('season_name') || '');
+
+        // Do not memorize previous action.
+        try { localStorage.removeItem('forecastSelections'); } catch (e0) {}
+
+        if (forecastType === 'month') {
+            // UX requirement: do NOT show the detailed month forecast table/card.
+            // Show only the selected-month Category Cost section (like the 2nd image).
+            card.style.display = 'none';
+
+            // Hide only the future forecast chart card; keep Download visible.
+            hideFutureForecastCardOnly();
+
+            // Show Business Insights card (we'll update after API response).
+            const insightsCard = document.getElementById('businessInsightsCard');
+            if (insightsCard) {
+                insightsCard.style.display = 'block';
+                const box = insightsCard.querySelector('.insight-box');
+                if (box) {
+                    box.innerHTML = '<p class="no-data">Loading insights for selected month...</p>';
+                }
+            }
+
+            const monthNum = Number(selectedMonth);
+            if (!monthNum || !Number.isFinite(monthNum)) {
+                try { window.alert('Please select a valid month.'); } catch (e0) {}
+                return;
+            }
+
+            // Prepare the Category Cost card immediately (no old data visible).
+            const catCard = document.getElementById('categoryCostCard');
+            const scroll = document.getElementById('catTableScroll');
+            if (catCard) {
+                catCard.style.display = 'block';
+                const h2 = catCard.querySelector('h2');
+                if (h2) h2.textContent = `Category Cost & Stock Analysis (Selected month: ${monthName(monthNum)})`;
+                const controls = catCard.querySelector('.table-controls');
+                if (controls) controls.style.display = 'none';
+                const noData = catCard.querySelector('.no-data');
+                if (noData) noData.style.display = 'none';
+            }
+            if (scroll) {
+                scroll.innerHTML = '<p class="no-data" style="margin: 12px 0;">Loading selected month forecast...</p>';
+            }
+
+            const { ok, data } = await postJson('/api/predict/month', {
+                dataset_id: datasetId,
+                selected_month: monthNum,
+                scope
+            });
+
+            if (!ok || !data || !data.ok) {
+                try { window.alert((data && data.message) ? data.message : 'Failed to load forecast.'); } catch (e1) {}
+                return;
+            }
+
+            const rows = Array.isArray(data.rows) ? data.rows : [];
+            const totals = data.totals || {};
+            const meta = data.metadata || {};
+
+            // Ensure Business Insights stays visible and updated.
+            if (insightsCard) insightsCard.style.display = 'block';
+
+            // Update Business Insights based on the selected-month forecast.
+            const avg = rows.length ? Math.round(Number(totals.units_pred || 0) / rows.length) : Number(totals.units_pred || 0);
+            updateBusinessInsights(avg, recommendationFromAvg(avg));
+
+            // Replace Category Cost table for Specific Month (NO Month column).
+            const monthLabel = selectedMonth ? `Selected month: ${monthName(monthNum)}` : '';
+            renderCategoryCostForSpecificMonth(monthLabel, rows);
+
+            // Save dashboards snapshot (best-effort) so /dashboards reflects the same latest values.
+            try {
+                await postJson('/api/dashboards/snapshot', {
+                    dataset_id: datasetId,
+                    forecast_type: 'month',
+                    selected_month: monthNum,
+                    rows
+                });
+            } catch (e2) {}
+
+            return;
+        }
+
+        if (forecastType === 'season') {
+            titleEl.textContent = 'Season Forecast';
+            subtitleEl.textContent = seasonName ? (`Season: ${seasonName}`) : '';
+            setLoading('Calculating forecast for the selected season...');
+
+            // Do NOT show the detailed Season table/card.
+            card.style.display = 'none';
+            tableWrap.style.display = 'none';
+
+            // Hide only the horizon future chart; we'll update Insights + Category Cost for season.
+            hideFutureForecastCardOnly();
+
+            // Show Insights + Category Cost placeholders so stale horizon data isn't shown.
+            const insightsCard = document.getElementById('businessInsightsCard');
+            if (insightsCard) {
+                insightsCard.style.display = 'block';
+                const box = insightsCard.querySelector('.insight-box');
+                if (box) box.innerHTML = '<p class="no-data">Loading insights for selected season...</p>';
+            }
+            const catCard = document.getElementById('categoryCostCard');
+            const scroll = document.getElementById('catTableScroll');
+            if (catCard) {
+                catCard.style.display = 'block';
+                const h2 = catCard.querySelector('h2');
+                if (h2) h2.textContent = seasonName ? `Category Cost & Stock Analysis (Season: ${seasonName})` : 'Category Cost & Stock Analysis (Season)';
+                const noData = catCard.querySelector('.no-data');
+                if (noData) noData.style.display = 'none';
+            }
+            if (scroll) {
+                scroll.innerHTML = '<p class="no-data" style="margin: 12px 0;">Loading season category cost analysis...</p>';
+            }
+
+            if (!seasonName) {
+                showError('Please select a season.');
+                return;
+            }
+
+            const { ok, data } = await postJson('/api/predict/season', {
+                dataset_id: datasetId,
+                season_name: seasonName,
+                scope,
+                season_mapping: (seasonMapping && typeof seasonMapping === 'object') ? seasonMapping : undefined
+            });
+
+            if (!ok || !data || !data.ok) {
+                showError((data && data.message) ? data.message : 'Failed to load forecast.');
+                return;
+            }
+
+            const perMonth = Array.isArray(data.per_month) ? data.per_month : [];
+
+            // Derive the season months order for rendering (prefer mapping in browser; fallback to API rows ordering).
+            let seasonMonths = [];
+            try {
+                const mapped = (seasonMapping && seasonName && Array.isArray(seasonMapping[seasonName])) ? seasonMapping[seasonName] : [];
+                seasonMonths = mapped.map(m => Number(m)).filter(m => Number.isFinite(m) && m >= 1 && m <= 12);
+            } catch (e0) {
+                seasonMonths = [];
+            }
+            if (!seasonMonths.length) {
+                const copy = perMonth.slice();
+                copy.sort((a, b) => Number(a.months_ahead || 0) - Number(b.months_ahead || 0));
+                const seen = new Set();
+                for (const r of copy) {
+                    const m = Number(r.month);
+                    if (!Number.isFinite(m)) continue;
+                    if (seen.has(m)) continue;
+                    seen.add(m);
+                    seasonMonths.push(m);
+                }
+            }
+
+            // Update Business Insights based on the season forecast (avg per returned row).
+            if (insightsCard) insightsCard.style.display = 'block';
+            let totalUnits = 0;
+            for (const r of perMonth) {
+                try { totalUnits += Number(r.units_pred || 0); } catch (e1) {}
+            }
+            const denom = seasonMonths.length ? seasonMonths.length : 1;
+            const avg = Math.round(Number(totalUnits || 0) / denom);
+            updateBusinessInsights(avg, recommendationFromAvg(avg));
+
+            // Render season Category Cost table with real month names.
+            if (catCard) catCard.style.display = 'block';
+            renderCategoryCostForSeason(seasonName, seasonMonths, perMonth);
+
+            // Save dashboards snapshot (best-effort) so /dashboards reflects the same latest values.
+            try {
+                await postJson('/api/dashboards/snapshot', {
+                    dataset_id: datasetId,
+                    forecast_type: 'season',
+                    season_name: seasonName,
+                    season_months: seasonMonths,
+                    per_month: perMonth,
+                });
+            } catch (e3) {}
+
+            // Remove Season-only summary/table UI (keep page clean like normal results).
+            statusEl.textContent = '';
+            totalsEl.style.display = 'none';
+            totalsEl.innerHTML = '';
+        }
+    })();
+})();
 </script>
 
 <script>
