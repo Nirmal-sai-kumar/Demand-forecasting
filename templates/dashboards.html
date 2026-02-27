@@ -373,7 +373,7 @@
 
   <div class="wrap">
     <div class="header-row" style="justify-content: flex-end;">
-      <a class="btn" href="{{ url_for('download_dashboards_pdf') }}">⬇ Download PDF</a>
+      <a class="btn" href="{{ url_for('download_dashboards_pdf') }}" id="dashPdfLink">⬇ Download PDF</a>
     </div>
 
     <div class="grid-3">
@@ -452,6 +452,16 @@
       </div>
     </div>
   </div>
+
+  <script>
+    (function () {
+      try {
+        const qs = window.location.search || '';
+        const pdf = document.getElementById('dashPdfLink');
+        if (pdf) pdf.setAttribute('href', '/dashboards/pdf' + qs);
+      } catch (e) {}
+    })();
+  </script>
 
   <div class="fs-overlay" id="fsOverlay" data-open="false" aria-hidden="true">
     <div class="fs-dialog" role="dialog" aria-modal="true" aria-label="Full screen chart">
