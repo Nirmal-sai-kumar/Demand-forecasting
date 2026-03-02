@@ -211,27 +211,41 @@ The destination WhatsApp number must join your Twilio WhatsApp Sandbox (Twilio C
 ## Project Structure
 
 ```
-Retail_Demand_Forecasting/
+Demand-forecasting/
 │
 ├── app.py
+├── forecast_engine.py
 ├── ml_model_xgb.py
-├── README.md
-├── requirements.txt
 ├── supabase_client.py
-├── users.csv
+├── requirements.txt
+├── README.md
+├── .env.example
+├── .env  # (local only; do not commit)
 ├── __pycache__/
 ├── dataset/
-├── downloads/
+│   └── retail_sales_forecasting.xlsx
 ├── graphs/
+│   ├── actual_vs_predicted.png
+│   ├── future_forecast.png
+│   ├── future_graph.png
+│   ├── past_graph.png
+│   ├── user_output.png
+│   └── xgb_graph.png
 ├── model/
 │   ├── xgb_model.json
+│   ├── xgb_model.joblib
 │   └── xgb_model_multifeature.json
 └── templates/
+    ├── dashboards.html
+    ├── forgot_password.html
+    ├── homepage.html
     ├── index.html
     ├── login.html
     ├── register.html
-    ├── forgot_password.html
     ├── reset_password.html
     ├── result.html
-    └── upload.html
+    ├── settings.html
+    ├── trusted_emails.html
+    ├── upload.html
+    └── verify_email_share.html
 ```
