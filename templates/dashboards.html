@@ -338,7 +338,7 @@
   <div class="navbar">
     <div><strong>Retail Demand Forecasting</strong> — Dashboards</div>
     <div>
-      <a href="/home">Upload</a>
+      <a href="{{ url_for('home') }}">Upload</a>
       {% if session.get('report_id') %}
         <a href="{{ url_for('result_page') }}">Results</a>
         <a href="{{ url_for('dashboards_page') }}">Dashboards</a>
@@ -346,7 +346,7 @@
         <a href="#" aria-disabled="true" class="disabled">Results</a>
         <a href="#" aria-disabled="true" class="disabled">Dashboards</a>
       {% endif %}
-      <a href="/trusted-emails/manage">Trusted Emails</a>
+      <a href="{{ url_for('trusted_emails_manage_page') }}">Trusted Emails</a>
 
       {% set _username = (session.get('username') or '').strip() %}
       {% set _email = (session.get('user_email') or '').strip() %}
@@ -363,9 +363,9 @@
           👤 {{ _user_label }} ▾
         </button>
         <div class="user-dropdown" id="userMenuDropdown" role="menu" aria-label="User menu" data-open="false">
-          <a class="user-item" href="/settings" role="menuitem">Settings</a>
+          <a class="user-item" href="{{ url_for('settings_page') }}" role="menuitem">Settings</a>
           <div class="user-divider" role="separator" aria-hidden="true"></div>
-          <a class="user-item" href="/logout" role="menuitem">Logout</a>
+          <a class="user-item" href="{{ url_for('logout') }}" role="menuitem">Logout</a>
         </div>
       </span>
     </div>
