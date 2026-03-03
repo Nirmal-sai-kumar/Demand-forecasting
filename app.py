@@ -822,69 +822,6 @@ def _report_share_is_verified(owner_id: str, report_id: str, recipient_email: st
     return True
 
 
-def _report_share_recipient_is_verified_any(owner_id: str, recipient_email: str, access_token: str) -> bool:
-    """Return True if recipient_email has ANY verified share row for this owner.
-
-    This prevents surprising behavior where a recipient is forced to re-verify for
-    every newly generated report_id.
-    """
-    if UNIT_TESTING:
-        return False
-    recipient = (recipient_email or "").strip().lower()
-    if not recipient:
-        return False
-
-    def _query_any(sb) -> bool:
-        res = (
-            sb.table("report_shares")
-            .select("id,is_verified")
-            .eq("owner_id", owner_id)
-            .eq("is_verified", True)
-            .limit(1)
-        )
-        # Prefer exact; fall back to ilike when available.
-        try:
-            res = res.eq("recipient_email", recipient)
-        except Exception:
-            pass
-        try:
-            res2 = res.execute()
-            rows = getattr(res2, "data", None) or []
-            if rows:
-                return True
-        except Exception:
-            pass
-
-        try:
-            res3 = (
-                sb.table("report_shares")
-                .select("id,is_verified")
-                .eq("owner_id", owner_id)
-                .eq("is_verified", True)
-                .ilike("recipient_email", recipient)
-                .limit(1)
-                .execute()
-            )
-            rows = getattr(res3, "data", None) or []
-            return bool(rows)
-        except Exception:
-            return False
-
-    # First user-scoped, then admin fallback.
-    try:
-        sb = get_supabase(access_token)
-        if _query_any(sb):
-            return True
-    except Exception:
-        pass
-
-    try:
-        sb_admin = get_supabase_admin()
-        return _query_any(sb_admin)
-    except Exception:
-        return False
-
-
 def can_send_report(user: CurrentUser, recipient_email: str, report_id: str | None) -> bool:
     """Authorization policy for delivering a report to recipient_email.
 
@@ -916,12 +853,8 @@ def can_send_report(user: CurrentUser, recipient_email: str, report_id: str | No
     if report_id and _report_share_is_verified(user.id, report_id, recipient, access_token):
         return True
 
-    # If a recipient verified a previous share for this owner, allow delivery for
-    # new report_ids without forcing repeated verification.
-    if _report_share_recipient_is_verified_any(user.id, recipient, access_token):
-        return True
-
     return False
+
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -5289,6 +5222,48 @@ def _create_or_refresh_report_share_verification(
     )
     _send_email_plain_sendgrid(recipient_email, subject, body)
 
+    # Best-effort: make the recipient visible in the sender's Trusted Emails list.
+    # We do NOT send a separate trusted-email verification here; the share verification
+    # link is the verification mechanism. The row will be marked verified on success.
+    try:
+        trow = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": recipient_email})
+        if not trow:
+            try:
+                tres = (
+                    sb.table("trusted_emails")
+                    .select("*")
+                    .eq("owner_id", owner_id)
+                    .ilike("email", recipient_email)
+                    .limit(1)
+                    .execute()
+                )
+                tdata = getattr(tres, "data", None)
+                if isinstance(tdata, list) and tdata:
+                    trow = tdata[0]
+                elif isinstance(tdata, dict):
+                    trow = tdata
+            except Exception:
+                trow = None
+
+        if trow:
+            # Ensure stored email is normalized.
+            if (trow.get("email") or "").strip() != recipient_email:
+                sb.table("trusted_emails").update({"email": recipient_email}).eq("id", trow["id"]).execute()
+        else:
+            sb.table("trusted_emails").insert(
+                {
+                    "owner_id": owner_id,
+                    "email": recipient_email,
+                    "is_verified": False,
+                    "verify_token_hash": None,
+                    "verify_sent_at": now_iso,
+                    "verified_at": None,
+                }
+            ).execute()
+    except Exception:
+        # Trusted-email visibility must not block share verification.
+        pass
+
     # Start cooldown only after the email send succeeds.
     _cooldown_start(cd_key, RECIPIENT_COOLDOWN_SECONDS)
 
@@ -5890,8 +5865,57 @@ def verify_report_share():
             }
         ).eq("id", row["id"]).execute()
 
-        # Public verification should be minimal-scope: do not auto-promote recipients or auto-deliver
-        # reports from a token-bearing public endpoint. The sender can resend after verification.
+        # Keep trusted_emails in sync with share verification so recipients show up in the
+        # Trusted Emails page with the correct verified status.
+        try:
+            owner_id = (str(row.get("owner_id")) if row.get("owner_id") else "").strip()
+            recipient = ((row.get("recipient_email") or "").strip().lower())
+            if owner_id and recipient:
+                trow = _supabase_table_get_single(
+                    sb_admin,
+                    "trusted_emails",
+                    {"owner_id": owner_id, "email": recipient},
+                )
+                if not trow:
+                    try:
+                        tres = (
+                            sb_admin.table("trusted_emails")
+                            .select("*")
+                            .eq("owner_id", owner_id)
+                            .ilike("email", recipient)
+                            .limit(1)
+                            .execute()
+                        )
+                        tdata = getattr(tres, "data", None)
+                        if isinstance(tdata, list) and tdata:
+                            trow = tdata[0]
+                        elif isinstance(tdata, dict):
+                            trow = tdata
+                    except Exception:
+                        trow = None
+
+                if trow:
+                    sb_admin.table("trusted_emails").update(
+                        {
+                            "email": recipient,
+                            "is_verified": True,
+                            "verified_at": now_iso,
+                            "verify_token_hash": None,
+                        }
+                    ).eq("id", trow["id"]).execute()
+                else:
+                    sb_admin.table("trusted_emails").insert(
+                        {
+                            "owner_id": owner_id,
+                            "email": recipient,
+                            "is_verified": True,
+                            "verified_at": now_iso,
+                            "verify_token_hash": None,
+                            "verify_sent_at": now_iso,
+                        }
+                    ).execute()
+        except Exception:
+            pass
 
         _audit_event_best_effort(
             "share_verified",
