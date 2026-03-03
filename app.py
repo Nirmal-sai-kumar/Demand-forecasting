@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import base64
+import ipaddress
 import io
 import urllib.request
 import urllib.error
@@ -225,6 +226,9 @@ PDF_PASSWORD_FERNET_KEY = (os.getenv("PDF_PASSWORD_FERNET_KEY") or "").strip()
 VERIFY_EMAIL_RATE_LIMIT = int(os.getenv("VERIFY_EMAIL_RATE_LIMIT", "5"))  # per window
 VERIFY_EMAIL_RATE_WINDOW_SECONDS = int(os.getenv("VERIFY_EMAIL_RATE_WINDOW_SECONDS", str(60 * 60)))
 
+# Cooldown between verification-email re-sends to the same recipient.
+VERIFY_EMAIL_COOLDOWN_SECONDS = int(os.getenv("VERIFY_EMAIL_COOLDOWN_SECONDS", str(60)))
+
 # Verification tokens (trusted email + report share): expire by default after 24 hours.
 # Report shares also have a DB-backed expires_at; trusted_emails relies on verify_sent_at.
 VERIFY_TOKEN_TTL_SECONDS = int(os.getenv("VERIFY_TOKEN_TTL_SECONDS", str(24 * 60 * 60)))
@@ -243,6 +247,13 @@ REPORT_SEND_RATE_LIMIT = int(os.getenv("REPORT_SEND_RATE_LIMIT", "10"))
 REPORT_SEND_RATE_WINDOW_SECONDS = int(os.getenv("REPORT_SEND_RATE_WINDOW_SECONDS", str(15 * 60)))
 
 RECIPIENT_COOLDOWN_SECONDS = int(os.getenv("RECIPIENT_COOLDOWN_SECONDS", str(5 * 60)))
+
+# Only honor X-Forwarded-For when the immediate peer is a trusted proxy.
+# Comma-separated list of IPs/CIDRs, e.g. "127.0.0.1,10.0.0.0/8".
+TRUSTED_PROXY_IPS = (os.getenv("TRUSTED_PROXY_IPS") or "").strip()
+
+# Public files generated for Twilio MediaUrl fetching are ephemeral.
+PUBLIC_FILE_TTL_SECONDS = int(os.getenv("PUBLIC_FILE_TTL_SECONDS", str(2 * 60 * 60)))
 
 # ---------- SETTINGS: PASSWORD CHANGE OTP + AVATAR UPLOAD ----------
 PW_CHANGE_OTP_TTL_SECONDS = int(os.getenv("PW_CHANGE_OTP_TTL_SECONDS", str(10 * 60)))
@@ -265,9 +276,72 @@ COMMON_PASSWORDS = {
 
 
 def _client_ip() -> str:
-    # Prefer proxy-aware header if present (Render sets X-Forwarded-For).
-    xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-    return xff or (request.remote_addr or "").strip() or "unknown"
+    def _parse_ip(s: str | None) -> ipaddress._BaseAddress | None:
+        if not s:
+            return None
+        try:
+            return ipaddress.ip_address(str(s).strip())
+        except Exception:
+            return None
+
+    def _trusted_proxy_networks() -> list[ipaddress._BaseNetwork]:
+        # If explicitly configured, trust only the provided set.
+        raw = TRUSTED_PROXY_IPS
+        cidrs: list[str]
+        if raw:
+            cidrs = [p.strip() for p in raw.split(",") if p.strip()]
+        else:
+            # Safe default for common reverse-proxy deployments: only trust loopback + RFC1918 + ULA.
+            cidrs = [
+                "127.0.0.0/8",
+                "::1/128",
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "fc00::/7",
+            ]
+        nets: list[ipaddress._BaseNetwork] = []
+        for c in cidrs:
+            try:
+                nets.append(ipaddress.ip_network(c, strict=False))
+            except Exception:
+                continue
+        return nets
+
+    remote_raw = (request.remote_addr or "").strip()
+    remote_ip = _parse_ip(remote_raw)
+
+    allow_forwarded = False
+    if remote_ip is not None:
+        try:
+            for net in _trusted_proxy_networks():
+                if remote_ip in net:
+                    allow_forwarded = True
+                    break
+        except Exception:
+            allow_forwarded = False
+
+    if allow_forwarded:
+        # Use the first hop in X-Forwarded-For (client IP).
+        xff_first = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        xff_ip = _parse_ip(xff_first)
+        if xff_ip is not None:
+            return str(xff_ip)
+
+        xri = (request.headers.get("X-Real-IP") or "").strip()
+        xri_ip = _parse_ip(xri)
+        if xri_ip is not None:
+            return str(xri_ip)
+
+    return remote_raw or "unknown"
+
+
+def _client_user_agent() -> str:
+    ua = (request.headers.get("User-Agent") or "").strip()
+    if not ua:
+        return ""
+    ua = ua.replace("\r", " ").replace("\n", " ")
+    return ua[:512]
 
 
 def _is_disposable_email_domain(email: str) -> bool:
@@ -289,22 +363,61 @@ class _InMemoryTtlStore:
 
     def __init__(self) -> None:
         self._data: dict[str, tuple[bytes, float]] = {}
+        self._lock = threading.Lock()
 
     def set(self, key: str, value: bytes, ttl_seconds: int) -> None:
-        self._data[key] = (value, time.time() + float(ttl_seconds))
+        with self._lock:
+            self._data[key] = (value, time.time() + float(ttl_seconds))
 
     def get(self, key: str) -> bytes | None:
-        item = self._data.get(key)
-        if not item:
-            return None
-        value, exp = item
-        if time.time() >= exp:
-            self._data.pop(key, None)
-            return None
-        return value
+        with self._lock:
+            item = self._data.get(key)
+            if not item:
+                return None
+            value, exp = item
+            if time.time() >= exp:
+                self._data.pop(key, None)
+                return None
+            return value
 
     def delete(self, key: str) -> None:
-        self._data.pop(key, None)
+        with self._lock:
+            self._data.pop(key, None)
+
+    def set_if_absent(self, key: str, value: bytes, ttl_seconds: int) -> bool:
+        """Atomic set-if-absent with TTL. Returns True if set."""
+        now = time.time()
+        exp = now + float(ttl_seconds)
+        with self._lock:
+            item = self._data.get(key)
+            if item:
+                _v, cur_exp = item
+                if now < cur_exp:
+                    return False
+                self._data.pop(key, None)
+            self._data[key] = (value, exp)
+            return True
+
+    def incr_with_ttl(self, key: str, ttl_seconds: int) -> int:
+        """Atomic increment with TTL set on first write."""
+        now = time.time()
+        exp = now + float(ttl_seconds)
+        with self._lock:
+            item = self._data.get(key)
+            if not item:
+                self._data[key] = (b"1", exp)
+                return 1
+            raw, cur_exp = item
+            if now >= cur_exp:
+                self._data[key] = (b"1", exp)
+                return 1
+            try:
+                n = int((raw or b"0").decode("utf-8"))
+            except Exception:
+                n = 0
+            n += 1
+            self._data[key] = (str(n).encode("utf-8"), cur_exp)
+            return n
 
 
 _MEM_STORE = _InMemoryTtlStore()
@@ -408,29 +521,48 @@ def _rate_limit_hit(key: str, limit: int, window_seconds: int) -> bool:
     backend = _pw_store_backend()
     k = "rl:" + key
 
-    # Redis path
-    if hasattr(backend, "incr") and hasattr(backend, "expire"):
+    # Redis path (atomic via Lua to avoid race conditions).
+    if hasattr(backend, "eval") and hasattr(backend, "incr") and hasattr(backend, "expire"):
         try:
-            n = int(backend.incr(k))
-            if n == 1:
-                backend.expire(k, int(window_seconds))
+            script = (
+                "local v = redis.call('INCR', KEYS[1]); "
+                "if v == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]); end; "
+                "return v;"
+            )
+            n = int(backend.eval(script, 1, k, int(window_seconds)))
             return n > int(limit)
         except Exception:
             # Fail-open to preserve availability.
             return False
 
-    # In-memory path
-    now = time.time()
-    raw = backend.get(k)
+    # In-memory path (atomic under store lock).
+    if hasattr(backend, "incr_with_ttl"):
+        try:
+            n = int(backend.incr_with_ttl(k, int(window_seconds)))
+            return n > int(limit)
+        except Exception:
+            return False
+
+    # Best-effort fallback.
+    try:
+        raw = backend.get(k)
+    except Exception:
+        raw = None
     if raw is None:
-        backend.set(k, b"1", int(window_seconds))
+        try:
+            backend.set(k, b"1", int(window_seconds))
+        except Exception:
+            return False
         return False
     try:
         n = int(raw.decode("utf-8"))
     except Exception:
         n = 1
     n += 1
-    backend.set(k, str(n).encode("utf-8"), int(window_seconds))
+    try:
+        backend.set(k, str(n).encode("utf-8"), int(window_seconds))
+    except Exception:
+        return False
     return n > int(limit)
 
 
@@ -438,17 +570,34 @@ def _cooldown_block(key: str, cooldown_seconds: int) -> bool:
     """Return True if still in cooldown; otherwise start cooldown and return False."""
     backend = _pw_store_backend()
     k = "cd:" + key
-    if hasattr(backend, "set") and hasattr(backend, "setnx"):
-        # Redis set-if-not-exists
+    if hasattr(backend, "set_if_absent"):
         try:
-            ok = backend.set(k, b"1", nx=True, ex=int(cooldown_seconds))
-            return not bool(ok)
+            created = bool(backend.set_if_absent(k, b"1", int(cooldown_seconds)))
+            return not created
         except Exception:
             return False
 
-    if backend.get(k):
-        return True
-    backend.set(k, b"1", int(cooldown_seconds))
+    # Redis set-if-not-exists (atomic).
+    if hasattr(backend, "set") and hasattr(backend, "get"):
+        try:
+            ok = backend.set(k, b"1", nx=True, ex=int(cooldown_seconds))
+            return not bool(ok)
+        except TypeError:
+            # Backend doesn't support Redis-style kwargs.
+            pass
+        except Exception:
+            return False
+
+    # Best-effort fallback.
+    try:
+        if backend.get(k):
+            return True
+    except Exception:
+        return False
+    try:
+        backend.set(k, b"1", int(cooldown_seconds))
+    except Exception:
+        return False
     return False
 
 
@@ -466,10 +615,18 @@ def _cooldown_start(key: str, cooldown_seconds: int) -> None:
     """Start cooldown best-effort."""
     backend = _pw_store_backend()
     k = "cd:" + key
+    if hasattr(backend, "set_if_absent"):
+        try:
+            backend.set_if_absent(k, b"1", int(cooldown_seconds))
+            return
+        except Exception:
+            return
     try:
-        if hasattr(backend, "set") and hasattr(backend, "setnx"):
+        if hasattr(backend, "set") and hasattr(backend, "get"):
             backend.set(k, b"1", nx=True, ex=int(cooldown_seconds))
             return
+    except TypeError:
+        pass
     except Exception:
         return
     try:
@@ -4567,6 +4724,12 @@ def email_pdf():
     if not session.get('logged_in'):
         return jsonify({"ok": False, "message": "Please login first."}), 401
 
+    # Cache session values once for consistency (audit/report ids).
+    session_user_id = session.get("user_id") or None
+    session_user_email = session.get("user_email") or None
+    session_report_id = session.get("report_id")
+    session_access_token = (session.get("access_token") or "").strip()
+
     email = None
     pdf_password = None
     try:
@@ -4589,10 +4752,10 @@ def email_pdf():
     if BLOCK_DISPOSABLE_EMAILS and _is_disposable_email_domain(email):
         _audit_event_best_effort(
             "recipient_blocked_disposable",
-            owner_id=(session.get("user_id") or None),
-            actor_email=(session.get("user_email") or None),
+            owner_id=session_user_id,
+            actor_email=session_user_email,
             recipient_email=email,
-            report_id=str(session.get("report_id") or "") or None,
+            report_id=str(session_report_id or "") or None,
             meta={},
         )
         return jsonify({"ok": False, "message": "Disposable email domains are not allowed."}), 400
@@ -4609,7 +4772,7 @@ def email_pdf():
     if sender_err:
         return jsonify(sender_err[0]), sender_err[1]
 
-    report_id = _parse_report_id(session.get("report_id"))
+    report_id = _parse_report_id(session_report_id)
     if not report_id:
         return jsonify({"ok": False, "message": "Report not found. Please upload a dataset again."}), 400
 
@@ -4649,11 +4812,10 @@ def email_pdf():
             }), 403
 
         try:
-            access_token = (session.get("access_token") or "").strip()
-            if not access_token:
+            if not session_access_token:
                 return jsonify({"ok": False, "message": "Login session expired. Please login again."}), 401
 
-            _create_or_refresh_report_share_verification(sender.id, report_id, email, access_token, pdf_password=pdf_password or None)
+            _create_or_refresh_report_share_verification(sender.id, report_id, email, session_access_token, pdf_password=pdf_password or None)
             _audit_event_best_effort(
                 "share_verification_sent",
                 owner_id=sender.id,
@@ -4834,25 +4996,64 @@ def public_files(filename: str):
     unauthenticated. Files are keyed by report UUID and stored in a non-user-controlled
     directory.
     """
+
+    _cleanup_stale_public_files_best_effort()
+
     name = (filename or "").strip()
+    if "/" in name or "\\" in name:
+        return ("Not found", 404)
+    name = name.lower()
     # Only allow our expected filenames.
-    # Allow optional suffixes for derived protected files (e.g., public_<id>_pw.pdf, public_<id>_dashpw.pdf).
-    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([A-Za-z0-9_\-]+))?\.(pdf)", name)
+    # Allow optional suffixes for derived protected/tagged files produced by this app.
+    m = re.fullmatch(r"public_([0-9a-fA-F-]{32,36})(?:_([a-z0-9_\-]{1,80}))?\.(pdf)", name)
     if not m:
         return ("Not found", 404)
 
     report_id = m.group(1)
     suffix = m.group(2)
-    ext = m.group(3)
+    _ext = m.group(3)
     report_id = _parse_report_id(report_id)
     if not report_id:
         return ("Not found", 404)
 
+    allowed_simple_suffixes = {None, "dash", "pw", "dashpw"}
+    if suffix not in allowed_simple_suffixes:
+        # Allow only tags (generated via _safe_dashboard_tag) and their expected variants.
+        #   public_<id>_<tag>.pdf
+        #   public_<id>_dash_<tag>.pdf
+        #   public_<id>_<tag>_pw.pdf
+        #   public_<id>_dash_<tag>_pw.pdf
+        tag = suffix
+        if suffix.startswith("dash_"):
+            tag = suffix[len("dash_") :]
+        if tag.endswith("_pw"):
+            tag = tag[: -len("_pw")]
+        if not re.fullmatch(r"[a-z0-9_\-]{1,40}", tag or ""):
+            return ("Not found", 404)
+        allowed_tag_suffixes = {
+            tag,
+            f"dash_{tag}",
+            f"{tag}_pw",
+            f"dash_{tag}_pw",
+        }
+        if suffix not in allowed_tag_suffixes:
+            return ("Not found", 404)
+
     # We generate only the base report PDF and base dashboard PDF on demand.
     # Password-protected variants (suffix: pw / dashpw) must already exist.
-    if suffix and suffix not in ("dash",):
-        path = os.path.join(DOWNLOAD_DIR, name)
-    else:
+    can_generate = (suffix in (None, "dash"))
+    path = os.path.join(DOWNLOAD_DIR, name)
+
+    # If the file exists but is stale, delete it. Base/dash can be regenerated.
+    if os.path.exists(path) and PUBLIC_FILE_TTL_SECONDS > 0:
+        try:
+            age = time.time() - float(os.path.getmtime(path))
+            if age > float(PUBLIC_FILE_TTL_SECONDS):
+                os.remove(path)
+        except Exception:
+            pass
+
+    if can_generate:
         try:
             report_path = os.path.join(DOWNLOAD_DIR, f"{report_id}.json")
             with open(report_path, "r", encoding="utf-8") as f:
@@ -4865,10 +5066,21 @@ def public_files(filename: str):
         except Exception:
             app.logger.exception("Failed generating public report files")
             return ("Not found", 404)
-
-        path = os.path.join(DOWNLOAD_DIR, name)
     if not os.path.exists(path):
         return ("Not found", 404)
+
+    # Enforce TTL for non-regeneratable variants too.
+    if PUBLIC_FILE_TTL_SECONDS > 0:
+        try:
+            age = time.time() - float(os.path.getmtime(path))
+            if age > float(PUBLIC_FILE_TTL_SECONDS):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                return ("Not found", 404)
+        except Exception:
+            pass
 
     # Do not cache long-term; these are ephemeral files.
     @after_this_request
@@ -4877,6 +5089,46 @@ def public_files(filename: str):
         return resp
 
     return send_file(path, as_attachment=False)
+
+
+_PUBLIC_FILES_CLEANUP_LOCK = threading.Lock()
+_PUBLIC_FILES_LAST_CLEANUP_TS = 0.0
+
+
+def _cleanup_stale_public_files_best_effort() -> None:
+    global _PUBLIC_FILES_LAST_CLEANUP_TS
+    if PUBLIC_FILE_TTL_SECONDS <= 0:
+        return
+    now_ts = time.time()
+    try:
+        with _PUBLIC_FILES_CLEANUP_LOCK:
+            if (now_ts - float(_PUBLIC_FILES_LAST_CLEANUP_TS)) < 300:
+                return
+            _PUBLIC_FILES_LAST_CLEANUP_TS = now_ts
+    except Exception:
+        return
+
+    cutoff = now_ts - float(PUBLIC_FILE_TTL_SECONDS)
+    try:
+        removed = 0
+        with os.scandir(DOWNLOAD_DIR) as it:
+            for entry in it:
+                if removed >= 200:
+                    break
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if not (name.startswith("public_") and name.endswith(".pdf")):
+                    continue
+                try:
+                    st = entry.stat()
+                    if float(st.st_mtime) < cutoff:
+                        os.remove(entry.path)
+                        removed += 1
+                except Exception:
+                    continue
+    except Exception:
+        return
 
 
 # ---------- SECURE EMAIL SHARING ----------
@@ -5070,6 +5322,11 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
     if _rate_limit_hit(rl_key, VERIFY_EMAIL_RATE_LIMIT, VERIFY_EMAIL_RATE_WINDOW_SECONDS):
         raise RuntimeError("rate_limited")
 
+    cd_key = f"verify_trusted_cd:{owner_id}:{email_norm}"
+    # Important: do NOT start cooldown until after the verification email is actually sent.
+    if _cooldown_is_active(cd_key):
+        raise RuntimeError("cooldown")
+
     token = _new_verify_token()
     token_hash = _token_hash(token)
 
@@ -5100,6 +5357,12 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
         row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": raw_email})
 
     if row:
+        # If it's already verified, keep it verified and avoid re-sending verification.
+        if bool(row.get("is_verified")):
+            if (row.get("email") or "") != email_norm:
+                sb.table("trusted_emails").update({"email": email_norm}).eq("id", row["id"]).execute()
+            return
+
         sb.table("trusted_emails").update(
             {
                 "email": email_norm,
@@ -5128,6 +5391,7 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
         "If you did not request this, you can ignore this message."
     )
     _send_email_plain_sendgrid(email_norm, subject, body)
+    _cooldown_start(cd_key, VERIFY_EMAIL_COOLDOWN_SECONDS)
 
 
 def _create_or_refresh_report_share_verification(
@@ -5269,7 +5533,7 @@ def _create_or_refresh_report_share_verification(
         pass
 
     # Start cooldown only after the email send succeeds.
-    _cooldown_start(cd_key, RECIPIENT_COOLDOWN_SECONDS)
+    _cooldown_start(cd_key, VERIFY_EMAIL_COOLDOWN_SECONDS)
 
     if pdf_password and not password_stored:
         # Preserve previous behavior for callers that want to message the sender.
@@ -5368,13 +5632,23 @@ def _audit_event_best_effort(
         "recipient_email": (recipient_email or "").strip().lower()[:254] if recipient_email else None,
         "report_id": report_id,
         "ip": _client_ip(),
-        "user_agent": (request.headers.get("User-Agent") or "")[:512],
+        "user_agent": _client_user_agent(),
         "meta": meta or {},
     }
     try:
         sb_admin = get_supabase_admin()
         sb_admin.table("share_audit_events").insert(payload).execute()
-    except Exception:
+    except Exception as e:
+        try:
+            app.logger.warning(
+                "AUDIT_INSERT_FAILED event_type=%s owner_id=%s report_id=%s err=%s",
+                payload.get("event_type"),
+                payload.get("owner_id"),
+                payload.get("report_id"),
+                str(e)[:500],
+            )
+        except Exception:
+            pass
         try:
             app.logger.info("AUDIT %s %s", event_type, json.dumps(payload, default=str)[:2000])
         except Exception:
