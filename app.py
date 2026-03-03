@@ -6,7 +6,19 @@ import urllib.request
 import urllib.error
 from xml.sax.saxutils import escape as _xml_escape
 
-from flask import Flask, request, render_template, redirect, url_for, session, send_file, after_this_request, jsonify, Response
+from flask import (
+    Flask,
+    request,
+    render_template,
+    redirect,
+    url_for,
+    session,
+    send_file,
+    after_this_request,
+    jsonify,
+    Response,
+    make_response,
+)
 import json
 import logging
 import os
@@ -219,6 +231,12 @@ VERIFY_TOKEN_TTL_SECONDS = int(os.getenv("VERIFY_TOKEN_TTL_SECONDS", str(24 * 60
 # Rate limit verification endpoints to reduce brute-force / abuse.
 VERIFY_ENDPOINT_RATE_LIMIT = int(os.getenv("VERIFY_ENDPOINT_RATE_LIMIT", "30"))
 VERIFY_ENDPOINT_RATE_WINDOW_SECONDS = int(os.getenv("VERIFY_ENDPOINT_RATE_WINDOW_SECONDS", str(5 * 60)))
+
+# Public verify pages should avoid leaking token via referrer/caches.
+VERIFY_PAGE_REFERRER_POLICY = os.getenv("VERIFY_PAGE_REFERRER_POLICY", "no-referrer").strip() or "no-referrer"
+
+# Avoid user/email enumeration by standardizing verify UX text for all invalid cases.
+VERIFY_GENERIC_INVALID_MESSAGE = "Verification link is invalid or expired."
 
 REPORT_SEND_RATE_LIMIT = int(os.getenv("REPORT_SEND_RATE_LIMIT", "10"))
 REPORT_SEND_RATE_WINDOW_SECONDS = int(os.getenv("REPORT_SEND_RATE_WINDOW_SECONDS", str(15 * 60)))
@@ -5099,6 +5117,14 @@ def _app_public_base_url() -> str:
     return (CONFIG.email_redirect_base_url or CONFIG.app_base_url or "").rstrip("/")
 
 
+def _verify_page_response(message: str, status_code: int) -> Response:
+    resp = make_response(render_template("verify_email_share.html", message=message), status_code)
+    # Prevent leaking the token via referrer headers and avoid caching token-bearing URLs.
+    resp.headers["Referrer-Policy"] = VERIFY_PAGE_REFERRER_POLICY
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
 def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, access_token: str) -> None:
     # Abuse prevention: limit verification email bursts per owner+email.
     raw_email = (email or "").strip()
@@ -5113,8 +5139,26 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
     sb = get_supabase(access_token)
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Prefer normalized lookup; fallback to raw in case older rows were stored with casing.
+    # Prefer normalized lookup; fallback to case-insensitive match to avoid duplicates.
     row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": email_norm})
+    if not row:
+        # Older rows may have mixed casing. Try a case-insensitive lookup when supported.
+        try:
+            res = (
+                sb.table("trusted_emails")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .ilike("email", email_norm)
+                .limit(1)
+                .execute()
+            )
+            data = getattr(res, "data", None)
+            if isinstance(data, list) and data:
+                row = data[0]
+            elif isinstance(data, dict):
+                row = data
+        except Exception:
+            row = None
     if not row and raw_email and raw_email != email_norm:
         row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": raw_email})
 
@@ -5185,12 +5229,30 @@ def _create_or_refresh_report_share_verification(
     expires_dt = now_dt + timedelta(hours=24)
 
     sb = get_supabase(access_token)
-    # Prefer normalized lookup; fallback to raw in case older rows were stored with casing.
+    # Prefer normalized lookup; fallback to case-insensitive match to avoid duplicates.
     row = _supabase_table_get_single(
         sb,
         "report_shares",
         {"owner_id": owner_id, "report_id": report_id, "recipient_email": recipient_email},
     )
+    if not row:
+        try:
+            res = (
+                sb.table("report_shares")
+                .select("*")
+                .eq("owner_id", owner_id)
+                .eq("report_id", report_id)
+                .ilike("recipient_email", recipient_email)
+                .limit(1)
+                .execute()
+            )
+            data = getattr(res, "data", None)
+            if isinstance(data, list) and data:
+                row = data[0]
+            elif isinstance(data, dict):
+                row = data
+        except Exception:
+            row = None
     if not row and recipient_email_raw and recipient_email_raw != recipient_email:
         row = _supabase_table_get_single(
             sb,
@@ -5648,7 +5710,7 @@ def verify_trusted_email():
     # Throttle public verification endpoint to reduce brute-force attempts.
     rl_key = f"verify_ep:trusted:{_client_ip()}"
     if _rate_limit_hit(rl_key, VERIFY_ENDPOINT_RATE_LIMIT, VERIFY_ENDPOINT_RATE_WINDOW_SECONDS):
-        return render_template("verify_email_share.html", message="Too many attempts. Please try again later."), 429
+        return _verify_page_response("Too many attempts. Please try again later.", 429)
 
     token = (request.args.get("token") or "").strip()
     if not token:
@@ -5660,7 +5722,7 @@ def verify_trusted_email():
             report_id=None,
             meta={"reason": "missing_token"},
         )
-        return render_template("verify_email_share.html", message="Invalid verification link."), 400
+        return _verify_page_response(VERIFY_GENERIC_INVALID_MESSAGE, 400)
 
     try:
         sb_admin = get_supabase_admin()
@@ -5673,10 +5735,10 @@ def verify_trusted_email():
             report_id=None,
             meta={"reason": "admin_client_unavailable"},
         )
-        return render_template(
-            "verify_email_share.html",
-            message="Server is not configured for verification. Please contact support.",
-        ), 500
+        return _verify_page_response(
+            "Server is not configured for verification. Please contact support.",
+            500,
+        )
 
     token_hash = _token_hash(token)
     try:
@@ -5697,7 +5759,7 @@ def verify_trusted_email():
                 report_id=None,
                 meta={"reason": "token_not_found"},
             )
-            return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
+            return _verify_page_response(VERIFY_GENERIC_INVALID_MESSAGE, 400)
 
         row_id = rows[0]["id"]
 
@@ -5713,7 +5775,7 @@ def verify_trusted_email():
                     report_id=None,
                     meta={"reason": "expired"},
                 )
-                return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
+                return _verify_page_response(VERIFY_GENERIC_INVALID_MESSAGE, 400)
         except Exception:
             # If the DB column is missing/unparseable, skip strict expiry to preserve compatibility.
             pass
@@ -5734,7 +5796,7 @@ def verify_trusted_email():
             report_id=None,
             meta={"row_id": row_id},
         )
-        return render_template("verify_email_share.html", message="Email verified successfully. You can now receive reports."), 200
+        return _verify_page_response("Email verified successfully. You can now receive reports.", 200)
     except Exception:
         app.logger.exception("Trusted email verification failed")
         _audit_event_best_effort(
@@ -5745,7 +5807,7 @@ def verify_trusted_email():
             report_id=None,
             meta={"reason": "exception"},
         )
-        return render_template("verify_email_share.html", message="Verification failed. Please try again later."), 500
+        return _verify_page_response("Verification failed. Please try again later.", 500)
 
 
 @app.route("/share/verify", methods=["GET"])
@@ -5753,7 +5815,7 @@ def verify_report_share():
     # Throttle public verification endpoint to reduce brute-force attempts.
     rl_key = f"verify_ep:share:{_client_ip()}"
     if _rate_limit_hit(rl_key, VERIFY_ENDPOINT_RATE_LIMIT, VERIFY_ENDPOINT_RATE_WINDOW_SECONDS):
-        return render_template("verify_email_share.html", message="Too many attempts. Please try again later."), 429
+        return _verify_page_response("Too many attempts. Please try again later.", 429)
 
     token = (request.args.get("token") or "").strip()
     if not token:
@@ -5765,7 +5827,7 @@ def verify_report_share():
             report_id=None,
             meta={"reason": "missing_token"},
         )
-        return render_template("verify_email_share.html", message="Invalid verification link."), 400
+        return _verify_page_response(VERIFY_GENERIC_INVALID_MESSAGE, 400)
 
     try:
         sb_admin = get_supabase_admin()
@@ -5778,10 +5840,10 @@ def verify_report_share():
             report_id=None,
             meta={"reason": "admin_client_unavailable"},
         )
-        return render_template(
-            "verify_email_share.html",
-            message="Server is not configured for verification. Please contact support.",
-        ), 500
+        return _verify_page_response(
+            "Server is not configured for verification. Please contact support.",
+            500,
+        )
 
     token_hash = _token_hash(token)
     try:
@@ -5802,7 +5864,7 @@ def verify_report_share():
                 report_id=None,
                 meta={"reason": "token_not_found"},
             )
-            return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
+            return _verify_page_response(VERIFY_GENERIC_INVALID_MESSAGE, 400)
 
         row = rows[0]
         exp_dt = _parse_iso_datetime(row.get("expires_at")) if row.get("expires_at") else None
@@ -5815,7 +5877,7 @@ def verify_report_share():
                 report_id=None,
                 meta={"reason": "expired"},
             )
-            return render_template("verify_email_share.html", message="Verification link is expired."), 400
+            return _verify_page_response(VERIFY_GENERIC_INVALID_MESSAGE, 400)
 
         now_iso = datetime.now(timezone.utc).isoformat()
         # Important: clear expires_at on success. Token expiry is not share expiry.
@@ -5828,86 +5890,22 @@ def verify_report_share():
             }
         ).eq("id", row["id"]).execute()
 
-        # Promote the verified recipient into trusted_emails (best-effort) so future
-        # reports can be delivered without requiring per-report verification.
-        try:
-            owner_id = row.get("owner_id")
-            recipient_email = (row.get("recipient_email") or "").strip().lower()
-            if owner_id and recipient_email:
-                existing = (
-                    sb_admin.table("trusted_emails")
-                    .select("id")
-                    .eq("owner_id", owner_id)
-                    .eq("email", recipient_email)
-                    .limit(1)
-                    .execute()
-                )
-                existing_rows = getattr(existing, "data", None) or []
-                if existing_rows:
-                    sb_admin.table("trusted_emails").update(
-                        {
-                            "is_verified": True,
-                            "verified_at": now_iso,
-                            "verify_token_hash": None,
-                        }
-                    ).eq("id", existing_rows[0]["id"]).execute()
-                else:
-                    sb_admin.table("trusted_emails").insert(
-                        {
-                            "owner_id": owner_id,
-                            "email": recipient_email,
-                            "is_verified": True,
-                            "verified_at": now_iso,
-                        }
-                    ).execute()
-        except Exception:
-            app.logger.info("Trusted email promotion skipped", exc_info=True)
+        # Public verification should be minimal-scope: do not auto-promote recipients or auto-deliver
+        # reports from a token-bearing public endpoint. The sender can resend after verification.
 
         _audit_event_best_effort(
             "share_verified",
             owner_id=(str(row.get("owner_id")) if row.get("owner_id") else None),
             actor_email=None,
-            recipient_email=(row.get("recipient_email") or None),
+            recipient_email=((row.get("recipient_email") or "").strip().lower() or None),
             report_id=(row.get("report_id") or None),
             meta={"row_id": row["id"]},
         )
 
-        # Auto-deliver the report after verification (best-effort).
-        try:
-            owner_id = str(row.get("owner_id") or "").strip() or None
-            report_id = _parse_report_id(row.get("report_id"))
-            recipient_email = (row.get("recipient_email") or "").strip().lower()
-
-            if owner_id and report_id and recipient_email:
-                # If password protection was requested, only deliver automatically if we still
-                # have the password in short-lived storage.
-                password_required = _share_password_was_requested(owner_id, report_id, recipient_email)
-                stored_pw = _get_share_pdf_password(owner_id, report_id, recipient_email)
-                if password_required and not stored_pw:
-                    return render_template(
-                        "verify_email_share.html",
-                        message="Recipient verified successfully. The report will be delivered by the sender (password is required and must be re-sent).",
-                    ), 200
-
-                _deliver_cached_report_via_email(recipient_email, report_id, owner_id, pdf_password=stored_pw or None)
-                return render_template(
-                    "verify_email_share.html",
-                    message="Recipient verified successfully. The report has been sent to your email.",
-                ), 200
-        except FileNotFoundError:
-            # Report cache may have been cleaned up.
-            return render_template(
-                "verify_email_share.html",
-                message="Recipient verified successfully, but the report is no longer available. Please ask the sender to resend.",
-            ), 200
-        except Exception:
-            app.logger.exception("Auto-delivery after share verification failed")
-            return render_template(
-                "verify_email_share.html",
-                message="Recipient verified successfully, but automatic delivery failed. Please ask the sender to resend.",
-            ), 200
-
-        return render_template("verify_email_share.html", message="Recipient verified successfully."), 200
+        return _verify_page_response(
+            "Recipient verified successfully. Please ask the sender to resend the report.",
+            200,
+        )
     except Exception:
         app.logger.exception("Report share verification failed")
         _audit_event_best_effort(
@@ -5918,7 +5916,7 @@ def verify_report_share():
             report_id=None,
             meta={"reason": "exception"},
         )
-        return render_template("verify_email_share.html", message="Verification failed. Please try again later."), 500
+        return _verify_page_response("Verification failed. Please try again later.", 500)
 
 
 @app.route("/trusted-emails/manage", methods=["GET"])
