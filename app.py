@@ -213,6 +213,14 @@ PDF_PASSWORD_FERNET_KEY = (os.getenv("PDF_PASSWORD_FERNET_KEY") or "").strip()
 VERIFY_EMAIL_RATE_LIMIT = int(os.getenv("VERIFY_EMAIL_RATE_LIMIT", "5"))  # per window
 VERIFY_EMAIL_RATE_WINDOW_SECONDS = int(os.getenv("VERIFY_EMAIL_RATE_WINDOW_SECONDS", str(60 * 60)))
 
+# Verification tokens (trusted email + report share): expire by default after 24 hours.
+# Report shares also have a DB-backed expires_at; trusted_emails relies on verify_sent_at.
+VERIFY_TOKEN_TTL_SECONDS = int(os.getenv("VERIFY_TOKEN_TTL_SECONDS", str(24 * 60 * 60)))
+
+# Rate limit verification endpoints to reduce brute-force / abuse.
+VERIFY_ENDPOINT_RATE_LIMIT = int(os.getenv("VERIFY_ENDPOINT_RATE_LIMIT", "30"))
+VERIFY_ENDPOINT_RATE_WINDOW_SECONDS = int(os.getenv("VERIFY_ENDPOINT_RATE_WINDOW_SECONDS", str(5 * 60)))
+
 REPORT_SEND_RATE_LIMIT = int(os.getenv("REPORT_SEND_RATE_LIMIT", "10"))
 REPORT_SEND_RATE_WINDOW_SECONDS = int(os.getenv("REPORT_SEND_RATE_WINDOW_SECONDS", str(15 * 60)))
 
@@ -1247,13 +1255,17 @@ def _normalize_and_validate_email_for_sending(value: str | None) -> tuple[str | 
     if not raw:
         return None, "Please enter a valid email address."
 
+    # Always lowercase for consistent comparisons/storage across the app.
+    # (Email local-parts are theoretically case-sensitive, but in practice most providers
+    # treat them case-insensitively, and this app relies on case-insensitive behavior.)
     if _ev_validate_email is None:
-        return (raw, None) if _is_valid_email_address(raw) else (None, "Please enter a valid email address.")
+        raw_norm = raw.lower()
+        return (raw_norm, None) if _is_valid_email_address(raw_norm) else (None, "Please enter a valid email address.")
 
     check_deliverability = _get_env_bool("EMAIL_DELIVERABILITY_CHECK", False)
     try:
         res = _ev_validate_email(raw, check_deliverability=bool(check_deliverability))
-        normalized = (getattr(res, "email", None) or raw).strip()
+        normalized = (getattr(res, "email", None) or raw).strip().lower()
         if not normalized or len(normalized) > 254:
             return None, "Please enter a valid email address."
         return normalized, None
@@ -2050,21 +2062,18 @@ def _is_transient_auth_email_error(err: Exception) -> bool:
     aren't confused when the email arrives.
     """
     msg = _sanitize_public_error_message(str(err)).lower()
-    return (
-        "timed out" in msg
-        or "readtimeout" in msg
-        or "timeout" in msg
-        or "connection" in msg
-        or "connection reset" in msg
-        or "connection aborted" in msg
-        or "temporarily unavailable" in msg
-        or "service unavailable" in msg
-        or "bad gateway" in msg
-        or "gateway timeout" in msg
-        or "502" in msg
-        or "503" in msg
-        or "504" in msg
+    # Tighten classification: only treat highly likely transient transport timeouts
+    # as "success-like" outcomes.
+    transient_markers = (
+        "timed out",
+        "readtimeout",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "gateway timeout",
+        "504",
     )
+    return any(m in msg for m in transient_markers)
 
 
 def _safe_predict(m, X):
@@ -3138,6 +3147,8 @@ def sitemap_xml():
 def landing():
     # Public homepage (always shown as the default page).
     # Backward compatibility: if an older login form posts to '/', handle it like '/login'.
+    # NOTE: This exists only to avoid breaking old HTML forms that hardcoded action="/".
+    # If you confirm no clients depend on it, you can safely remove POST support here.
     if request.method == 'POST':
         return login()
     # If already authenticated, send user straight to the dashboard.
@@ -3467,9 +3478,15 @@ def forgot_password():
                 info="If an account exists for that email, a password reset link has been sent."
             )
         except Exception as e:
-            app.logger.exception("Supabase reset password email failed")
             raw_msg = _sanitize_public_error_message(str(e))
             msg_lower = raw_msg.lower()
+
+            # Align logging severity with user-facing outcome.
+            if _is_transient_auth_email_error(e):
+                if not UNIT_TESTING:
+                    app.logger.warning("Supabase reset password email request hit transient error (sanitized): %s", raw_msg)
+            else:
+                app.logger.exception("Supabase reset password email failed")
 
             # Misconfiguration should be shown as a clear failure.
             if "missing supabase config" in msg_lower:
@@ -3493,8 +3510,6 @@ def forgot_password():
             # If the request may have succeeded server-side (timeouts / transient network),
             # show a success-like message to avoid confusing users who still receive the email.
             if _is_transient_auth_email_error(e):
-                if not UNIT_TESTING:
-                    app.logger.warning("Reset password request may have timed out (sanitized): %s", raw_msg)
                 return render_template(
                     "forgot_password.html",
                     info=(
@@ -5090,7 +5105,9 @@ def _app_public_base_url() -> str:
 
 def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, access_token: str) -> None:
     # Abuse prevention: limit verification email bursts per owner+email.
-    rl_key = f"verify_trusted:{owner_id}:{email.lower().strip()}"
+    raw_email = (email or "").strip()
+    email_norm = raw_email.lower()
+    rl_key = f"verify_trusted:{owner_id}:{email_norm}"
     if _rate_limit_hit(rl_key, VERIFY_EMAIL_RATE_LIMIT, VERIFY_EMAIL_RATE_WINDOW_SECONDS):
         raise RuntimeError("rate_limited")
 
@@ -5099,10 +5116,16 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
 
     sb = get_supabase(access_token)
     now_iso = datetime.now(timezone.utc).isoformat()
-    row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": email})
+
+    # Prefer normalized lookup; fallback to raw in case older rows were stored with casing.
+    row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": email_norm})
+    if not row and raw_email and raw_email != email_norm:
+        row = _supabase_table_get_single(sb, "trusted_emails", {"owner_id": owner_id, "email": raw_email})
+
     if row:
         sb.table("trusted_emails").update(
             {
+                "email": email_norm,
                 "verify_token_hash": token_hash,
                 "verify_sent_at": now_iso,
                 "is_verified": False,
@@ -5113,7 +5136,7 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
         sb.table("trusted_emails").insert(
             {
                 "owner_id": owner_id,
-                "email": email,
+                "email": email_norm,
                 "verify_token_hash": token_hash,
                 "verify_sent_at": now_iso,
                 "is_verified": False,
@@ -5127,7 +5150,7 @@ def _create_or_refresh_trusted_email_verification(owner_id: str, email: str, acc
         f"Verify this email by opening: {verify_url}\n\n"
         "If you did not request this, you can ignore this message."
     )
-    _send_email_plain_sendgrid(email, subject, body)
+    _send_email_plain_sendgrid(email_norm, subject, body)
 
 
 def _create_or_refresh_report_share_verification(
@@ -5138,15 +5161,16 @@ def _create_or_refresh_report_share_verification(
     pdf_password: str | None = None,
 ) -> None:
     # Abuse prevention: limit verification email bursts and repeated spam.
-    rl_key = f"verify_share:{owner_id}:{report_id}:{recipient_email.lower().strip()}"
+    recipient_email_raw = (recipient_email or "").strip()
+    recipient_email = recipient_email_raw.lower()
+    rl_key = f"verify_share:{owner_id}:{report_id}:{recipient_email}"
     if _rate_limit_hit(rl_key, VERIFY_EMAIL_RATE_LIMIT, VERIFY_EMAIL_RATE_WINDOW_SECONDS):
         raise RuntimeError("rate_limited")
-    cd_key = f"verify_share_cd:{owner_id}:{recipient_email.lower().strip()}"
+    cd_key = f"verify_share_cd:{owner_id}:{recipient_email}"
     # Important: do NOT start cooldown until after the verification email is actually sent.
     if _cooldown_is_active(cd_key):
         raise RuntimeError("cooldown")
 
-    recipient_email = (recipient_email or "").strip().lower()
     password_stored = True
 
     # If sender requested password protection, store password encrypted in short-lived storage.
@@ -5165,13 +5189,21 @@ def _create_or_refresh_report_share_verification(
     expires_dt = now_dt + timedelta(hours=24)
 
     sb = get_supabase(access_token)
+    # Prefer normalized lookup; fallback to raw in case older rows were stored with casing.
     row = _supabase_table_get_single(
         sb,
         "report_shares",
         {"owner_id": owner_id, "report_id": report_id, "recipient_email": recipient_email},
     )
+    if not row and recipient_email_raw and recipient_email_raw != recipient_email:
+        row = _supabase_table_get_single(
+            sb,
+            "report_shares",
+            {"owner_id": owner_id, "report_id": report_id, "recipient_email": recipient_email_raw},
+        )
 
     payload = {
+        "recipient_email": recipient_email,
         "verify_token_hash": token_hash,
         "verify_sent_at": now_iso,
         "is_verified": False,
@@ -5576,7 +5608,7 @@ def api_report_shares_create():
         if pw_err:
             return jsonify({"ok": False, "message": pw_err}), 400
 
-    if email == user.email:
+    if (email or "").strip().lower() == (user.email or "").strip().lower():
         return jsonify({"ok": False, "message": "Recipient is your own email. Use direct send instead."}), 400
 
     try:
@@ -5617,6 +5649,11 @@ def api_report_shares_create():
 
 @app.route("/trusted-email/verify", methods=["GET"])
 def verify_trusted_email():
+    # Throttle public verification endpoint to reduce brute-force attempts.
+    rl_key = f"verify_ep:trusted:{_client_ip()}"
+    if _rate_limit_hit(rl_key, VERIFY_ENDPOINT_RATE_LIMIT, VERIFY_ENDPOINT_RATE_WINDOW_SECONDS):
+        return render_template("verify_email_share.html", message="Too many attempts. Please try again later."), 429
+
     token = (request.args.get("token") or "").strip()
     if not token:
         _audit_event_best_effort(
@@ -5649,7 +5686,7 @@ def verify_trusted_email():
     try:
         res = (
             sb_admin.table("trusted_emails")
-            .select("id")
+            .select("id,verify_sent_at")
             .eq("verify_token_hash", token_hash)
             .limit(1)
             .execute()
@@ -5667,6 +5704,24 @@ def verify_trusted_email():
             return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
 
         row_id = rows[0]["id"]
+
+        # Enforce expiry based on verify_sent_at when present.
+        try:
+            sent_at = _parse_iso_datetime(rows[0].get("verify_sent_at"))
+            if sent_at and (datetime.now(timezone.utc) - sent_at).total_seconds() > float(VERIFY_TOKEN_TTL_SECONDS):
+                _audit_event_best_effort(
+                    "trusted_verify_invalid",
+                    owner_id=None,
+                    actor_email=None,
+                    recipient_email=None,
+                    report_id=None,
+                    meta={"reason": "expired"},
+                )
+                return render_template("verify_email_share.html", message="Verification link is invalid or expired."), 400
+        except Exception:
+            # If the DB column is missing/unparseable, skip strict expiry to preserve compatibility.
+            pass
+
         sb_admin.table("trusted_emails").update(
             {
                 "is_verified": True,
@@ -5699,6 +5754,11 @@ def verify_trusted_email():
 
 @app.route("/share/verify", methods=["GET"])
 def verify_report_share():
+    # Throttle public verification endpoint to reduce brute-force attempts.
+    rl_key = f"verify_ep:share:{_client_ip()}"
+    if _rate_limit_hit(rl_key, VERIFY_ENDPOINT_RATE_LIMIT, VERIFY_ENDPOINT_RATE_WINDOW_SECONDS):
+        return render_template("verify_email_share.html", message="Too many attempts. Please try again later."), 429
+
     token = (request.args.get("token") or "").strip()
     if not token:
         _audit_event_best_effort(
