@@ -158,6 +158,33 @@ The app reads configuration from environment variables (and `.env` for local dev
 - `TREND_EPS`: Optional float threshold for trend labeling (default `0.01`)
 - `CLEANUP_MAX_AGE_HOURS`: Optional float age threshold for runtime cleanup (default `24`)
 
+Verification + email delivery (optional but recommended for production):
+
+- `EMAIL_REDIRECT_BASE_URL`: Canonical public base URL used in emailed links (verification + auth redirects). If unset, falls back to `APP_BASE_URL` / `RENDER_EXTERNAL_URL`.
+- `VERIFY_TOKEN_TTL_SECONDS`: Verification link TTL for trusted emails (default 24h).
+- `VERIFY_ENDPOINT_RATE_LIMIT`: Public verify endpoint limit per IP per window (default 30).
+- `VERIFY_ENDPOINT_RATE_WINDOW_SECONDS`: Public verify window seconds (default 300 / 5 minutes).
+- `VERIFY_PAGE_REFERRER_POLICY`: Referrer policy for verify pages (default `no-referrer`).
+
+## Verification Flows & Policies
+
+This project uses two verification flows:
+
+- **Trusted email verification**: sender adds a recipient email → recipient verifies via `/trusted-email/verify?token=...` → `trusted_emails.is_verified` is set and the token hash is cleared.
+- **Report share verification**: sender shares a report → recipient verifies via `/share/verify?token=...` → `report_shares.is_verified` is set and the token hash is cleared.
+
+Security + abuse prevention:
+
+- Verification tokens are stored hashed in the database (`verify_token_hash`) and cleared on successful verification.
+- Public verify endpoints are rate-limited per client IP (`VERIFY_ENDPOINT_RATE_LIMIT` / `VERIFY_ENDPOINT_RATE_WINDOW_SECONDS`).
+- Trusted-email verification links expire based on `verify_sent_at` when available (`VERIFY_TOKEN_TTL_SECONDS`).
+- Verify pages set a strict referrer policy (`VERIFY_PAGE_REFERRER_POLICY`) to reduce the chance of leaking tokens via referrers.
+
+Email normalization:
+
+- All emails are normalized to lowercase before storage and comparisons.
+- Recommended DB hardening (optional): enforce uniqueness using a case-insensitive unique index/constraint (e.g., on `lower(email)` for `trusted_emails`).
+
 ### Render deployment: where to set secrets
 
 On Render, set environment variables in your service:

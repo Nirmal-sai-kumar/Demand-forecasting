@@ -179,6 +179,17 @@
 
     function render(items) {
       while (rowsEl.firstChild) rowsEl.removeChild(rowsEl.firstChild);
+
+      function formatLocalTimestamp(v) {
+        const s = (v === null || v === undefined) ? '' : String(v).trim();
+        if (!s) return '';
+        const d = new Date(s);
+        if (!Number.isNaN(d.getTime())) {
+          return d.toLocaleString();
+        }
+        return s.replace('T', ' ').replace('Z', '');
+      }
+
       if (!items || !items.length) {
         const tr = document.createElement('tr');
         const td = document.createElement('td');
@@ -191,7 +202,7 @@
       for (const it of items) {
         const tr = document.createElement('tr');
         const verified = it && it.is_verified ? 'Yes' : 'No';
-        const created = (it && it.created_at) ? String(it.created_at).replace('T', ' ').replace('Z','') : '';
+        const created = formatLocalTimestamp(it && it.created_at);
         const safeEmail = (it && it.email) ? String(it.email) : '';
         const canDelete = !!(it && it.id);
 
