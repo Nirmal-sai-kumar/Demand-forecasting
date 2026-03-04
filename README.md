@@ -2,6 +2,8 @@
 
 Flask web app for retail demand forecasting using an XGBoost model. The UI supports uploading a dataset (CSV/Excel) and forecasting 1–12 months ahead. Authentication (login/register/forgot password) is handled via Supabase Auth.
 
+Deployed app: https://demand-forecasting-l93a.onrender.com/
+
 ## Prerequisites
 
 - Python 3.9+ recommended
